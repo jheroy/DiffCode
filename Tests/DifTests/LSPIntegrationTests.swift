@@ -103,29 +103,31 @@ final class LSPIntegrationTests: XCTestCase {
     func testTextBufferApplySemanticTokensDoesNotCompoundAcrossRefreshes() {
         let lines = [
             "package main",
-            "func greet(name string) {}",
+            "func greet(name string) {",
+            "    msg := name",
+            "}",
         ]
         let buffer = TextBuffer(lines: lines)
         buffer.spans = Highlighter.highlight(lines, language: .go)
-        let originalLine1 = buffer.spans(at: 1)
+        let originalLine2 = buffer.spans(at: 2)
 
-        // First semantic overlay colours `name` as .parameter
+        // First semantic overlay colours body identifier `msg` as .variable
         let firstChanged = buffer.applySemanticTokens([
-            1: [LSPSemanticSpan(start: 11, length: 4, kind: .parameter)],
+            2: [LSPSemanticSpan(start: 4, length: 3, kind: .variable)],
         ])
-        XCTAssertEqual(firstChanged, IndexSet(integer: 1))
-        XCTAssertTrue(buffer.spans(at: 1).contains(SyntaxSpan(start: 11, length: 4, kind: .parameter)))
+        XCTAssertEqual(firstChanged, IndexSet(integer: 2))
+        XCTAssertTrue(buffer.spans(at: 2).contains(SyntaxSpan(start: 4, length: 3, kind: .variable)))
 
         // Applying identical semantic tokens again reports zero changed lines
         let noopChanged = buffer.applySemanticTokens([
-            1: [LSPSemanticSpan(start: 11, length: 4, kind: .parameter)],
+            2: [LSPSemanticSpan(start: 4, length: 3, kind: .variable)],
         ])
         XCTAssertTrue(noopChanged.isEmpty)
 
         // Subsequent empty semantic tokens cleanly revert to the preserved base Lexer spans
         let reverted = buffer.applySemanticTokens([:])
-        XCTAssertEqual(reverted, IndexSet(integer: 1))
-        XCTAssertEqual(buffer.spans(at: 1), originalLine1)
+        XCTAssertEqual(reverted, IndexSet(integer: 2))
+        XCTAssertEqual(buffer.spans(at: 2), originalLine2)
     }
 
     private func assertSortedAndNonOverlapping(_ spans: [SyntaxSpan], file: StaticString = #filePath, line: UInt = #line) {
@@ -764,5 +766,399 @@ final class LSPIntegrationTests: XCTestCase {
             repo,
             "GoWorkspaceResolver must stay on origin module root so gopls is reused"
         )
+    }
+
+    // MARK: - 7. Smart ⌘+Click Definition Detection & References Picker Model
+
+    func testIsPositionOnDefinitionMatchingAndNonMatchingCases() throws {
+        let dir = try makeTempDir(prefix: "dif-pos-def")
+        let fileA = dir.appendingPathComponent("greet.go")
+        let fileB = dir.appendingPathComponent("main.go")
+        try writeFile(fileA, contents: "package repob\nfunc Greet() { Greet() }\n")
+        try writeFile(fileB, contents: "package main\nfunc main() { Greet() }\n")
+
+        let defLoc = LSPLocation(
+            uri: LSPURI.uri(from: fileA),
+            range: LSPRange(
+                start: LSPPosition(line: 1, character: 5),
+                end: LSPPosition(line: 1, character: 10)
+            )
+        )
+
+        // Clicking start, middle, or end of the definition symbol -> true
+        XCTAssertTrue(LSPNavigationHelper.isPositionOnDefinition(fileURL: fileA, line: 1, character: 5, definitions: [defLoc]))
+        XCTAssertTrue(LSPNavigationHelper.isPositionOnDefinition(fileURL: fileA, line: 1, character: 7, definitions: [defLoc]))
+        XCTAssertTrue(LSPNavigationHelper.isPositionOnDefinition(fileURL: fileA, line: 1, character: 10, definitions: [defLoc]))
+
+        // Clicking a recursive call on the SAME line (`Greet()` at col 15..<20) -> false
+        XCTAssertFalse(LSPNavigationHelper.isPositionOnDefinition(
+            fileURL: fileA, line: 1, character: 17, symbolRange: 15..<20, definitions: [defLoc]
+        ))
+
+        // Clicking a reference on a different line in the same file -> false
+        XCTAssertFalse(LSPNavigationHelper.isPositionOnDefinition(fileURL: fileA, line: 4, character: 7, definitions: [defLoc]))
+
+        // Clicking same line & column in a different file -> false
+        XCTAssertFalse(LSPNavigationHelper.isPositionOnDefinition(fileURL: fileB, line: 1, character: 7, definitions: [defLoc]))
+
+        // Non-canonical path (`dir/./greet.go`) matches canonical definition URL -> true
+        let nonCanonical = dir.appendingPathComponent("./greet.go")
+        XCTAssertTrue(LSPNavigationHelper.isPositionOnDefinition(fileURL: nonCanonical, line: 1, character: 6, definitions: [defLoc]))
+
+        // Zero-width definition range matches exact character or covering symbolRange
+        let zeroWidthDef = LSPLocation(
+            uri: LSPURI.uri(from: fileA),
+            range: LSPRange(
+                start: LSPPosition(line: 1, character: 5),
+                end: LSPPosition(line: 1, character: 5)
+            )
+        )
+        XCTAssertTrue(LSPNavigationHelper.isPositionOnDefinition(
+            fileURL: fileA, line: 1, character: 5, definitions: [zeroWidthDef]
+        ))
+        XCTAssertTrue(LSPNavigationHelper.isPositionOnDefinition(
+            fileURL: fileA, line: 1, character: 8, symbolRange: 5..<10, definitions: [zeroWidthDef]
+        ))
+        XCTAssertFalse(LSPNavigationHelper.isPositionOnDefinition(
+            fileURL: fileA, line: 1, character: 16, symbolRange: 15..<20, definitions: [zeroWidthDef]
+        ))
+
+        // Symbol extraction helper
+        let extracted = LSPNavigationHelper.extractSymbol(in: "func DeleteSignup(id string) {", at: 8)
+        XCTAssertEqual(extracted?.name, "DeleteSignup")
+        XCTAssertEqual(extracted?.range, 5..<17)
+    }
+
+    @MainActor
+    func testReferencesPickerModelFilteringAndContextSnippetExtraction() throws {
+        let dir = try makeTempDir(prefix: "dif-refs-model")
+        let fileA = dir.appendingPathComponent("repoA/main.go")
+        let fileB = dir.appendingPathComponent("repoB/greet.go")
+
+        let linesA: [String] = (1...25).map { idx in
+            if idx == 12 {
+                return "\tmsg := repob.Greet(\"world\")"
+            }
+            return "\t// line \(idx)"
+        }
+        let spansA = Highlighter.highlight(linesA, language: .go)
+
+        let item0 = ReferenceItem(
+            id: 0,
+            location: LSPLocation(
+                uri: LSPURI.uri(from: fileB),
+                range: LSPRange(start: LSPPosition(line: 3, character: 5), end: LSPPosition(line: 3, character: 10))
+            ),
+            fileURL: fileB,
+            displayPath: "repoB/greet.go",
+            lineNumber: 4,
+            column: 5,
+            endColumn: 10,
+            linePreview: "func Greet(name string) string {",
+            matchRangeInPreview: 5..<10,
+            isDeclaration: true
+        )
+        let item1 = ReferenceItem(
+            id: 1,
+            location: LSPLocation(
+                uri: LSPURI.uri(from: fileA),
+                range: LSPRange(start: LSPPosition(line: 11, character: 14), end: LSPPosition(line: 11, character: 19))
+            ),
+            fileURL: fileA,
+            displayPath: "repoA/main.go",
+            lineNumber: 12,
+            column: 14,
+            endColumn: 19,
+            linePreview: "msg := repob.Greet(\"world\")",
+            matchRangeInPreview: 13..<18,
+            isDeclaration: false
+        )
+
+        // Filtering by path, code snippet, line number, and multi-token query
+        XCTAssertEqual(ReferencesPickerModel.filterItems([item0, item1], query: "").count, 2)
+        // "repoB" matches item0 via displayPath and item1 via linePreview (`repob.Greet`)
+        XCTAssertEqual(ReferencesPickerModel.filterItems([item0, item1], query: "repoB").map(\.id), [0, 1])
+        XCTAssertEqual(ReferencesPickerModel.filterItems([item0, item1], query: "greet.go").map(\.id), [0])
+        XCTAssertEqual(ReferencesPickerModel.filterItems([item0, item1], query: "WORLD").map(\.id), [1])
+        XCTAssertEqual(ReferencesPickerModel.filterItems([item0, item1], query: "main.go 12").map(\.id), [1])
+        XCTAssertTrue(ReferencesPickerModel.filterItems([item0, item1], query: "nonexistent").isEmpty)
+
+        // Context snippet extraction: 6 lines before (6..11) + matched (12) + 8 lines after (13..20) = 15 lines
+        let ctx = try XCTUnwrap(ReferencesPickerModel.extractContext(
+            fileURL: fileA,
+            displayPath: "repoA/main.go",
+            lines: linesA,
+            spans: spansA,
+            language: .go,
+            lineNumber: 12,
+            column: 14,
+            endColumn: 19,
+            symbolName: "Greet"
+        ))
+        XCTAssertEqual(ctx.lines.count, 15)
+        XCTAssertEqual(ctx.lines.first?.lineNumber, 6)
+        XCTAssertEqual(ctx.lines.last?.lineNumber, 20)
+        XCTAssertEqual(ctx.matchedLineNumber, 12)
+
+        let matchedLines = ctx.lines.filter(\.isMatchedLine)
+        XCTAssertEqual(matchedLines.count, 1)
+        let matched = try XCTUnwrap(matchedLines.first)
+        XCTAssertEqual(matched.lineNumber, 12)
+        // Leading `\t` expanded to 4 spaces (+3 UTF-16 shift), so `Greet` moves from 14..<19 to 17..<22
+        XCTAssertEqual(matched.text, "    msg := repob.Greet(\"world\")")
+        XCTAssertEqual(matched.highlightRange, 17..<22)
+        let nsMatched = matched.text as NSString
+        XCTAssertEqual(nsMatched.substring(with: NSRange(location: 17, length: 5)), "Greet")
+        // Verify syntax spans were preserved and shifted accurately (string `"world"` starts at 23)
+        XCTAssertTrue(matched.spans.contains { $0.kind == .string && $0.start == 23 })
+
+        // Clamping near top of file (line 2 -> starts at line 1)
+        let topCtx = try XCTUnwrap(ReferencesPickerModel.extractContext(
+            fileURL: fileA,
+            displayPath: "repoA/main.go",
+            lines: linesA,
+            spans: spansA,
+            language: .go,
+            lineNumber: 2,
+            column: 1,
+            endColumn: 1,
+            symbolName: "line"
+        ))
+        XCTAssertEqual(topCtx.lines.first?.lineNumber, 1)
+        XCTAssertEqual(topCtx.lines.last?.lineNumber, 10)
+
+        // trimLinePreview removes leading indentation and adjusts highlight range
+        let trimmed = ReferencesPickerModel.trimLinePreview("\t\tmsg := repob.Greet(\"world\")", column: 15, endColumn: 20, symbolName: "Greet")
+        XCTAssertEqual(trimmed.text, "msg := repob.Greet(\"world\")")
+        XCTAssertEqual(trimmed.matchRange, 13..<18)
+
+        // Interactive model navigation & filtering updates previewContext from cache
+        let model = ReferencesPickerModel()
+        let linesB = ["package repob", "", "// Greet", "func Greet(name string) string {", "\treturn name", "}"]
+        let cache: [URL: CachedPreviewFile] = [
+            fileA: CachedPreviewFile(lines: linesA, language: .go, spans: spansA),
+            fileB: CachedPreviewFile(lines: linesB, language: .go, spans: Highlighter.highlight(linesB, language: .go)),
+        ]
+        model.setItemsForTesting(symbolName: "Greet", title: "References to Greet", items: [item0, item1], cachedFiles: cache)
+        XCTAssertEqual(model.selectedItem?.id, 0)
+        XCTAssertEqual(model.previewContext?.matchedLineNumber, 4)
+
+        model.move(1)
+        XCTAssertEqual(model.selectedItem?.id, 1)
+        XCTAssertEqual(model.previewContext?.matchedLineNumber, 12)
+
+        model.filterQuery = "greet.go"
+        XCTAssertEqual(model.filteredItems.map(\.id), [0])
+        XCTAssertEqual(model.selectedIndex, 0)
+        XCTAssertEqual(model.previewContext?.matchedLineNumber, 4)
+    }
+
+    @MainActor
+    func testViewerContextMenuIncludesLSPItemsOnlyOnDirectEditionWithSymbol() async throws {
+        let originalEdition = AppEnvironment.edition
+        defer { AppEnvironment.edition = originalEdition }
+
+        let dir = try makeTempDir(prefix: "dif-ctx-menu")
+        let file = dir.appendingPathComponent("sample.go")
+        try writeFile(file, contents: "package main\nfunc Greet() {}\n")
+
+        let store = AppStore.shared
+        let prevReq = store.viewer.request
+        let prevDoc = store.viewer.document
+        let prevContainer = store.viewer.container
+        defer {
+            store.viewer.request = prevReq
+            store.viewer.document = prevDoc
+            store.viewer.container = prevContainer
+        }
+
+        let req = DiffRequest(root: dir, path: "sample.go", oldPath: nil, kind: nil, source: .file)
+        let doc = await DiffLoader.load(req)
+        let container = CodeScrollContainer(frame: NSRect(x: 0, y: 0, width: 600, height: 240))
+        container.layoutSubtreeIfNeeded()
+        container.show(doc, mode: .single, preserveScroll: false)
+        container.canvas.isLSPEnabled = true
+
+        store.viewer.request = req
+        store.viewer.document = doc
+        store.viewer.container = container
+
+        let target = CodeCanvasView.LSPHoverTarget(row: 1, line: 1, column: 6, range: 5..<10)
+
+        // Direct edition + eligible symbol -> prepends Go to Definition & Find All References
+        AppEnvironment.edition = .direct
+        container.canvas.noteContextLSPSymbol(target)
+        let directMenu = try XCTUnwrap(store.viewerContextMenu())
+        XCTAssertGreaterThanOrEqual(directMenu.items.count, 3)
+        XCTAssertEqual(directMenu.items[0].title, L("Go to Definition", "跳转到声明"))
+        XCTAssertEqual(directMenu.items[1].title, L("Find All References", "查找所有引用"))
+        XCTAssertTrue(directMenu.items[2].isSeparatorItem)
+
+        // No symbol under pointer -> LSP items omitted
+        container.canvas.noteContextLSPSymbol(nil)
+        let noSymbolMenu = try XCTUnwrap(store.viewerContextMenu())
+        XCTAssertFalse(noSymbolMenu.items.contains { $0.title == L("Go to Definition", "跳转到声明") })
+        XCTAssertFalse(noSymbolMenu.items.contains { $0.title == L("Find All References", "查找所有引用") })
+
+        // App Store edition -> LSP items never shown even if target is set
+        AppEnvironment.edition = .appStore
+        container.canvas.noteContextLSPSymbol(target)
+        let appStoreMenu = try XCTUnwrap(store.viewerContextMenu())
+        XCTAssertFalse(appStoreMenu.items.contains { $0.title == L("Go to Definition", "跳转到声明") })
+        XCTAssertFalse(appStoreMenu.items.contains { $0.title == L("Find All References", "查找所有引用") })
+    }
+
+    @MainActor
+    func testSmartLSPNavigateOnDefinitionOpensReferencesAndOnReferenceJumps() async throws {
+        let originalEdition = AppEnvironment.edition
+        AppEnvironment.edition = .direct
+        defer { AppEnvironment.edition = originalEdition }
+
+        let dir = try makeTempDir(prefix: "dif-smart-click")
+        let repo = dir.appendingPathComponent("repo", isDirectory: true)
+        let greetFile = repo.appendingPathComponent("greet.go")
+        let mainFile = repo.appendingPathComponent("main.go")
+        try writeFile(repo.appendingPathComponent("go.mod"), contents: "module example.com/repo\ngo 1.22\n")
+        try writeFile(greetFile, contents: "package repo\nfunc Greet() {}\n")
+        try writeFile(mainFile, contents: "package repo\nfunc main() { Greet() }\n")
+
+        let greetURI = LSPURI.uri(from: greetFile)
+        let mainURI = LSPURI.uri(from: mainFile)
+        let script = dir.appendingPathComponent("mock-smart-lsp.py")
+        let source = """
+        #!/usr/bin/env python3
+        import json, sys
+
+        def read_msg():
+            headers = {}
+            while True:
+                line = sys.stdin.buffer.readline()
+                if not line:
+                    return None
+                if line in (b"\\r\\n", b"\\n"):
+                    break
+                k, _, v = line.decode("utf-8", "replace").partition(":")
+                headers[k.strip().lower()] = v.strip()
+            n = int(headers.get("content-length", "0"))
+            return json.loads(sys.stdin.buffer.read(n).decode("utf-8")) if n > 0 else None
+
+        def send_msg(obj):
+            raw = json.dumps(obj).encode("utf-8")
+            sys.stdout.buffer.write(f"Content-Length: {len(raw)}\\r\\n\\r\\n".encode("ascii") + raw)
+            sys.stdout.buffer.flush()
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            method = msg.get("method")
+            msg_id = msg.get("id")
+            if method == "initialize":
+                send_msg({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "capabilities": {
+                            "textDocumentSync": 1,
+                            "definitionProvider": True,
+                            "referencesProvider": True,
+                        }
+                    },
+                })
+            elif method == "textDocument/definition":
+                send_msg({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": [{
+                        "uri": "\(greetURI)",
+                        "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 10}},
+                    }],
+                })
+            elif method == "textDocument/references":
+                send_msg({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": [{
+                        "uri": "\(mainURI)",
+                        "range": {"start": {"line": 1, "character": 14}, "end": {"line": 1, "character": 19}},
+                    }],
+                })
+            elif method == "shutdown":
+                send_msg({"jsonrpc": "2.0", "id": msg_id, "result": None})
+            elif method == "exit":
+                break
+        """
+        try writeFile(script, contents: source)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let server = LSPResolvedServer(
+            descriptor: LSPServerRegistry.go,
+            executablePath: "/usr/bin/python3",
+            arguments: [script.path],
+            environment: AppEnvironment.childEnvironment
+        )
+        let manager = LSPManager(isEnabled: true, serverOverrides: [LSPServerRegistry.go.id: server])
+
+        let store = AppStore.shared
+        let prevManager = store.viewer.lspManager
+        let prevReq = store.viewer.request
+        let prevDoc = store.viewer.document
+        let prevLSPDoc = store.viewer.lspDocument
+        let prevPopup = store.popup
+        let prevExternal = store.externalRequest
+        let prevHistory = store.jumpHistory
+        defer {
+            store.definitionTask?.cancel()
+            store.dismissPopup(restoreFocus: false)
+            store.viewer.lspManager = prevManager
+            store.viewer.request = prevReq
+            store.viewer.document = prevDoc
+            store.viewer.lspDocument = prevLSPDoc
+            store.popup = prevPopup
+            store.externalRequest = prevExternal
+            store.jumpHistory = prevHistory
+        }
+
+        store.viewer.lspManager = manager
+        store.jumpHistory.clear()
+
+        // 1. Open greet.go (where Greet is defined on line 1, col 5..<10)
+        let reqGreet = DiffRequest(root: repo, path: "greet.go", oldPath: nil, kind: nil, source: .file)
+        let docGreet = await DiffLoader.load(reqGreet)
+        store.viewer.request = reqGreet
+        store.viewer.document = docGreet
+        store.viewer.syncLSPForCurrentDocument()
+        await store.viewer.lspTask?.value
+
+        // Smart ⌘+Click ON the definition (`Greet` at line 1, col 6) -> opens References Picker Popup!
+        store.smartLSPNavigate(line: 1, character: 6)
+        await store.definitionTask?.value
+
+        XCTAssertEqual(store.popup, .references)
+        XCTAssertEqual(store.references.symbolName, "Greet")
+        XCTAssertEqual(store.references.items.count, 1)
+        XCTAssertEqual(store.references.items.first?.fileURL, mainFile)
+        XCTAssertEqual(store.references.origin?.fileURL, greetFile)
+        XCTAssertEqual(store.references.origin?.line, 2)
+
+        // Dismiss popup, open main.go (reference site at line 1, col 15)
+        store.dismissPopup(restoreFocus: false)
+        let reqMain = DiffRequest(root: repo, path: "main.go", oldPath: nil, kind: nil, source: .file)
+        let docMain = await DiffLoader.load(reqMain)
+        store.viewer.request = reqMain
+        store.viewer.document = docMain
+        store.viewer.syncLSPForCurrentDocument()
+        await store.viewer.lspTask?.value
+
+        // Smart ⌘+Click ON the reference (`Greet` at line 1, col 15) -> jumps directly to greet.go (no popup) & pushes origin!
+        store.smartLSPNavigate(line: 1, character: 15)
+        await store.definitionTask?.value
+
+        XCTAssertNil(store.popup)
+        XCTAssertTrue(store.jumpHistory.canGoBack)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.fileURL, mainFile)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.line, 2)
+
+        await manager.shutdownAll()
     }
 }

@@ -766,8 +766,179 @@ final class LSPTests: XCTestCase {
         let targetRepo = manager.containingRepoRoot(for: try XCTUnwrap(target.fileURL), relativeTo: mainURL, repoRoot: repoA)
         XCTAssertEqual(targetRepo, repoB)
 
+        // 4. Cross-repo textDocument/references from repoB/greet.go (definition) -> finds call site in repoA/main.go
+        let greetSession = await manager.didOpen(fileURL: greetURL, text: greetCode, repoRoot: repoB)
+        XCTAssertNotNil(greetSession)
+
+        var refsWithoutDecl: [LSPLocation] = []
+        for _ in 0..<5 {
+            refsWithoutDecl = await manager.references(fileURL: greetURL, line: 3, character: 6, includeDeclaration: false)
+            if !refsWithoutDecl.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        XCTAssertTrue(
+            refsWithoutDecl.contains { $0.fileURL == mainURL && $0.range.start.line == 5 },
+            "Expected gopls references(includeDeclaration: false) on repoB/greet.go:Greet to find repoA/main.go:5, got: \(refsWithoutDecl)"
+        )
+
+        let refsWithDecl = await manager.references(fileURL: greetURL, line: 3, character: 6, includeDeclaration: true)
+        XCTAssertTrue(
+            refsWithDecl.contains { $0.fileURL == greetURL && $0.range.start.line == 3 },
+            "Expected gopls references(includeDeclaration: true) to include declaration in repoB/greet.go:3, got: \(refsWithDecl)"
+        )
+        XCTAssertTrue(
+            refsWithDecl.contains { $0.fileURL == mainURL && $0.range.start.line == 5 },
+            "Expected gopls references(includeDeclaration: true) to include cross-repo call site in repoA/main.go:5, got: \(refsWithDecl)"
+        )
+
         await manager.shutdownAll()
         let remaining = await manager.runningServerCount()
         XCTAssertEqual(remaining, 0)
+    }
+
+    // MARK: - 8. Mock LSP Server textDocument/references (Dedup, includeDeclaration, Null/Empty, Gating)
+
+    func testMockStdioServerReferencesDedupIncludeDeclarationAndEmptyResponses() async throws {
+        let dir = try makeTempDir(prefix: "dif-mock-refs")
+        let scriptURL = dir.appendingPathComponent("mock_refs_lsp.py")
+        let declURL = dir.appendingPathComponent("greet.go")
+        let callerAURL = dir.appendingPathComponent("caller_a.go")
+        let callerBURL = dir.appendingPathComponent("caller_b.go")
+        try writeFile(declURL, contents: "package demo\nfunc Greet() {}\n")
+        try writeFile(callerAURL, contents: "package demo\nfunc a() { Greet() }\n")
+        try writeFile(callerBURL, contents: "package demo\nfunc b() { Greet() }\n")
+
+        let declURI = LSPURI.uri(from: declURL)
+        let callerAURI = LSPURI.uri(from: callerAURL)
+        let callerBURI = LSPURI.uri(from: callerBURL)
+        // Non-canonical duplicate URI with redundant `/./` segment to verify canonical deduplication
+        let callerADupURI = "file://" + dir.path + "/./caller_a.go"
+
+        let mockServerScript = """
+        #!/usr/bin/env python3
+        import json, sys
+
+        def send(msg):
+            body = json.dumps(msg).encode("utf-8")
+            header = f"Content-Length: {len(body)}\\r\\n\\r\\n".encode("ascii")
+            sys.stdout.buffer.write(header + body)
+            sys.stdout.buffer.flush()
+
+        def read_msg():
+            headers = {}
+            while True:
+                line = sys.stdin.buffer.readline()
+                if not line:
+                    return None
+                if line in (b"\\r\\n", b"\\n"):
+                    break
+                if b":" in line:
+                    k, v = line.decode("ascii").split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+            length = int(headers.get("content-length", "0"))
+            body = sys.stdin.buffer.read(length)
+            if not body:
+                return None
+            return json.loads(body.decode("utf-8"))
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            method = msg.get("method")
+            req_id = msg.get("id")
+            params = msg.get("params") or {}
+
+            if method == "initialize":
+                send({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "capabilities": {
+                            "textDocumentSync": 1,
+                            "definitionProvider": True,
+                            "referencesProvider": True,
+                        }
+                    },
+                })
+            elif method == "textDocument/references":
+                pos = params.get("position") or {}
+                ctx = params.get("context") or {}
+                line = pos.get("line", 0)
+                include_decl = bool(ctx.get("includeDeclaration", False))
+                if line == 99:
+                    send({"jsonrpc": "2.0", "id": req_id, "result": None})
+                elif line == 98:
+                    send({"jsonrpc": "2.0", "id": req_id, "result": []})
+                else:
+                    locs = []
+                    if include_decl:
+                        locs.append({
+                            "uri": "\(declURI)",
+                            "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 10}},
+                        })
+                    # Include intentional exact and non-canonical duplicates to test dedup & stable ordering
+                    locs.extend([
+                        {
+                            "uri": "\(callerBURI)",
+                            "range": {"start": {"line": 1, "character": 11}, "end": {"line": 1, "character": 16}},
+                        },
+                        {
+                            "uri": "\(callerAURI)",
+                            "range": {"start": {"line": 1, "character": 11}, "end": {"line": 1, "character": 16}},
+                        },
+                        {
+                            "uri": "\(callerADupURI)",
+                            "range": {"start": {"line": 1, "character": 11}, "end": {"line": 1, "character": 16}},
+                        },
+                        {
+                            "uri": "\(callerBURI)",
+                            "range": {"start": {"line": 1, "character": 11}, "end": {"line": 1, "character": 16}},
+                        },
+                    ])
+                    send({"jsonrpc": "2.0", "id": req_id, "result": locs})
+            elif method == "shutdown":
+                send({"jsonrpc": "2.0", "id": req_id, "result": None})
+            elif method == "exit":
+                break
+        """
+        try writeFile(scriptURL, contents: mockServerScript, executable: true)
+
+        let mockResolved = LSPResolvedServer(
+            descriptor: LSPServerRegistry.go,
+            executablePath: "/usr/bin/python3",
+            arguments: [scriptURL.path],
+            environment: ProcessInfo.processInfo.environment
+        )
+        let manager = LSPManager(
+            isEnabled: true,
+            serverOverrides: [LSPServerRegistry.go.id: mockResolved]
+        )
+
+        let session = await manager.didOpen(fileURL: declURL, text: "package demo\nfunc Greet() {}\n", repoRoot: dir)
+        XCTAssertNotNil(session)
+
+        // includeDeclaration: true -> declaration + deduped callers in stable order (decl, callerB, callerA)
+        let withDecl = await manager.references(fileURL: declURL, line: 1, character: 6, includeDeclaration: true)
+        XCTAssertEqual(withDecl.count, 3)
+        XCTAssertEqual(withDecl.map(\.fileURL), [declURL, callerBURL, callerAURL])
+
+        // includeDeclaration: false -> deduped callers only (callerB, callerA)
+        let withoutDecl = await manager.references(fileURL: declURL, line: 1, character: 6, includeDeclaration: false)
+        XCTAssertEqual(withoutDecl.count, 2)
+        XCTAssertEqual(withoutDecl.map(\.fileURL), [callerBURL, callerAURL])
+
+        // null and empty array responses -> []
+        let nullRefs = await manager.references(fileURL: declURL, line: 99, character: 0)
+        XCTAssertTrue(nullRefs.isEmpty)
+        let emptyRefs = await manager.references(fileURL: declURL, line: 98, character: 0)
+        XCTAssertTrue(emptyRefs.isEmpty)
+
+        // Disabled manager gating -> []
+        await manager.setEnabled(false)
+        let gatedRefs = await manager.references(fileURL: declURL, line: 1, character: 6)
+        XCTAssertTrue(gatedRefs.isEmpty)
+
+        await manager.shutdownAll()
     }
 }
