@@ -420,7 +420,7 @@ final class Project: Identifiable {
                     page = (try? await commits) ?? []
                 } else {
                     // From the commit asked for (a file deleted since, say), otherwise from what the Log lists.
-                    let scope = history.rev != "HEAD" ? [history.rev] : (all ? ["--all"] : (ref.map { [$0] } ?? []))
+                    let scope = history.rev != "HEAD" ? [history.rev] : (all ? Git.allBranchesScope(includeInternalRefs: false) : (ref.map { [$0] } ?? []))
                     let result = try? await Git.fileHistory(history.path, in: self.url, skip: skip, limit: limit, query: query, scope: scope)
                     page = result?.commits ?? []
                     paths = result?.paths ?? [:]

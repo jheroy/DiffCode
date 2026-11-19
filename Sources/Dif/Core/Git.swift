@@ -553,10 +553,20 @@ extension Git {
     static let logFields = "%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s"
     static let logFormat = logFields + "%x1e"
 
+    /// Revision arguments for "All branches": standard branches, remotes, tags, and HEAD by default,
+    /// excluding internal tool refs such as `refs/t3/*`, `refs/notes/*`, `refs/stash`.
+    /// Set `includeInternalRefs: true` to pass `--all` and show every ref under `refs/`.
+    static func allBranchesScope(includeInternalRefs: Bool = false) -> [String] {
+        // `--ignore-missing` keeps unborn `HEAD` (e.g. an orphan branch or empty repo) from failing the whole query.
+        includeInternalRefs ? ["--all"] : ["--ignore-missing", "HEAD", "--branches", "--remotes", "--tags"]
+    }
+
     /// - Parameter ref: a full ref name (`refs/heads/x`) whose history to list instead of HEAD's. Ignored with `allBranches`.
-    static func log(in dir: URL, skip: Int, limit: Int, query: String, allBranches: Bool, ref: String? = nil) async throws -> [Commit] {
+    /// - Parameter includeInternalRefs: when `allBranches` is true, also walk internal refs such as `refs/t3/*` and `refs/stash`.
+    static func log(in dir: URL, skip: Int, limit: Int, query: String, allBranches: Bool, ref: String? = nil,
+                    includeInternalRefs: Bool = false) async throws -> [Commit] {
         // A full ref name never starts with "-", so it cannot be read as an option.
-        let scope = allBranches ? ["--all"] : (ref.map { [$0] } ?? [])
+        let scope = allBranches ? allBranchesScope(includeInternalRefs: includeInternalRefs) : (ref.map { [$0] } ?? [])
         // Full ref names, so a local "feature/x" and a remote "origin/x" can be told apart.
         var args = ["log", "--format=\(logFormat)", "--decorate=full", "--skip=\(skip)", "--max-count=\(limit)", "--date-order"] + scope
         let q = query.trimmingCharacters(in: .whitespaces)
