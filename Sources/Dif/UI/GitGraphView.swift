@@ -49,6 +49,16 @@ struct GitGraphDropdown: View {
                     .font(.ui(size: 11))
                     .foregroundStyle(Color.difText3)
                     .lineLimit(1)
+                if model.scope == .all {
+                    IconButton(symbol: model.showInternalRefs ? "eye" : "eye.slash",
+                               help: model.showInternalRefs
+                                   ? L("Hide internal refs (e.g. refs/t3/*, stash)", "隐藏内部引用（如 refs/t3/*、stash）")
+                                   : L("Show internal refs (e.g. refs/t3/*, stash)", "显示内部引用（如 refs/t3/*、stash）"),
+                               isActive: model.showInternalRefs,
+                               size: 11.5) {
+                        model.toggleInternalRefs()
+                    }
+                }
                 if let project = store.currentProject, project.id == model.projectID {
                     RemoteButtons(project: project)
                 }

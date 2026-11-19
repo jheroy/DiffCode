@@ -44,6 +44,8 @@ final class GitGraphModel {
 
     private(set) var projectID: UUID?
     var scope: Scope = .all
+    /// Whether "All branches" also walks non-standard internal refs (`refs/t3/*`, `refs/notes/*`, `refs/stash`).
+    var showInternalRefs = false
     var refs: [GitRef] = []
     var rows: [GraphRow] = []
     /// Lanes the graph column is sized for.
@@ -73,6 +75,7 @@ final class GitGraphModel {
             projectID = project.id
             root = project.url
             scope = .all
+            showInternalRefs = false
             selectedBranchID = "scope:all"
             selectedCommitID = nil
             branchFilter = ""
@@ -149,6 +152,14 @@ final class GitGraphModel {
         }
     }
 
+    /// Toggles whether internal Git refs (e.g. `refs/t3/*`, `refs/stash`) appear in "All branches" and reloads.
+    func toggleInternalRefs() {
+        showInternalRefs.toggle()
+        if scope == .all {
+            load(reset: true)
+        }
+    }
+
     func load(reset: Bool) {
         guard let root else { return }
         if isLoading, !reset { return }
@@ -156,12 +167,15 @@ final class GitGraphModel {
         isLoading = true
         let skip = reset ? 0 : commits.count
         let scope = self.scope
+        let includeInternalRefs = self.showInternalRefs
         task = Task { @MainActor [weak self] in
             var page: [Commit] = []
             var failure: String?
             do {
                 switch scope {
-                case .all: page = try await Git.log(in: root, skip: skip, limit: Self.pageSize, query: "", allBranches: true)
+                case .all:
+                    page = try await Git.log(in: root, skip: skip, limit: Self.pageSize, query: "",
+                                             allBranches: true, includeInternalRefs: includeInternalRefs)
                 case .head: page = try await Git.log(in: root, skip: skip, limit: Self.pageSize, query: "", allBranches: false)
                 case .ref(let name): page = try await Git.log(in: root, skip: skip, limit: Self.pageSize, query: "", allBranches: false, ref: name)
                 }
