@@ -85,10 +85,17 @@ final class TextBuffer {
         }
         let base = baseSpans!
         var changed = IndexSet()
+        var activeGoReceiver: String?
         for line in 0..<lines.count {
+            let text = lines[line]
+            if text.hasPrefix("func ") || text.hasPrefix("func(") {
+                activeGoReceiver = SyntaxOverlay.goMethodReceiverName(in: text)
+            } else if text.hasPrefix("}") {
+                activeGoReceiver = nil
+            }
             let merged: [SyntaxSpan]
             if let sem = semanticByLine[line], !sem.isEmpty {
-                merged = SyntaxOverlay.merge(base: base[line], semantic: sem)
+                merged = SyntaxOverlay.merge(base: base[line], semantic: sem, lineText: text, goReceiver: activeGoReceiver)
             } else {
                 merged = base[line]
             }

@@ -107,9 +107,9 @@ struct CanvasTheme {
     let text: CGColor
     let gutterText: CGColor
     let gutterTextStrong: CGColor
-    /// Default token styles indexed by `TokenKind.rawValue` (0...19).
+    /// Default token styles indexed by `TokenKind.rawValue` (0...25).
     let syntax: [TokenStyle]
-    /// Authentic JetBrains GoLand palette for Go files, indexed by `TokenKind.rawValue` (0...19).
+    /// GoLand-inspired palette for Go files, indexed by `TokenKind.rawValue` (0...25).
     let goSyntax: [TokenStyle]
     // Side-by-side follows the IntelliJ convention: blue = modified, green = inserted, grey = deleted.
     let modified: CGColor, modifiedWord: CGColor, modifiedMark: CGColor
@@ -137,27 +137,62 @@ struct CanvasTheme {
         return idx < table.count ? table[idx] : TokenStyle(text)
     }
 
-    private static let darkPalette: [TokenStyle] = [
+    private static let darkSyntaxPalette: [TokenStyle] = [
         TokenStyle(c(0xBCBEC4)),                   // 0: plain
-        TokenStyle(c(0xCF8E6D)),                   // 1: keyword (GoLand New UI Dark)
+        TokenStyle(c(0xCF8E6D)),                   // 1: keyword (JetBrains New UI Dark)
         TokenStyle(c(0x6AAB73)),                   // 2: string
         TokenStyle(c(0x7A7E85), italic: true),     // 3: comment
         TokenStyle(c(0x2AACB8)),                   // 4: number
-        TokenStyle(c(0xB3AE60)),                   // 5: annotation / struct tag
+        TokenStyle(c(0xB3AE60)),                   // 5: annotation
         TokenStyle(c(0x56A8F5)),                   // 6: function
         TokenStyle(c(0xC77DBB), italic: true),     // 7: constant
         TokenStyle(c(0xD5B778)),                   // 8: tag
         TokenStyle(c(0xBABABA)),                   // 9: attribute
-        TokenStyle(c(0x6FAFBD)),                   // 10: type (struct / named type)
+        TokenStyle(c(0x6FAFBD)),                   // 10: type
         TokenStyle(c(0x6FAFBD), italic: true),     // 11: interface
         TokenStyle(c(0x56A8F5)),                   // 12: method
-        TokenStyle(c(0x8888C6)),                   // 13: builtin (Darcula / GoLand predeclared & builtin)
-        TokenStyle(c(0xAFBF7E)),                   // 14: namespace (package identifier)
-        TokenStyle(c(0xC77DBB)),                   // 15: property (struct field)
+        TokenStyle(c(0x8888C6)),                   // 13: builtin
+        TokenStyle(c(0xAFBF7E)),                   // 14: namespace
+        TokenStyle(c(0xC77DBB)),                   // 15: property
         TokenStyle(c(0xBCBEC4)),                   // 16: parameter
         TokenStyle(c(0xBCBEC4)),                   // 17: variable
-        TokenStyle(c(0x16BAAC)),                   // 18: typeParameter (generic type param)
+        TokenStyle(c(0x16BAAC)),                   // 18: typeParameter
         TokenStyle(c(0xBCBEC4)),                   // 19: operator
+        TokenStyle(c(0x56A8F5)),                   // 20: exportedFunction
+        TokenStyle(c(0xC77DBB), italic: true),     // 21: exportedConstant
+        TokenStyle(c(0xBCBEC4)),                   // 22: exportedVariable
+        TokenStyle(c(0x8888C6)),                   // 23: builtinType
+        TokenStyle(c(0x6FAFBD)),                   // 24: exportedType
+        TokenStyle(c(0xC77DBB)),                   // 25: exportedProperty
+    ]
+
+    private static let darkGoLandPalette: [TokenStyle] = [
+        TokenStyle(c(0xBCBEC4)),                   // 0: plain
+        TokenStyle(c(0xB8525E), italic: true),     // 1: keyword (coral/crimson red italic: func, go, defer, for, range, if, return, map)
+        TokenStyle(c(0x6AAB73)),                   // 2: string
+        TokenStyle(c(0x7A7E85), italic: true),     // 3: comment
+        TokenStyle(c(0xD9A589)),                   // 4: number (warm amber/peach)
+        TokenStyle(c(0xB3AE60)),                   // 5: annotation / struct tag
+        TokenStyle(c(0x4E8EC6), italic: true),     // 6: function (unexported func: soft blue italic)
+        TokenStyle(c(0xC8569C), italic: true),     // 7: constant (unexported const & nil/true/false/iota: orchid purple italic)
+        TokenStyle(c(0xD5B778)),                   // 8: tag
+        TokenStyle(c(0xBABABA)),                   // 9: attribute
+        TokenStyle(c(0x9E9978), italic: true),     // 10: type (unexported type/struct: olive-tan italic)
+        TokenStyle(c(0x9E8DD4)),                   // 11: interface (soft lavender)
+        TokenStyle(c(0x4E8EC6), italic: true),     // 12: method (unexported method: soft blue italic)
+        TokenStyle(c(0x84A9E8), italic: true),     // 13: builtin (builtin func: periwinkle/sky blue italic: make, delete, len)
+        TokenStyle(c(0x919758)),                   // 14: namespace (package identifier: olive/sage green)
+        TokenStyle(c(0x8F9196), italic: true),     // 15: property (unexported struct field: muted gray italic)
+        TokenStyle(c(0xB3B2B6), italic: true),     // 16: parameter (function param & method receiver: warm gray italic)
+        TokenStyle(c(0xBCBEC4)),                   // 17: variable (local variable: neutral light gray)
+        TokenStyle(c(0x50B8A8)),                   // 18: typeParameter (generic type param)
+        TokenStyle(c(0xBCBEC4)),                   // 19: operator
+        TokenStyle(c(0x2E8CE6), bold: true),       // 20: exportedFunction (exported func/method decl & call: vivid blue BOLD)
+        TokenStyle(c(0xDCDDD7), bold: true),       // 21: exportedConstant (exported const decl & ref: bright off-white BOLD)
+        TokenStyle(c(0x7C6EE0), bold: true),       // 22: exportedVariable (exported package var: indigo/purple BOLD)
+        TokenStyle(c(0xE01F92), bold: true),       // 23: builtinType (int64, bool, string, error, any: vivid magenta BOLD)
+        TokenStyle(c(0xDFC7B3)),                   // 24: exportedType (exported struct/type: warm sand regular)
+        TokenStyle(c(0xC6C7CC)),                   // 25: exportedProperty (exported struct field: light gray regular)
     ]
 
     private static let lightSyntaxPalette: [TokenStyle] = [
@@ -166,7 +201,7 @@ struct CanvasTheme {
         TokenStyle(c(0x067D17)),                   // 2: string
         TokenStyle(c(0x8C8C8C), italic: true),     // 3: comment
         TokenStyle(c(0x1750EB)),                   // 4: number
-        TokenStyle(c(0x9E880D)),                   // 5: annotation / struct tag
+        TokenStyle(c(0x9E880D)),                   // 5: annotation
         TokenStyle(c(0x00627A)),                   // 6: function
         TokenStyle(c(0x871094), italic: true),     // 7: constant
         TokenStyle(c(0x0033B3)),                   // 8: tag
@@ -181,29 +216,41 @@ struct CanvasTheme {
         TokenStyle(c(0x080808)),                   // 17: variable
         TokenStyle(c(0x007E8A)),                   // 18: typeParameter
         TokenStyle(c(0x080808)),                   // 19: operator
+        TokenStyle(c(0x00627A)),                   // 20: exportedFunction
+        TokenStyle(c(0x871094), italic: true),     // 21: exportedConstant
+        TokenStyle(c(0x080808)),                   // 22: exportedVariable
+        TokenStyle(c(0x0033B3)),                   // 23: builtinType
+        TokenStyle(c(0x007E8A)),                   // 24: exportedType
+        TokenStyle(c(0x871094)),                   // 25: exportedProperty
     ]
 
     private static let lightGoLandPalette: [TokenStyle] = [
-        TokenStyle(c(0x080808)),                   // 0: plain (GoLand Light)
-        TokenStyle(c(0x0033B3), bold: true),       // 1: keyword (bold blue)
+        TokenStyle(c(0x1F2329)),                   // 0: plain (GoLand Light)
+        TokenStyle(c(0xA8283B), italic: true),     // 1: keyword (crimson/coral italic)
         TokenStyle(c(0x067D17)),                   // 2: string
         TokenStyle(c(0x8C8C8C), italic: true),     // 3: comment
-        TokenStyle(c(0x1750EB)),                   // 4: number
-        TokenStyle(c(0x9E880D)),                   // 5: annotation / struct tag
-        TokenStyle(c(0x00627A)),                   // 6: function
-        TokenStyle(c(0x871094), italic: true),     // 7: constant
+        TokenStyle(c(0xB5541C)),                   // 4: number (warm amber)
+        TokenStyle(c(0x8A7308)),                   // 5: annotation / struct tag
+        TokenStyle(c(0x246A9E), italic: true),     // 6: function (unexported func: soft blue italic)
+        TokenStyle(c(0x9B2378), italic: true),     // 7: constant (unexported const & nil/true/false/iota: orchid italic)
         TokenStyle(c(0x0033B3)),                   // 8: tag
         TokenStyle(c(0x174AD4)),                   // 9: attribute
-        TokenStyle(c(0x007E8A)),                   // 10: type
-        TokenStyle(c(0x007E8A), italic: true),     // 11: interface
-        TokenStyle(c(0x00627A)),                   // 12: method
-        TokenStyle(c(0x0033B3)),                   // 13: builtin
-        TokenStyle(c(0x20999D)),                   // 14: namespace
-        TokenStyle(c(0x871094)),                   // 15: property
-        TokenStyle(c(0x080808)),                   // 16: parameter
-        TokenStyle(c(0x080808)),                   // 17: variable
-        TokenStyle(c(0x007E8A)),                   // 18: typeParameter
-        TokenStyle(c(0x080808)),                   // 19: operator
+        TokenStyle(c(0x6B6538), italic: true),     // 10: type (unexported type: olive-tan italic)
+        TokenStyle(c(0x684DB0)),                   // 11: interface (lavender-purple)
+        TokenStyle(c(0x246A9E), italic: true),     // 12: method (unexported method: soft blue italic)
+        TokenStyle(c(0x2E6DA4), italic: true),     // 13: builtin (builtin func: sky-blue italic)
+        TokenStyle(c(0x566B2F)),                   // 14: namespace (package identifier: olive green)
+        TokenStyle(c(0x6B707B), italic: true),     // 15: property (unexported struct field: muted gray italic)
+        TokenStyle(c(0x4A4D57), italic: true),     // 16: parameter (function param & receiver: warm gray italic)
+        TokenStyle(c(0x1F2329)),                   // 17: variable (local variable)
+        TokenStyle(c(0x0E7C73)),                   // 18: typeParameter
+        TokenStyle(c(0x1F2329)),                   // 19: operator
+        TokenStyle(c(0x0A5EB8), bold: true),       // 20: exportedFunction (exported func/method decl & call: vivid blue BOLD)
+        TokenStyle(c(0x181A1F), bold: true),       // 21: exportedConstant (exported const decl & ref: crisp dark BOLD)
+        TokenStyle(c(0x5842C3), bold: true),       // 22: exportedVariable (exported package var: indigo/purple BOLD)
+        TokenStyle(c(0xB81474), bold: true),       // 23: builtinType (int64, bool, string, error, any: vivid magenta BOLD)
+        TokenStyle(c(0x8A5A2B)),                   // 24: exportedType (exported struct/type: warm bronze)
+        TokenStyle(c(0x2C3038)),                   // 25: exportedProperty (exported struct field: dark neutral gray)
     ]
 
     static let dark = CanvasTheme(
@@ -212,8 +259,8 @@ struct CanvasTheme {
         text: c(0xBCBEC4),
         gutterText: c(0x4E525A),
         gutterTextStrong: c(0xA1A5AD),
-        syntax: darkPalette,
-        goSyntax: darkPalette,
+        syntax: darkSyntaxPalette,
+        goSyntax: darkGoLandPalette,
         modified: c(0x3574F0, 0.20), modifiedWord: c(0x3574F0, 0.40), modifiedMark: c(0x5C92F7),
         added: c(0x3FA65A, 0.20), addedWord: c(0x3FA65A, 0.42), addedMark: c(0x57B46F),
         deleted: c(0x868A93, 0.20), deletedWord: c(0x868A93, 0.40), deletedMark: c(0x8E929B),
