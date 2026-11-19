@@ -21,7 +21,7 @@ struct TerminalPanel: View {
                     HStack(spacing: 0) {
                         ForEach(Array(sessions.enumerated()), id: \.element.id) { index, session in
                             TerminalPane(session: session, isFocused: manager.focusedID == session.id,
-                                         isLast: index == sessions.count - 1)
+                                         isFirst: index == 0, isLast: index == sessions.count - 1)
                                 .frame(width: (available * session.weight / total).rounded(.down))
                             if index < sessions.count - 1 {
                                 PaneDivider(left: session, right: sessions[index + 1], pointsPerWeight: available / total)
@@ -72,11 +72,19 @@ struct TerminalPanel: View {
 private struct TerminalPane: View {
     let session: TerminalSession
     var isFocused: Bool
+    var isFirst: Bool
     var isLast: Bool
     @Environment(AppStore.self) private var store
     @State private var hovering = false
 
     static var headerHeight: CGFloat { UI.s(26) }
+
+    private var bottomCorners: CACornerMask {
+        var mask: CACornerMask = []
+        if isFirst { mask.insert(.layerMinXMinYCorner) }
+        if isLast { mask.insert(.layerMaxXMinYCorner) }
+        return mask
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -132,7 +140,7 @@ private struct TerminalPane: View {
             .onTapGesture { store.terminals.focus(session) }
             .onHover { hovering = $0 }
 
-            TerminalHost(session: session)
+            TerminalHost(session: session, bottomCorners: bottomCorners)
         }
         .contextMenu {
             Button(L("New Terminal", "新建终端")) {
@@ -184,22 +192,44 @@ private struct PaneDivider: View {
 /// Mounts a session's long-lived terminal view.
 private struct TerminalHost: NSViewRepresentable {
     let session: TerminalSession
+    var bottomCorners: CACornerMask
 
-    func makeNSView(context: Context) -> TerminalContainerView { TerminalContainerView(session: session) }
-    func updateNSView(_ view: TerminalContainerView, context: Context) {}
+    func makeNSView(context: Context) -> TerminalContainerView {
+        let view = TerminalContainerView(session: session)
+        view.bottomCorners = bottomCorners
+        return view
+    }
+
+    func updateNSView(_ view: TerminalContainerView, context: Context) {
+        if view.bottomCorners != bottomCorners {
+            view.bottomCorners = bottomCorners
+        }
+    }
 }
 
 final class TerminalContainerView: NSView {
     private let session: TerminalSession
     /// The right edge stays clear of the divider's grab strip, so the terminal's own pointer never competes with it.
-    private static let inset = NSEdgeInsets(top: 4, left: 10, bottom: 4, right: DividerGrip.grabWidth / 2 + 1)
+    private static let inset = NSEdgeInsets(top: 4, left: 10, bottom: 6, right: DividerGrip.grabWidth / 2 + 1)
+
+    var bottomCorners: CACornerMask = [] {
+        didSet { applyCornerMask() }
+    }
 
     init(session: TerminalSession) {
         self.session = session
         super.init(frame: .zero)
         wantsLayer = true
+        applyCornerMask()
         addSubview(session.view)
         applyTheme()
+    }
+
+    private func applyCornerMask() {
+        layer?.cornerRadius = bottomCorners.isEmpty ? 0 : IslandStyle.cornerRadius
+        layer?.cornerCurve = .continuous
+        layer?.maskedCorners = bottomCorners
+        layer?.masksToBounds = true
     }
 
     @available(*, unavailable)

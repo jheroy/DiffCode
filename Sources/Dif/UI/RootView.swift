@@ -14,36 +14,44 @@ struct RootView: View {
                         if store.sidebarVisible {
                             SidebarView()
                                 .frame(width: settings.sidebarWidth)
+                                .islandCard(background: .difSidebar)
                                 .transition(.move(edge: .leading))
-                            ResizeHandle(width: $settings.sidebarWidth, range: Settings.sidebarRange) { settings.save() }
+                            ResizeHandle(width: $settings.sidebarWidth, range: Settings.sidebarRange, islandGap: true) { settings.save() }
                         }
                         if store.gitMissing {
                             GitMissingView()
+                                .islandCard(background: .difWindow)
                         } else if let project = store.currentProject {
                             if project.needsAccess {
                                 AccessNeededView(project: project)
+                                    .islandCard(background: .difWindow)
                             } else {
                                 if store.listVisible {
                                     ProjectPanel(project: project)
                                         .frame(width: settings.listWidth)
-                                    ResizeHandle(width: $settings.listWidth, range: 236...620) { settings.save() }
+                                        .islandCard(background: .difPanel)
+                                    ResizeHandle(width: $settings.listWidth, range: 236...620, islandGap: true) { settings.save() }
                                 }
                                 ViewerPanel(project: project)
+                                    .islandCard(background: .difWindow)
                             }
                         } else {
                             WelcomeView()
+                                .islandCard(background: .difWindow)
                         }
                     }
                     // The terminals run the full width of the window, under the sidebar too.
                     if let project = store.currentProject, store.terminals.isVisible {
                         // They may take most of the window, but always leave the diff a strip to live in.
                         let ceiling = max(120, Double(proxy.size.height) - 200)
-                        HorizontalResizeHandle(height: $settings.terminalHeight, range: 120...ceiling) { settings.save() }
+                        HorizontalResizeHandle(height: $settings.terminalHeight, range: 120...ceiling, islandGap: true) { settings.save() }
                         TerminalPanel(project: project)
                             .frame(height: min(settings.terminalHeight, ceiling))
+                            .islandCard(background: .difWindow)
                     }
                 }
             }
+            .padding(IslandStyle.outerPadding)
 
             if let popup = store.popup {
                 PopupLayer(popup: popup)
@@ -92,7 +100,10 @@ struct RootView: View {
                     .zIndex(30)
             }
         }
-        .background(Color.difWindow)
+        .background {
+            Color.difIslandFrame
+            WindowDragArea()
+        }
         .ignoresSafeArea()
         .onDrop(of: [UTType.fileURL], isTargeted: $dropTargeted) { providers in
             Task { @MainActor in
