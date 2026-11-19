@@ -35,4 +35,32 @@ final class FontTests: XCTestCase {
         XCTAssertNotEqual(CodeFont(size: 12, family: "Menlo"), CodeFont(size: 13, family: "Menlo"))
         XCTAssertEqual(CodeFont(size: 12, family: missing), CodeFont(size: 12))
     }
+
+    func testBoldAndItalicVariantsExistAndPreserveMetrics() {
+        let menlo = CodeFont(size: 13, family: "Menlo")
+        XCTAssertTrue(CTFontGetSymbolicTraits(menlo.boldFont).contains(.traitBold))
+        XCTAssertTrue(CTFontGetSymbolicTraits(menlo.italicFont).contains(.traitItalic))
+        let biTraits = CTFontGetSymbolicTraits(menlo.boldItalicFont)
+        XCTAssertTrue(biTraits.contains(.traitBold) && biTraits.contains(.traitItalic))
+        XCTAssertEqual(CTFontGetSize(menlo.boldFont), 13)
+        XCTAssertEqual(CTFontGetSize(menlo.italicFont), 13)
+        XCTAssertEqual(CTFontGetSize(menlo.boldItalicFont), 13)
+        XCTAssertEqual(menlo.ctFont(bold: false, italic: false), menlo.regularFont)
+        XCTAssertEqual(menlo.ctFont(bold: true, italic: false), menlo.boldFont)
+        XCTAssertEqual(menlo.ctFont(bold: false, italic: true), menlo.italicFont)
+        XCTAssertEqual(menlo.ctFont(bold: true, italic: true), menlo.boldItalicFont)
+
+        // Faces that lack native italic (e.g. Monaco) still produce valid CTFonts and keep line metrics identical.
+        let monaco = CodeFont(size: 14, family: "Monaco")
+        XCTAssertEqual(monaco.lineHeight, (14.0 * 1.5).rounded())
+        XCTAssertGreaterThan(monaco.charWidth, 0)
+        XCTAssertEqual(CTFontGetSize(monaco.boldFont), 14)
+        XCTAssertEqual(CTFontGetSize(monaco.italicFont), 14)
+        XCTAssertEqual(CTFontGetSize(monaco.boldItalicFont), 14)
+
+        let defaultFont = CodeFont(size: 12)
+        XCTAssertEqual(CTFontGetSize(defaultFont.boldFont), 12)
+        XCTAssertEqual(CTFontGetSize(defaultFont.italicFont), 12)
+        XCTAssertEqual(CTFontGetSize(defaultFont.boldItalicFont), 12)
+    }
 }
