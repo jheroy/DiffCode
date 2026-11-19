@@ -214,13 +214,13 @@ private struct ViewerHeader: View {
                     IconButton(symbol: "arrow.up", help: L("Previous Difference (⇧F7)", "上一处差异 (⇧F7)")) { viewer.stepDifference(-1) }
                     IconButton(symbol: "arrow.down", help: L("Next Difference (F7)", "下一处差异 (F7)")) { viewer.stepDifference(1) }
                     Divider().frame(height: 14)
-                    IconButton(symbol: "rectangle.split.2x1", help: L("Side-by-Side (⌥⌘V)", "并排视图 (⌥⌘V)"), isActive: !store.settings.unified) {
-                        if store.settings.unified { viewer.toggleUnified() }
-                    }
-                    IconButton(symbol: "rectangle.grid.1x2", help: L("Unified (⌥⌘V)", "合并视图 (⌥⌘V)"), isActive: store.settings.unified) {
-                        if !store.settings.unified { viewer.toggleUnified() }
-                    }
                     if !doc.isAddedOnly {
+                        IconButton(symbol: "rectangle.split.2x1", help: L("Side-by-Side (⌥⌘V)", "并排视图 (⌥⌘V)"), isActive: !store.settings.unified) {
+                            if store.settings.unified { viewer.toggleUnified() }
+                        }
+                        IconButton(symbol: "rectangle.grid.1x2", help: L("Unified (⌥⌘V)", "合并视图 (⌥⌘V)"), isActive: store.settings.unified) {
+                            if !store.settings.unified { viewer.toggleUnified() }
+                        }
                         IconButton(symbol: "rectangle.split.1x2",
                                    help: L("Toggle inline line diff", "显示/隐藏底部行内对比"),
                                    isActive: store.settings.showLineDiffBar) {
@@ -252,7 +252,7 @@ private struct ViewerHeader: View {
                         }
                     }
                 }
-                IconButton(symbol: "magnifyingglass", help: L("Find in File (⌘F)", "在文件中查找 (⌘F)"), isActive: viewer.findVisible) {
+                IconButton(symbol: "magnifyingglass", help: L("Find in File (⌃⇧⌘F)", "在文件中查找 (⌃⇧⌘F)"), isActive: viewer.findVisible) {
                     if viewer.findVisible { viewer.hideFind() } else { viewer.showFind() }
                 }
                 if AppEnvironment.hasTerminal {
@@ -455,8 +455,8 @@ private struct ViewerEmptyState: View {
     var body: some View {
         let hints: [(String, String)] = [
             (L("Search Everywhere", "随处搜索"), L("Double ⇧", "双击 ⇧")),
-            (L("Go to File", "查找文件"), "⇧⌘O"),
-            (L("Find in Files", "在文件中查找"), "⇧⌘F"),
+            (L("Go to File", "查找文件"), "⌘P"),
+            (L("Find in Files", "在文件中查找"), "⌘F"),
             (L("Recent Files", "最近的文件"), "⌘E"),
             (L("Next / Previous Difference", "下一处 / 上一处差异"), "F7 / ⇧F7"),
             (L("Git Log", "提交历史"), "⌘9"),

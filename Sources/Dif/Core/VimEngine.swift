@@ -1304,7 +1304,8 @@ final class VimEngine {
 
         // ~/.ideavimrc:64-73 visual surround shortcuts!
         // xmap " S", xmap ' S', xmap ` S`, xmap [ S[, xmap ( S(, xmap { S{, xmap } S}, xmap ] S], xmap ) S)
-        if let pair = surroundPair(for: ch) {
+        // Exclude `<` and `>` here so Visual indent (`>`) and outdent (`<`) remain reachable (`S<` / `S>` still surround).
+        if let pair = surroundPair(for: ch, includeAngleBrackets: false) {
             clearPending()
             return applyVisualSurround(pair: pair, anchor: anchor, head: cursor, linewise: linewise, context: context)
         }
@@ -1380,11 +1381,11 @@ final class VimEngine {
             return applyVisualDelete(anchor: anchor, head: cursor, linewise: linewise, enterInsert: true, context: context)
         case ">":
             clearPending()
-            mode = .normal; visualAnchor = nil
+            mode = .normal; visualAnchor = nil; selectionStack.removeAll()
             return applyIndent(firstRow: min(anchor.row, cursor.row), lastRow: max(anchor.row, cursor.row), outdent: false, context: context, recordDot: false)
         case "<":
             clearPending()
-            mode = .normal; visualAnchor = nil
+            mode = .normal; visualAnchor = nil; selectionStack.removeAll()
             return applyIndent(firstRow: min(anchor.row, cursor.row), lastRow: max(anchor.row, cursor.row), outdent: true, context: context, recordDot: false)
         case "~":
             clearPending()
@@ -2625,7 +2626,7 @@ final class VimEngine {
     }
 
     private func applyIndent(firstRow: Int, lastRow: Int, outdent: Bool, context: VimContext, recordDot: Bool) -> VimResult {
-        guard context.isEditable else { return VimResult(handled: true, actions: [.readOnlyNotice]) }
+        guard context.isEditable else { return VimResult(handled: true, clearVisual: true, actions: [.readOnlyNotice]) }
         let unit = context.indentUnit
         let width = unit == "\t" ? 4 : max(1, unit.utf16.count)
         var newLines: [String] = []
@@ -2788,7 +2789,7 @@ final class VimEngine {
         return VimResult(handled: true, edits: [VimTextEdit(from: from, to: to, text: insertion)], cursor: from, clearVisual: true)
     }
 
-    private func surroundPair(for ch: String) -> (open: String, close: String)? {
+    private func surroundPair(for ch: String, includeAngleBrackets: Bool = true) -> (open: String, close: String)? {
         switch ch {
         case "\"": return ("\"", "\"")
         case "'": return ("'", "'")
@@ -2796,7 +2797,7 @@ final class VimEngine {
         case "(", ")": return ("(", ")")
         case "[", "]": return ("[", "]")
         case "{", "}": return ("{", "}")
-        case "<", ">": return ("<", ">")
+        case "<", ">": return includeAngleBrackets ? ("<", ">") : nil
         default: return nil
         }
     }

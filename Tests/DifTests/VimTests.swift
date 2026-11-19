@@ -661,4 +661,133 @@ final class VimTests: XCTestCase {
         }
         XCTAssertNil(VimKey.from(event: event))
     }
+
+    // MARK: 7. Verifier Regression Tests
+
+    func testVisualIndentOutdentAndAngleBracketSurround() {
+        let h = VimHarness("alpha\nbeta\ngamma", indentUnit: "    ")
+        // Vj> indents lines 0 and 1 instead of wrapping in <...>
+        h.type("Vj>")
+        XCTAssertEqual(h.engine.mode, .normal)
+        XCTAssertEqual(h.text, "    alpha\n    beta\ngamma")
+
+        // Vj< outdents lines 0 and 1 back
+        h.type("Vj<")
+        XCTAssertEqual(h.engine.mode, .normal)
+        XCTAssertEqual(h.text, "alpha\nbeta\ngamma")
+
+        // S< and S> still surround with angle brackets
+        h.type("veS<")
+        XCTAssertEqual(h.engine.mode, .normal)
+        XCTAssertEqual(h.text, "<alpha>\nbeta\ngamma")
+    }
+
+    @MainActor
+    func testNonInsertVimModesNeverMutateBufferOnUnhandledKeys() throws {
+        let data = Data("hello world\nsecond line\n".utf8)
+        let editable = try XCTUnwrap(TextCodec.decodeForEditing(data))
+        let right = TextBuffer(lines: editable.lines)
+        let doc = DiffDocument(left: .empty, right: right, hunks: [], language: .plain, isPlainFile: true)
+        doc.editing = EditInfo(format: editable.format, crlf: editable.crlf, fingerprint: TextCodec.fingerprint(data))
+        let session = try XCTUnwrap(EditorSession(document: doc, root: URL(fileURLWithPath: "/tmp"), path: "vim.txt", ignoreWhitespace: false))
+
+        let canvas = CodeCanvasView(frame: NSRect(x: 0, y: 0, width: 800, height: 400))
+        canvas.vimModeEnabled = true
+        canvas.setDocument(doc, mode: .single)
+        canvas.editor = session
+        canvas.placeCaret(line: 0, column: 2)
+
+        func makeKey(_ chars: String, ignoring: String? = nil, modifiers: NSEvent.ModifierFlags = [], keyCode: UInt16) throws -> NSEvent {
+            try XCTUnwrap(NSEvent.keyEvent(
+                with: .keyDown,
+                location: .zero,
+                modifierFlags: modifiers,
+                timestamp: 0,
+                windowNumber: 0,
+                context: nil,
+                characters: chars,
+                charactersIgnoringModifiers: ignoring ?? chars,
+                isARepeat: false,
+                keyCode: keyCode
+            ))
+        }
+
+        // Normal mode: Tab, ⌃K, ⌃T, and Forward Delete must not fall through to editing.
+        canvas.keyDown(with: try makeKey("\t", keyCode: 48))
+        canvas.keyDown(with: try makeKey("\u{0B}", ignoring: "k", modifiers: [.control], keyCode: 40))
+        canvas.keyDown(with: try makeKey("\u{14}", ignoring: "t", modifiers: [.control], keyCode: 17))
+        canvas.keyDown(with: try makeKey("\u{F728}", keyCode: 117))
+        XCTAssertEqual(doc.right.lines, ["hello world", "second line"])
+
+        // Visual mode: ⌃O and Tab must not insert newlines/tabs into the buffer.
+        XCTAssertTrue(canvas.handleVimKey(VimKey("v")))
+        XCTAssertEqual(canvas.vimEngine.mode, .visual)
+        canvas.keyDown(with: try makeKey("\u{0F}", ignoring: "o", modifiers: [.control], keyCode: 31))
+        canvas.keyDown(with: try makeKey("\t", keyCode: 48))
+        XCTAssertEqual(doc.right.lines, ["hello world", "second line"])
+    }
+
+    @MainActor
+    func testExpandShrinkSelectionResetsAfterExternalCursorMoveWhenVimDisabled() {
+        let doc = DiffDocument(
+            left: .empty,
+            right: TextBuffer(lines: ["alpha beta gamma"]),
+            hunks: [],
+            language: .swift,
+            isPlainFile: true
+        )
+        let canvas = CodeCanvasView(frame: NSRect(x: 0, y: 0, width: 800, height: 300))
+        canvas.vimModeEnabled = false
+        canvas.setDocument(doc, mode: .single)
+
+        // Expand on "alpha"
+        canvas.setCaret(TextPosition(row: 0, column: 1))
+        canvas.vimExpandSelection()
+        XCTAssertEqual(canvas.selectedText(), "alpha")
+
+        // Move caret externally to "beta" (simulating click or arrow move while Vim is off)
+        canvas.setCaret(TextPosition(row: 0, column: 7))
+        canvas.vimExpandSelection()
+        XCTAssertEqual(canvas.selectedText(), "beta", "Expand selection should start fresh at the new caret position")
+
+        // Shrink collapses back cleanly rather than restoring stale "alpha"
+        canvas.vimShrinkSelection()
+        XCTAssertNil(canvas.selectedText())
+    }
+
+    @MainActor
+    func testBackwardVisualSelectionTracksMovingHeadLine() {
+        let doc = DiffDocument(
+            left: TextBuffer(lines: ["line0", "line1", "line2"]),
+            right: TextBuffer(lines: ["line0", "line1_mod", "line2"]),
+            hunks: [Hunk(leftStart: 1, leftCount: 1, rightStart: 1, rightCount: 1)],
+            language: .plain
+        )
+        let canvas = CodeCanvasView(frame: NSRect(x: 0, y: 0, width: 800, height: 300))
+        var reported: [(Side, Int)] = []
+        canvas.onActiveLineChange = { side, line in reported.append((side, line)) }
+        canvas.vimModeEnabled = true
+        canvas.setDocument(doc, mode: .sideBySide)
+
+        canvas.placeCaret(line: 2, column: 2)
+        reported.removeAll()
+        XCTAssertTrue(canvas.handleVimKey(VimKey("v")))
+        XCTAssertTrue(canvas.handleVimKey(VimKey("k")))
+        XCTAssertEqual(canvas.selection?.head.row, 1)
+        XCTAssertEqual(reported.last?.0, .right)
+        XCTAssertEqual(reported.last?.1, 1)
+
+        XCTAssertTrue(canvas.handleVimKey(VimKey("k")))
+        XCTAssertEqual(canvas.selection?.head.row, 0)
+        XCTAssertEqual(reported.last?.1, 0)
+
+        // Exit Visual and verify backward Visual-Line (V + k) tracks moving head too.
+        XCTAssertTrue(canvas.handleVimKey(VimKey(.escape)))
+        canvas.placeCaret(line: 2, column: 0)
+        reported.removeAll()
+        XCTAssertTrue(canvas.handleVimKey(VimKey("V")))
+        XCTAssertTrue(canvas.handleVimKey(VimKey("k")))
+        XCTAssertEqual(canvas.selection?.head.row, 1)
+        XCTAssertEqual(reported.last?.1, 1)
+    }
 }

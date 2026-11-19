@@ -280,8 +280,13 @@ final class CodeCanvasView: NSView {
     var selection: TextSelection? {
         didSet {
             if selection != oldValue {
-                if !isApplyingVimSelection, let sel = selection, mode != .sideBySide || sel.pane == .right {
-                    vimCursor = linePosition(sel.head)
+                if !isApplyingVimSelection {
+                    if !vimModeEnabled, vimEngine.mode.isVisual {
+                        vimEngine.resetToNormal(switchInputSource: false)
+                    }
+                    if let sel = selection, mode != .sideBySide || sel.pane == .right {
+                        vimCursor = linePosition(sel.head)
+                    }
                 }
                 refreshRelativeLineNumbersIfNeeded()
                 invalidate(.selection)
@@ -2645,7 +2650,7 @@ final class CodeCanvasView: NSView {
         }
         let side = pane(at: point)
         guard let pos = position(at: point, pane: side) else { selection = nil; return }
-        if vimModeEnabled, vimEngine.mode.isVisual || vimEngine.mode.isCommandLine {
+        if vimEngine.mode.isVisual || vimEngine.mode.isCommandLine {
             vimEngine.resetToNormal(switchInputSource: false)
         }
         switch event.clickCount {
@@ -2863,6 +2868,13 @@ final class CodeCanvasView: NSView {
                     if editor != nil, handleEditingKey(event) { return }
                 } else {
                     if let key = VimKey.from(event: event), handleVimKey(key) { return }
+                    // Allow function keys (F1–F35) through to the responder chain while never falling
+                    // through to `handleEditingKey` (which would mutate the buffer outside Insert mode).
+                    if let scalar = event.charactersIgnoringModifiers?.unicodeScalars.first,
+                       Int(scalar.value) >= NSF1FunctionKey, Int(scalar.value) <= NSF35FunctionKey {
+                        super.keyDown(with: event)
+                    }
+                    return
                 }
             }
         }

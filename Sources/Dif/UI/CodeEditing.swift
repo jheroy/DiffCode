@@ -702,23 +702,35 @@ extension CodeCanvasView: @preconcurrency NSTextInputClient {
                 let head = TextEditing.clamp(vr.head, in: lines)
                 vimCursor = head
                 if vr.linewise {
-                    let firstRow = min(anchor.row, head.row)
-                    let lastRow = max(anchor.row, head.row)
-                    let startPos = TextPosition(row: firstRow, column: 0)
-                    let endPos = TextPosition(row: lastRow, column: lineLength(lastRow))
-                    selection = TextSelection(pane: .right, anchor: rowPosition(startPos), head: rowPosition(endPos))
+                    if head.row >= anchor.row {
+                        let startPos = TextPosition(row: anchor.row, column: 0)
+                        let endPos = TextPosition(row: head.row, column: lineLength(head.row))
+                        selection = TextSelection(pane: .right, anchor: rowPosition(startPos), head: rowPosition(endPos))
+                    } else {
+                        let startPos = TextPosition(row: anchor.row, column: lineLength(anchor.row))
+                        let endPos = TextPosition(row: head.row, column: 0)
+                        selection = TextSelection(pane: .right, anchor: rowPosition(startPos), head: rowPosition(endPos))
+                    }
                 } else {
-                    let lo = min(anchor, head)
-                    let hi = max(anchor, head)
-                    let hiNS = lines[hi.row] as NSString
-                    let hiEnd = hi.column < hiNS.length
-                        ? TextEditing.characterBoundary(in: hiNS, from: hi.column, forward: true)
-                        : hiNS.length
-                    selection = TextSelection(
-                        pane: .right,
-                        anchor: rowPosition(lo),
-                        head: rowPosition(TextPosition(row: hi.row, column: hiEnd))
-                    )
+                    func charEnd(_ pos: TextPosition) -> Int {
+                        let ns = lines[pos.row] as NSString
+                        return pos.column < ns.length
+                            ? TextEditing.characterBoundary(in: ns, from: pos.column, forward: true)
+                            : ns.length
+                    }
+                    if head >= anchor {
+                        selection = TextSelection(
+                            pane: .right,
+                            anchor: rowPosition(anchor),
+                            head: rowPosition(TextPosition(row: head.row, column: charEnd(head)))
+                        )
+                    } else {
+                        selection = TextSelection(
+                            pane: .right,
+                            anchor: rowPosition(TextPosition(row: anchor.row, column: charEnd(anchor))),
+                            head: rowPosition(head)
+                        )
+                    }
                 }
             } else if let newCursor = result.cursor {
                 let clamped = TextEditing.clamp(newCursor, in: lines)
