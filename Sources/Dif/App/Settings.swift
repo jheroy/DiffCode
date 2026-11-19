@@ -103,6 +103,10 @@ final class Settings {
     var terminalFontSize: Double
     /// Font families picked for code and for terminals; nil is the default face (see `MonospaceFonts`).
     var codeFontFamily: String?
+    /// GoLand-style typography settings for the code canvas.
+    var codeFontMainWeight: CodeFontWeight
+    var codeFontBoldWeight: CodeFontWeight
+    var codeFontLigatures: Bool
     var terminalFontFamily: String?
     var unified: Bool
     var ignoreWhitespace: Bool
@@ -116,9 +120,10 @@ final class Settings {
     /// Keep the file tree's selection on whatever file the viewer is showing.
     var followFile: Bool
 
-    @ObservationIgnored private let defaults = UserDefaults.standard
+    @ObservationIgnored private let defaults: UserDefaults
 
-    init() {
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         // First launch is dark, as Android Studio's default theme is; a choice made in Settings is kept.
         appearance = Appearance(rawValue: defaults.string(forKey: "appearance") ?? "") ?? .dark
         language = Language.stored(in: defaults)
@@ -127,6 +132,9 @@ final class Settings {
         terminalFontSize = min(Self.terminalFontRange.upperBound,
                                max(Self.terminalFontRange.lowerBound, defaults.object(forKey: "terminalFontSize") as? Double ?? 12))
         codeFontFamily = defaults.string(forKey: "codeFontFamily").flatMap { $0.isEmpty ? nil : $0 }
+        codeFontMainWeight = defaults.string(forKey: "codeFontMainWeight").flatMap(CodeFontWeight.init(rawValue:)) ?? .regular
+        codeFontBoldWeight = defaults.string(forKey: "codeFontBoldWeight").flatMap(CodeFontWeight.init(rawValue:)) ?? .bold
+        codeFontLigatures = defaults.object(forKey: "codeFontLigatures") as? Bool ?? true
         terminalFontFamily = defaults.string(forKey: "terminalFontFamily").flatMap { $0.isEmpty ? nil : $0 }
         unified = defaults.bool(forKey: "unified")
         ignoreWhitespace = defaults.bool(forKey: "ignoreWhitespace")
@@ -147,6 +155,9 @@ final class Settings {
         defaults.set(uiFontSize, forKey: "uiFontSize")
         defaults.set(terminalFontSize, forKey: "terminalFontSize")
         defaults.set(codeFontFamily, forKey: "codeFontFamily")  // nil removes the key
+        defaults.set(codeFontMainWeight.rawValue, forKey: "codeFontMainWeight")
+        defaults.set(codeFontBoldWeight.rawValue, forKey: "codeFontBoldWeight")
+        defaults.set(codeFontLigatures, forKey: "codeFontLigatures")
         defaults.set(terminalFontFamily, forKey: "terminalFontFamily")
         defaults.set(unified, forKey: "unified")
         defaults.set(ignoreWhitespace, forKey: "ignoreWhitespace")

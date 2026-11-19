@@ -440,6 +440,10 @@ final class FindInPathModel {
         positionPreview()
     }
 
+    func applyCodeFont() {
+        previewContainer?.canvas.codeFont = CodeFont.current(store?.settings ?? .shared)
+    }
+
     private func setPreview(_ doc: DiffDocument?) {
         previewDocument = doc
         if doc == nil { previewPath = ""; previewKey = "" }
