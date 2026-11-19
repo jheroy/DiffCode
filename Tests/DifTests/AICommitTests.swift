@@ -420,4 +420,142 @@ final class AICommitTests: XCTestCase {
             XCTAssertEqual(error, .unavailableInAppStore)
         }
     }
+
+    // MARK: - Summary & Prompt Byte Capping (ARG_MAX Safety)
+
+    func testCollectCheckedDiffCapsSummaryByFileCountAndBytes() async throws {
+        let root = try await makeRepo()
+        var changes: [FileChange] = []
+        for i in 0..<25 {
+            let path = "dir/nested/module_\(i)/very_long_file_name_\(i).swift"
+            try writeFile(path, content: "let v\(i) = \(i)\n", in: root)
+            changes.append(FileChange(path: path, oldPath: nil, kind: .untracked))
+        }
+
+        // File count cap
+        let countCapped = try await AICommitGenerator.collectCheckedDiff(
+            changes: changes,
+            in: root,
+            maxSummaryFiles: 5,
+            maxSummaryBytes: 8 * 1024
+        )
+        XCTAssertTrue(countCapped.truncated)
+        XCTAssertTrue(countCapped.summary.contains("... and 20 more file(s)"))
+        XCTAssertEqual(countCapped.summary.split(separator: "\n").count, 6)
+
+        // Byte cap
+        let byteCapped = try await AICommitGenerator.collectCheckedDiff(
+            changes: changes,
+            in: root,
+            maxSummaryFiles: 200,
+            maxSummaryBytes: 320
+        )
+        XCTAssertTrue(byteCapped.truncated)
+        XCTAssertTrue(byteCapped.summary.contains("more file(s)"))
+        XCTAssertLessThanOrEqual(byteCapped.summary.utf8.count, 320)
+    }
+
+    func testBuildPromptEnforcesHardByteCapBelowArgMax() {
+        let hugeFormat = String(repeating: "自定义提交格式规则说明\n", count: 4000)
+        let hugeSummary = (0..<3000).map { "M Sources/Module/File_\($0).swift (+10 -2)" }.joined(separator: "\n")
+        let hugeDiff = String(repeating: "+let line = \"some diff payload line\"\n", count: 5000)
+
+        let prompt = AICommitGenerator.buildPrompt(
+            diff: hugeDiff,
+            format: hugeFormat,
+            summary: hugeSummary
+        )
+        XCTAssertLessThanOrEqual(prompt.utf8.count, AICommitGenerator.defaultMaxPromptBytes)
+        XCTAssertTrue(prompt.contains("truncated"))
+
+        let tightPrompt = AICommitGenerator.buildPrompt(
+            diff: hugeDiff,
+            format: hugeFormat,
+            summary: hugeSummary,
+            maxPromptBytes: 4096
+        )
+        XCTAssertLessThanOrEqual(tightPrompt.utf8.count, 4096)
+    }
+
+    // MARK: - Cancel-Then-Regenerate Token Isolation & SIGKILL Fallback
+
+    @MainActor
+    func testCancelThenRegenerateIsolatesTokensAcrossDeferCleanup() async throws {
+        let root = try makeTempDir("token-project")
+        let project = Project(url: root)
+
+        let token1 = project.beginCommitMessageGeneration()
+        let task1 = Task { @MainActor in
+            defer { project.finishCommitMessageGeneration(token: token1) }
+            // Simulate a slow exit after cancellation (e.g., child process still shutting down).
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            if project.commitMessageGenerationID == token1 {
+                project.commitMessage = "STALE_MESSAGE_FROM_TASK_1"
+            }
+        }
+        project.commitMessageGenerationTask = task1
+
+        // User cancels task 1 and immediately starts task 2 before task 1's defer runs.
+        project.cancelCommitMessageGeneration()
+        XCTAssertFalse(project.isGeneratingCommitMessage)
+
+        let token2 = project.beginCommitMessageGeneration()
+        XCTAssertNotEqual(token1, token2)
+        let task2 = Task { @MainActor in
+            defer { project.finishCommitMessageGeneration(token: token2) }
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            if project.commitMessageGenerationID == token2 {
+                project.commitMessage = "FRESH_MESSAGE_FROM_TASK_2"
+            }
+        }
+        project.commitMessageGenerationTask = task2
+
+        // Wait for task 1 (and its defer) to finish while task 2 is still running.
+        await task1.value
+        XCTAssertTrue(project.isGeneratingCommitMessage, "Task 1's defer must not clear Task 2's spinner")
+        XCTAssertNotNil(project.commitMessageGenerationTask, "Task 1's defer must not clear Task 2's task handle")
+        XCTAssertEqual(project.commitMessage, "", "Cancelled Task 1 must not write stale commit text")
+
+        // Now wait for task 2 to finish cleanly.
+        await task2.value
+        XCTAssertFalse(project.isGeneratingCommitMessage)
+        XCTAssertNil(project.commitMessageGenerationTask)
+        XCTAssertEqual(project.commitMessage, "FRESH_MESSAGE_FROM_TASK_2")
+    }
+
+    func testRunCLIEscalatesToSIGKILLWhenChildIgnoresSIGTERM() async throws {
+        let stubbornScript = try makeExecutableScript(
+            """
+            #!/bin/sh
+            trap '' TERM
+            while true; do
+              sleep 1
+            done
+            """,
+            name: "stubborn-agy"
+        )
+        let start = Date()
+        let workDir = fm.temporaryDirectory
+
+        let task = Task {
+            try await AICommitGenerator.runCLI(
+                executable: stubbornScript.path,
+                arguments: [],
+                environment: ProcessInfo.processInfo.environment,
+                workingDirectory: workDir,
+                timeoutSeconds: 30,
+                killGracePeriod: 0.2
+            )
+        }
+
+        try await Task.sleep(nanoseconds: 150_000_000)
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected CancellationError")
+        } catch is CancellationError {
+            XCTAssertLessThan(Date().timeIntervalSince(start), 3.0)
+        }
+    }
 }

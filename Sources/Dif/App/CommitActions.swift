@@ -240,18 +240,18 @@ extension AppStore {
         guard viewer.saveEdits() else { return }
 
         let format = settings.effectiveCommitMessageFormat
-        project.isGeneratingCommitMessage = true
+        let token = project.beginCommitMessageGeneration()
         project.commitMessageGenerationTask = Task { @MainActor [weak self, weak project] in
             guard let self, let project else { return }
             defer {
-                project.isGeneratingCommitMessage = false
-                project.commitMessageGenerationTask = nil
+                project.finishCommitMessageGeneration(token: token)
             }
             do {
                 let payload = try await AICommitGenerator.collectCheckedDiff(for: project)
                 try Task.checkCancellation()
                 let generated = try await AICommitGenerator.generate(from: payload, format: format)
                 try Task.checkCancellation()
+                guard project.commitMessageGenerationID == token else { return }
                 project.commitMessage = generated
                 if project.id == self.selectedProjectID {
                     self.focusCommitMessage()
@@ -260,6 +260,7 @@ extension AppStore {
             } catch is CancellationError {
                 // Cancelled by user or project switch; preserve any existing draft silently.
             } catch {
+                guard project.commitMessageGenerationID == token else { return }
                 self.showToast(error.localizedDescription)
             }
         }
@@ -268,8 +269,6 @@ extension AppStore {
     /// Cancels any active AI commit message generation for `project`, terminating the underlying `agy` process.
     func cancelCommitMessageGeneration(in project: Project? = nil) {
         guard let project = project ?? currentProject else { return }
-        project.commitMessageGenerationTask?.cancel()
-        project.commitMessageGenerationTask = nil
-        project.isGeneratingCommitMessage = false
+        project.cancelCommitMessageGeneration()
     }
 }
