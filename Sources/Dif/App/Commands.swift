@@ -137,6 +137,11 @@ extension AppStore {
                 self.settings.vimMode.toggle()
                 self.settings.save()
             },
+            AppCommand(id: "view.lineDiffBar", title: L("Toggle Inline Line Diff Bar", "显示/隐藏 底部行内对比栏"), symbol: "rectangle.split.1x2", group: .view) { [weak self] in
+                guard let self else { return }
+                self.settings.showLineDiffBar.toggle()
+                self.settings.save()
+            },
             AppCommand(id: "view.fontUp", title: L("Increase Font Size", "增大字号"), symbol: "textformat.size.larger", group: .view,
                        key: ".", modifiers: [.control, .shift], separatorBefore: true) { viewer.changeFontSize(by: 1) },
             AppCommand(id: "view.fontDown", title: L("Decrease Font Size", "减小字号"), symbol: "textformat.size.smaller", group: .view,
