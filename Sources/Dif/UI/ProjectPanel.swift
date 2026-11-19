@@ -732,10 +732,48 @@ struct EmptyListState: View {
 
 // MARK: - Log
 
+/// Pure layout math for `CommitDetail` height fitting and drag clamping inside `LogPanel`.
+enum CommitDetailLayout {
+    static let minHeight: Double = 120
+    /// `KeyboardList` adds `.padding(.vertical, 4)` (8 pt) around rows; 2 pt extra prevents unnecessary scrollbar flicker.
+    static let listPadding: Double = 10
+    static let defaultChromeHeight: Double = 72
+
+    static func minCommitListHeight(commitRowHeight: Double) -> Double {
+        max(140, max(0, commitRowHeight) * 3.5 + 8)
+    }
+
+    static func maxHeight(availableHeight: Double, minCommitListHeight: Double) -> Double {
+        max(0, availableHeight - max(0, minCommitListHeight) - 1)
+    }
+
+    static func clampedHeight(_ height: Double, minHeight: Double = Self.minHeight, maxHeight: Double) -> Double {
+        let safeMax = max(0, maxHeight)
+        let safeMin = min(max(0, minHeight), safeMax)
+        return min(safeMax, max(safeMin, height))
+    }
+
+    static func fittedHeight(
+        rowCount: Int,
+        rowHeight: Double,
+        chromeHeight: Double,
+        listPadding: Double = Self.listPadding,
+        minHeight: Double = Self.minHeight,
+        maxHeight: Double
+    ) -> Double {
+        let count = max(0, rowCount)
+        let rowsHeight = count > 0 ? Double(count) * max(0, rowHeight) + max(0, listPadding) : 0
+        let ideal = max(0, chromeHeight) + rowsHeight
+        return clampedHeight(ideal, minHeight: minHeight, maxHeight: maxHeight)
+    }
+}
+
 struct LogPanel: View {
     @Bindable var project: Project
     @Environment(AppStore.self) private var store
-    @State private var filesHeight: Double = 260
+    @State private var manualFilesHeight: Double?
+    @State private var dragStartHeight: Double?
+    @State private var chromeHeight: Double = CommitDetailLayout.defaultChromeHeight
     @State private var filesFocusToken = 0
     @State private var searchWork: DispatchWorkItem?
 
@@ -783,31 +821,91 @@ struct LogPanel: View {
                     EmptyListState(symbol: "clock", title: L("No commits", "没有提交"), detail: "")
                 }
             } else {
-                KeyboardList(rows: project.commits,
-                             selection: Binding(get: { project.selectedCommitID }, set: { id in
-                                 project.selectedCommitID = id
-                                 store.pickedInLog(project, commitChanged: true)
-                             }),
-                             multiSelection: Binding(get: { project.selectedCommitIDs }, set: { ids in
-                                 project.selectedCommitIDs = ids
-                                 store.pickedInLog(project, commitChanged: true)
-                             }),
-                             focusToken: store.listFocusToken, rowHeight: 44,
-                             onKey: { event, _ in
-                                 if event.keyCode == 124 || event.keyCode == 36 { filesFocusToken += 1; return true }
-                                 return false
-                             },
-                             onDoubleClick: { _ in filesFocusToken += 1 },
-                             onLastRowAppear: { if project.hasMoreCommits { project.loadLog(reset: false) } },
-                             menu: { commit in store.logCommitMenu(commit, in: project) }) { commit, _, _ in
-                    CommitRowView(commit: commit)
+                GeometryReader { proxy in
+                    let availableHeight = Double(proxy.size.height)
+                    let minCommitListHeight = CommitDetailLayout.minCommitListHeight(commitRowHeight: Double(UI.s(44)))
+                    let maxHeight = CommitDetailLayout.maxHeight(availableHeight: availableHeight, minCommitListHeight: minCommitListHeight)
+                    let rows = ChangeTree.rows(changes: project.commitFiles, flat: store.settings.flatList,
+                                               collapsed: project.commitCollapsed, filter: "", splitUnversioned: false)
+                    let autoHeight = CommitDetailLayout.fittedHeight(
+                        rowCount: rows.count,
+                        rowHeight: Double(UI.s(24)),
+                        chromeHeight: chromeHeight,
+                        maxHeight: maxHeight
+                    )
+                    let detailHeight = manualFilesHeight.map {
+                        CommitDetailLayout.clampedHeight($0, minHeight: CommitDetailLayout.minHeight, maxHeight: maxHeight)
+                    } ?? autoHeight
+
+                    VStack(spacing: 0) {
+                        KeyboardList(rows: project.commits,
+                                     selection: Binding(get: { project.selectedCommitID }, set: { id in
+                                         project.selectedCommitID = id
+                                         store.pickedInLog(project, commitChanged: true)
+                                     }),
+                                     multiSelection: Binding(get: { project.selectedCommitIDs }, set: { ids in
+                                         project.selectedCommitIDs = ids
+                                         store.pickedInLog(project, commitChanged: true)
+                                     }),
+                                     focusToken: store.listFocusToken, rowHeight: 44,
+                                     onKey: { event, _ in
+                                         if event.keyCode == 124 || event.keyCode == 36 { filesFocusToken += 1; return true }
+                                         return false
+                                     },
+                                     onDoubleClick: { _ in filesFocusToken += 1 },
+                                     onLastRowAppear: { if project.hasMoreCommits { project.loadLog(reset: false) } },
+                                     menu: { commit in store.logCommitMenu(commit, in: project) }) { commit, _, _ in
+                            CommitRowView(commit: commit)
+                        }
+                        DividerGrip(
+                            axis: .rows,
+                            color: .difHairline,
+                            onDrag: { translation in
+                                guard let translation else {
+                                    dragStartHeight = nil
+                                    return
+                                }
+                                let start = dragStartHeight ?? detailHeight
+                                if dragStartHeight == nil { dragStartHeight = detailHeight }
+                                manualFilesHeight = CommitDetailLayout.clampedHeight(
+                                    start - Double(translation),
+                                    minHeight: CommitDetailLayout.minHeight,
+                                    maxHeight: maxHeight
+                                )
+                            },
+                            onDoubleClick: {
+                                withAnimation(.snappy(duration: 0.2)) {
+                                    manualFilesHeight = nil
+                                }
+                            }
+                        )
+                        CommitDetail(
+                            project: project,
+                            focusToken: filesFocusToken,
+                            rows: rows,
+                            onChromeHeightChange: { height in
+                                if abs(chromeHeight - height) > 0.5 {
+                                    chromeHeight = height
+                                }
+                            }
+                        )
+                        .frame(height: detailHeight)
+                        .clipped()
+                        .animation(dragStartHeight == nil ? .snappy(duration: 0.2) : nil, value: rows.count)
+                        .animation(dragStartHeight == nil ? .snappy(duration: 0.2) : nil, value: chromeHeight)
+                    }
                 }
-                HorizontalResizeHandle(height: $filesHeight, range: 120...520)
-                CommitDetail(project: project, focusToken: filesFocusToken)
-                    .frame(height: filesHeight)
             }
         }
-        .onChange(of: project.commitSelectionIDs) { _, _ in store.commitSelectionChanged(project) }
+        .onChange(of: project.id) { _, _ in
+            manualFilesHeight = nil
+        }
+        .onChange(of: project.commitSelectionIDs) { _, _ in
+            withAnimation(.snappy(duration: 0.2)) {
+                manualFilesHeight = nil
+            }
+            store.commitSelectionChanged(project)
+        }
         .onChange(of: project.selectedCommitFileID) { _, _ in store.commitFileSelectionChanged(project) }
         .onAppear {
             // A load already running (one asked for by the Git graph) is not replaced by a plain one.
@@ -900,13 +998,35 @@ struct RefChip: View {
 private struct CommitDetail: View {
     @Bindable var project: Project
     var focusToken: Int
+    var rows: [ChangeRow]
+    var onChromeHeightChange: (Double) -> Void
     @Environment(AppStore.self) private var store
 
     var body: some View {
-        let rows = ChangeTree.rows(changes: project.commitFiles, flat: store.settings.flatList,
-                                   collapsed: project.commitCollapsed, filter: "", splitUnversioned: false)
         let folderIDs = store.settings.flatList ? [] : project.commitFolderIDs
         let selectedCommits = project.selectedCommits
+        VStack(spacing: 0) {
+            chrome(folderIDs: folderIDs, selectedCommits: selectedCommits)
+            KeyboardList(rows: rows,
+                         selection: Binding(get: { project.selectedCommitFileID }, set: { id in
+                             project.selectedCommitFileID = id
+                             store.pickedInLog(project, commitChanged: false)
+                         }),
+                         focusToken: focusToken + store.logFilesFocusToken,
+                         onKey: { event, row in handleKey(event, row, rows) },
+                         onClick: { row in
+                             if row.file == nil { toggle(row) }
+                         },
+                         onDoubleClick: { row in
+                             if row.file != nil { store.focusViewer() }
+                         },
+                         menu: { row in rowMenu(row) }) { row, _, _ in
+                ChangeRowView(row: row, showDirectory: store.settings.flatList) { toggle(row) }
+            }
+        }
+    }
+
+    private func chrome(folderIDs: Set<String>, selectedCommits: [Commit]) -> some View {
         VStack(spacing: 0) {
             if selectedCommits.count > 1, let newest = selectedCommits.first, let oldest = selectedCommits.last {
                 let fileCount = project.commitFiles.count
@@ -950,6 +1070,7 @@ private struct CommitDetail: View {
                         .font(.ui(size: 12))
                         .foregroundStyle(Color.difText)
                         .lineLimit(4)
+                        .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     HStack(spacing: 6) {
@@ -980,23 +1101,15 @@ private struct CommitDetail: View {
                 filesBar(rows: rows, folderIDs: folderIDs, multiCommit: selectedCommits.count > 1)
                 Rectangle().fill(Color.difHairline).frame(height: 1)
             }
-            KeyboardList(rows: rows,
-                         selection: Binding(get: { project.selectedCommitFileID }, set: { id in
-                             project.selectedCommitFileID = id
-                             store.pickedInLog(project, commitChanged: false)
-                         }),
-                         focusToken: focusToken + store.logFilesFocusToken,
-                         onKey: { event, row in handleKey(event, row, rows) },
-                         onClick: { row in
-                             if row.file == nil { toggle(row) }
-                         },
-                         onDoubleClick: { row in
-                             if row.file != nil { store.focusViewer() }
-                         },
-                         menu: { row in rowMenu(row) }) { row, _, _ in
-                ChangeRowView(row: row, showDirectory: store.settings.flatList) { toggle(row) }
-            }
         }
+        .fixedSize(horizontal: false, vertical: true)
+        .background(
+            GeometryReader { geo in
+                Color.clear.onChange(of: geo.size.height, initial: true) { _, height in
+                    onChromeHeightChange(Double(height))
+                }
+            }
+        )
     }
 
     private func filesBar(rows: [ChangeRow], folderIDs: Set<String>, multiCommit: Bool) -> some View {
