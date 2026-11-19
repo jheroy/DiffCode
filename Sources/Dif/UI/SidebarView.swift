@@ -5,60 +5,96 @@ struct SidebarView: View {
     @Environment(AppStore.self) private var store
     /// The projects' height when a drag of the divider under them began.
     @State private var dragStart: CGFloat?
+    @State private var topChromeHeight: CGFloat = 60
+    @State private var footerHeight: CGFloat = 35
 
     var body: some View {
         GeometryReader { proxy in
-            VStack(spacing: 0) {
-                // Clear space for the traffic lights (offset by the outer island frame padding); still draggable.
-                WindowDragArea().frame(height: store.isFullScreen ? 10 : max(26, store.titlebarHeight - IslandStyle.outerPadding))
-
-                HStack {
-                    SectionLabel(text: L("Projects", "项目"))
-                    Spacer()
-                    IconButton(symbol: "plus", help: L("Add Project (⌘N)", "添加项目 (⌘N)"), size: 12) { store.presentAddProject() }
-                }
-                .padding(.leading, 16)
-                .padding(.trailing, 8)
-                .padding(.bottom, 4)
-
-                if let project = store.currentProject, !project.needsAccess, !store.gitMissing {
-                    GeometryReader { middle in
-                        // The projects take the room they need, up to about a third; once the divider has been
-                        // dragged, exactly that much, blank space and all. The tree keeps at least its bar.
-                        let height = Self.projectsHeight(count: store.projectRows.count, available: proxy.size.height,
-                                                         chosen: store.settings.projectsHeight, room: middle.size.height)
-                        VStack(spacing: 0) {
-                            projects.frame(height: height)
-                            DividerGrip(axis: .rows, color: .difHairline, onDrag: { translation in
-                                guard let translation else {
-                                    dragStart = nil
-                                    store.settings.save()
-                                    return
-                                }
-                                let start = dragStart ?? height
-                                if dragStart == nil { dragStart = height }
-                                store.settings.projectsHeight = Self.clampedChoice(start + translation, room: middle.size.height)
-                            }, onDoubleClick: {
-                                // Back to the height that follows the number of projects.
-                                store.settings.projectsHeight = nil
-                                store.settings.save()
+            if let project = store.currentProject, !project.needsAccess, !store.gitMissing {
+                let room = max(0, proxy.size.height - topChromeHeight - footerHeight)
+                // The projects take the room they need, up to about a third; once the divider has been
+                // dragged, exactly that much, blank space and all. The tree keeps at least its bar.
+                let height = Self.projectsHeight(count: store.projectRows.count,
+                                                 available: proxy.size.height,
+                                                 chosen: store.settings.projectsHeight,
+                                                 room: room,
+                                                 dividerHeight: IslandStyle.gap)
+                VStack(spacing: 0) {
+                    VStack(spacing: 0) {
+                        projectsHeader
+                            .background(heightReader { value in
+                                if abs(topChromeHeight - value) > 0.5 { topChromeHeight = value }
                             })
-                            FileTreePanel(project: project)
-                                .id(project.id)
-                                .clipped()
-                        }
+                        projects.frame(height: height)
                     }
-                } else {
-                    projects
-                }
+                    .islandCard(background: .difSidebar)
 
-                Divider().opacity(0.5)
-                SidebarFooter()
+                    DividerGrip(axis: .rows, islandGap: true, onDrag: { translation in
+                        guard let translation else {
+                            dragStart = nil
+                            store.settings.save()
+                            return
+                        }
+                        let start = dragStart ?? height
+                        if dragStart == nil { dragStart = height }
+                        store.settings.projectsHeight = Self.clampedChoice(start + translation, room: room, dividerHeight: IslandStyle.gap)
+                    }, onDoubleClick: {
+                        // Back to the height that follows the number of projects.
+                        store.settings.projectsHeight = nil
+                        store.settings.save()
+                    })
+
+                    VStack(spacing: 0) {
+                        FileTreePanel(project: project)
+                            .id(project.id)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        sidebarFooter
+                            .background(heightReader { value in
+                                if abs(footerHeight - value) > 0.5 { footerHeight = value }
+                            })
+                    }
+                    .islandCard(background: .difSidebar)
+                }
+            } else {
+                VStack(spacing: 0) {
+                    projectsHeader
+                    projects
+                    sidebarFooter
+                }
+                .islandCard(background: .difSidebar)
             }
         }
-        // Opaque, like the other panels. The system's translucent sidebar material let a bright wallpaper or
-        // window behind show through, and the text, coloured for a dark panel, faded into it.
-        .background(Color.difSidebar)
+    }
+
+    private var projectsHeader: some View {
+        VStack(spacing: 0) {
+            // Clear space for the traffic lights (offset by the outer island frame padding); still draggable.
+            WindowDragArea().frame(height: store.isFullScreen ? 10 : max(26, store.titlebarHeight - IslandStyle.outerPadding))
+
+            HStack {
+                SectionLabel(text: L("Projects", "项目"))
+                Spacer()
+                IconButton(symbol: "plus", help: L("Add Project (⌘N)", "添加项目 (⌘N)"), size: 12) { store.presentAddProject() }
+            }
+            .padding(.leading, 16)
+            .padding(.trailing, 8)
+            .padding(.bottom, 4)
+        }
+    }
+
+    private var sidebarFooter: some View {
+        VStack(spacing: 0) {
+            Divider().opacity(0.5)
+            SidebarFooter()
+        }
+    }
+
+    private func heightReader(_ onChange: @escaping (CGFloat) -> Void) -> some View {
+        GeometryReader { geo in
+            Color.clear.onChange(of: geo.size.height, initial: true) { _, value in
+                onChange(value)
+            }
+        }
     }
 
     private var projects: some View {
@@ -90,22 +126,22 @@ struct SidebarView: View {
     static var treeMinimum: CGFloat { UI.s(56) }
 
     /// What a drag of the divider may ask for: a row and a half at least, and room left for the tree's bar.
-    static func clampedChoice(_ height: CGFloat, room: CGFloat) -> Double {
+    static func clampedChoice(_ height: CGFloat, room: CGFloat, dividerHeight: CGFloat = 1) -> Double {
         let step = rowHeight + rowSpacing
-        return Double(max(step * 1.5, min(height, room - 1 - treeMinimum)).rounded())
+        return Double(max(step * 1.5, min(height, room - dividerHeight - treeMinimum)).rounded())
     }
 
     /// Every project when they fit; otherwise a cut that leaves half a row showing, so the list reads as scrollable.
     /// A height the user dragged to (`chosen`) is kept as it is, even where it leaves room below the projects: that
     /// room takes folders dropped to add them. `room` is what the projects, the divider and the tree share.
-    static func projectsHeight(count: Int, available: CGFloat, chosen: Double? = nil, room: CGFloat = .infinity) -> CGFloat {
+    static func projectsHeight(count: Int, available: CGFloat, chosen: Double? = nil, room: CGFloat = .infinity, dividerHeight: CGFloat = 1) -> CGFloat {
         let step = rowHeight + rowSpacing
         let all = CGFloat(max(1, count)) * step - rowSpacing + bottomPadding
         if let chosen {
-            return CGFloat(clampedChoice(CGFloat(chosen), room: room))
+            return CGFloat(clampedChoice(CGFloat(chosen), room: room, dividerHeight: dividerHeight))
         }
         let limit = max(step * 2.5, min(step * 6.5, available * 0.34))
-        return max(0, min(room - 1 - treeMinimum, all <= limit ? all : ((limit / step - 0.5).rounded(.down) + 0.5) * step))
+        return max(0, min(room - dividerHeight - treeMinimum, all <= limit ? all : ((limit / step - 0.5).rounded(.down) + 0.5) * step))
     }
 }
 

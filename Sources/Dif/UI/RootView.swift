@@ -14,7 +14,6 @@ struct RootView: View {
                         if store.sidebarVisible {
                             SidebarView()
                                 .frame(width: settings.sidebarWidth)
-                                .islandCard(background: .difSidebar)
                                 .transition(.move(edge: .leading))
                             ResizeHandle(width: $settings.sidebarWidth, range: Settings.sidebarRange, islandGap: true) { settings.save() }
                         }
@@ -29,7 +28,6 @@ struct RootView: View {
                                 if store.listVisible {
                                     ProjectPanel(project: project)
                                         .frame(width: settings.listWidth)
-                                        .islandCard(background: .difPanel)
                                     ResizeHandle(width: $settings.listWidth, range: 236...620, islandGap: true) { settings.save() }
                                 }
                                 ViewerPanel(project: project)

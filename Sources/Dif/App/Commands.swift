@@ -222,7 +222,7 @@ extension AppStore {
             AppCommand(id: "git.commit", title: L("Commit…", "提交…"), symbol: "checkmark.circle", group: .git,
                        key: "c", modifiers: [.shift, .control, .option]) { [weak self] in self?.focusCommitMessage() },
             AppCommand(id: "git.commitPush", title: L("Commit and Push…", "提交并推送…"), symbol: "arrow.up.circle", group: .git,
-                       key: "k", modifiers: [.command, .option]) { [weak self] in self?.commitCurrent(thenPush: true) },
+                       key: "\r", modifiers: [.command, .shift]) { [weak self] in self?.commitCurrent(thenPush: true) },
             AppCommand(id: "git.amend", title: L("Amend Last Commit", "修改上次提交 (Amend)"), symbol: "pencil.circle",
                        group: .git) { [weak self] in self?.toggleAmend() },
             AppCommand(id: "git.undoCommit", title: L("Undo Last Commit", "撤销上次提交"), symbol: "arrow.uturn.backward.circle",

@@ -32,14 +32,18 @@ struct CommitCheckbox: View {
     }
 }
 
-/// The bottom of the Changes list: what will be committed, then the message box with the Commit button in it.
-/// The line above it is a divider: drag it to give the message more room or less.
+/// The bottom island of the Changes column: what will be committed, then the message box with the Commit button in it.
 struct CommitPanel: View {
     @Bindable var project: Project
-    /// The height of the whole Changes column, so the box never squeezes the list out.
+    /// The height of the Changes area (excluding header and island gap), so the box never squeezes the list out.
     var columnHeight: CGFloat
     @Environment(AppStore.self) private var store
     @State private var editing = false
+
+    /// Maximum height of the commit message editor box for the current Changes column height.
+    static func heightCeiling(columnHeight: CGFloat) -> Double {
+        max(Settings.commitBoxRange.lowerBound, min(Settings.commitBoxRange.upperBound, Double(columnHeight) - 220))
+    }
 
     var body: some View {
         @Bindable var settings = store.settings
@@ -56,59 +60,55 @@ struct CommitPanel: View {
         let canCommit = (merging ? project.status.conflictCount == 0 : ((!included.isEmpty || amend) && operation == nil)) && !project.isCommitting
             && !project.commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         // The list keeps at least a few rows.
-        let ceiling = max(Settings.commitBoxRange.lowerBound, min(Settings.commitBoxRange.upperBound, Double(columnHeight) - 220))
-        VStack(alignment: .leading, spacing: 0) {
-            HorizontalResizeHandle(height: $settings.commitBoxHeight, range: Settings.commitBoxRange.lowerBound...ceiling) { settings.save() }
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(spacing: 8) {
-                    Text(merging ? L("Finishing the merge: what it brought, plus the ticked files", "完成合并：合并带来的改动，加上勾选的文件")
-                                 : amend ? amendSummary(included: included.count, partial: partial)
-                                 : L("\(included.count) of \(project.changes.count) files to commit", "将提交 \(included.count) / \(project.changes.count) 个文件")
-                                   + (partial == 0 ? "" : L(" · \(partial) in part", " · \(partial) 个部分提交")))
-                        .font(.ui(size: 11))
-                        .foregroundStyle(Color.difText3)
-                        .lineLimit(1)
-                    Spacer(minLength: 4)
-                    StatBadge(additions: added, deletions: deleted)
-                }
-                if amend, let remote = project.amendPushedTo.first {
-                    Label(L("\(project.status.shortHead) is already on \(remote) · it can then only be pushed by force",
-                            "\(project.status.shortHead) 已推送到 \(remote) · 修改后只能强制推送"), systemImage: "exclamationmark.triangle.fill")
-                        .font(.ui(size: 11))
-                        .foregroundStyle(Color.orange)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                VStack(spacing: 0) {
-                    CommitMessageEditor(text: $project.commitMessage,
-                                        placeholder: L("Commit message", "提交说明"),
-                                        focusToken: store.commitFocusToken,
-                                        requestedAt: store.commitFocusRequestedAt,
-                                        onSubmit: { store.commitCurrent() },
-                                        onCancel: { store.focusList() },
-                                        onFocusChange: { editing = $0 })
-                        .padding(.horizontal, 4)
-                        .padding(.top, 5)
-                        .frame(maxHeight: .infinity)
-                    buttonRow(canCommit: canCommit, included: included.count, amend: amend)
-                        .padding(.horizontal, 6)
-                        .padding(.top, 4)
-                        .padding(.bottom, 6)
-                }
-                .frame(height: min(settings.commitBoxHeight, ceiling))
-                .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.difChip))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(editing ? Color.difAccent.opacity(0.7) : Color.clear, lineWidth: 1.5)
-                )
-                // A click on the box around the text, by the buttons, still means "write here".
-                .contentShape(Rectangle())
-                .onTapGesture { store.focusCommitMessage() }
+        let ceiling = Self.heightCeiling(columnHeight: columnHeight)
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 8) {
+                Text(merging ? L("Finishing the merge: what it brought, plus the ticked files", "完成合并：合并带来的改动，加上勾选的文件")
+                             : amend ? amendSummary(included: included.count, partial: partial)
+                             : L("\(included.count) of \(project.changes.count) files to commit", "将提交 \(included.count) / \(project.changes.count) 个文件")
+                               + (partial == 0 ? "" : L(" · \(partial) in part", " · \(partial) 个部分提交")))
+                    .font(.ui(size: 11))
+                    .foregroundStyle(Color.difText3)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                StatBadge(additions: added, deletions: deleted)
             }
-            .padding(.horizontal, 10)
-            .padding(.top, 7)
-            .padding(.bottom, 10)
+            if amend, let remote = project.amendPushedTo.first {
+                Label(L("\(project.status.shortHead) is already on \(remote) · it can then only be pushed by force",
+                        "\(project.status.shortHead) 已推送到 \(remote) · 修改后只能强制推送"), systemImage: "exclamationmark.triangle.fill")
+                    .font(.ui(size: 11))
+                    .foregroundStyle(Color.orange)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            VStack(spacing: 0) {
+                CommitMessageEditor(text: $project.commitMessage,
+                                    placeholder: L("Commit message", "提交说明"),
+                                    focusToken: store.commitFocusToken,
+                                    requestedAt: store.commitFocusRequestedAt,
+                                    onSubmit: { store.commitCurrent() },
+                                    onCommitAndPush: { store.commitCurrent(thenPush: true) },
+                                    onCancel: { store.focusList() },
+                                    onFocusChange: { editing = $0 })
+                    .padding(.horizontal, 4)
+                    .padding(.top, 5)
+                    .frame(maxHeight: .infinity)
+                buttonRow(canCommit: canCommit, included: included.count, amend: amend)
+                    .padding(.horizontal, 6)
+                    .padding(.top, 4)
+                    .padding(.bottom, 6)
+            }
+            .frame(height: min(settings.commitBoxHeight, ceiling))
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.difChip))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(editing ? Color.difAccent.opacity(0.7) : Color.clear, lineWidth: 1.5)
+            )
+            // A click on the box around the text, by the buttons, still means "write here".
+            .contentShape(Rectangle())
+            .onTapGesture { store.focusCommitMessage() }
         }
+        .padding(10)
         .onChange(of: project.id) { oldID, _ in
             if let previous = store.project(oldID), previous.isGeneratingCommitMessage {
                 store.cancelCommitMessageGeneration(in: previous)
@@ -123,12 +123,15 @@ struct CommitPanel: View {
             + (partial == 0 ? "" : L(" · \(partial) in part", " · \(partial) 个部分提交"))
     }
 
-    /// Inside the box, under the text: Amend and taking back the last commit on the left, Commit on the right.
+    /// Inside the box, under the text: Amend and taking back the last commit on the left, Commit & Commit and Push on the right.
     private func buttonRow(canCommit: Bool, included: Int, amend: Bool) -> some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 5) {
             if project.status.operation == nil, !project.status.isInitial || project.amend {
                 Toggle(isOn: Binding(get: { project.amend }, set: { store.setAmend($0, in: project) })) {
-                    Text(L("Amend", "修改上次提交")).font(.ui(size: 11.5)).foregroundStyle(Color.difText2)
+                    Text(L("Amend", "修改上次提交"))
+                        .font(.ui(size: 11.5))
+                        .foregroundStyle(Color.difText2)
+                        .lineLimit(1)
                 }
                 .toggleStyle(.checkbox)
                 .controlSize(.small)
@@ -140,10 +143,10 @@ struct CommitPanel: View {
                 Button { store.undoLastCommit() } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "arrow.uturn.backward").font(.ui(size: 9.5, weight: .semibold))
-                        Text(L("Undo \(last.shortHash)", "撤销 \(last.shortHash)")).font(.ui(size: 11.5))
+                        Text(L("Undo \(last.shortHash)", "撤销 \(last.shortHash)")).font(.ui(size: 11.5)).lineLimit(1)
                     }
                     .foregroundStyle(Color.difText2)
-                    .padding(.horizontal, 6)
+                    .padding(.horizontal, 5)
                     .frame(height: UI.s(24))
                     .contentShape(Rectangle())
                 }
@@ -161,6 +164,27 @@ struct CommitPanel: View {
                     store.generateCommitMessage(in: project)
                 }
             }
+            Button { store.commitCurrent(thenPush: true) } label: {
+                Text(L("Commit & Push", "提交并推送"))
+                    .font(.ui(size: 11.5, weight: .semibold))
+                    .lineLimit(1)
+                    .fixedSize()
+                    .foregroundStyle(Color.difAccent.opacity(canCommit ? 1 : 0.4))
+                    .padding(.horizontal, 9)
+                    .frame(height: UI.s(24))
+                    .background(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color.difAccent.opacity(canCommit ? 0.14 : 0.06))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(Color.difAccent.opacity(canCommit ? 0.35 : 0.14), lineWidth: 1)
+                    )
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!canCommit)
+            .help(commitPushHelp(canCommit: canCommit, included: included, amend: amend))
             Button { store.commitCurrent() } label: {
                 HStack(spacing: 6) {
                     if project.isCommitting {
@@ -170,6 +194,8 @@ struct CommitPanel: View {
                          : amend ? L("Amend Commit", "修改提交") : L("Commit", "提交")).font(.ui(size: 12, weight: .semibold))
                     Text("⌘↩").font(.ui(size: 10, weight: .medium, design: .rounded)).opacity(0.65)
                 }
+                .lineLimit(1)
+                .fixedSize()
                 .foregroundStyle(.white)
                 .padding(.horizontal, 11)
                 .frame(height: UI.s(24))
@@ -180,6 +206,10 @@ struct CommitPanel: View {
             .disabled(!canCommit)
             .help(commitHelp(included: included, amend: amend))
         }
+    }
+
+    private func commitPushHelp(canCommit: Bool, included: Int, amend: Bool) -> String {
+        canCommit ? L("Commit and Push (⇧⌘↩)", "提交并推送 (⇧⌘↩)") : commitHelp(included: included, amend: amend)
     }
 
     private func commitHelp(included: Int, amend: Bool) -> String {
@@ -240,7 +270,7 @@ private struct AICommitButton: View {
     }
 }
 
-/// A plain multi-line text view: ⌘↩ submits, Esc goes back to the list, ⇥ moves on rather than typing a tab.
+/// A plain multi-line text view: ⌘↩ submits, ⇧⌘↩ commits and pushes, Esc goes back to the list, ⇥ moves on rather than typing a tab.
 struct CommitMessageEditor: NSViewRepresentable {
     @Binding var text: String
     var placeholder: String
@@ -248,19 +278,25 @@ struct CommitMessageEditor: NSViewRepresentable {
     /// When the focus was asked for: an editor that is only now being created takes it if the request is fresh.
     var requestedAt: CFTimeInterval
     var onSubmit: () -> Void
+    var onCommitAndPush: () -> Void
     var onCancel: () -> Void
     var onFocusChange: (Bool) -> Void
 
     final class TextView: NSTextView {
         var placeholder = "" { didSet { needsDisplay = true } }
         var onSubmit: (() -> Void)?
+        var onCommitAndPush: (() -> Void)?
         var onCancel: (() -> Void)?
         var onFocusChange: ((Bool) -> Void)?
 
         override func keyDown(with event: NSEvent) {
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             if event.keyCode == 36 || event.keyCode == 76, flags.contains(.command) {
-                onSubmit?()
+                if flags.contains(.shift) {
+                    onCommitAndPush?()
+                } else {
+                    onSubmit?()
+                }
                 return
             }
             if event.keyCode == 53, !hasMarkedText() {
@@ -385,6 +421,7 @@ struct CommitMessageEditor: NSViewRepresentable {
         view.typingAttributes = [.font: font, .foregroundColor: Palette.textPrimary]
         view.placeholder = placeholder
         view.onSubmit = onSubmit
+        view.onCommitAndPush = onCommitAndPush
         view.onCancel = onCancel
         view.onFocusChange = onFocusChange
     }

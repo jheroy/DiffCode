@@ -3,19 +3,27 @@ import SwiftUI
 /// Middle column: a project's local changes or its commit log.
 struct ProjectPanel: View {
     @Bindable var project: Project
+
+    var body: some View {
+        switch project.tab {
+        case .changes:
+            if project.comparison != nil { ComparisonList(project: project) } else { ChangesList(project: project) }
+        case .log:
+            LogPanel(project: project)
+        }
+    }
+}
+
+/// Top tab bar (`Changes` / `Log`) + toolbar buttons + hairline, rendered inside the top island card.
+private struct ProjectTabsHeader: View {
+    @Bindable var project: Project
     @Environment(AppStore.self) private var store
 
     var body: some View {
         VStack(spacing: 0) {
             tabs
             Rectangle().fill(Color.difHairline).frame(height: 1)
-            switch project.tab {
-            case .changes:
-                if project.comparison != nil { ComparisonList(project: project) } else { ChangesList(project: project) }
-            case .log: LogPanel(project: project)
-            }
         }
-        .background(Color.difPanel)
     }
 
     /// The top row, level with the window's title bar: the two tabs, then the list's own buttons.
@@ -124,45 +132,59 @@ struct ChangesList: View {
     @Environment(AppStore.self) private var store
 
     var body: some View {
+        @Bindable var settings = store.settings
         let rows = ChangeTree.rows(changes: project.changes, flat: store.settings.flatList, collapsed: project.collapsed,
                                    filter: project.filter, splitUnversioned: true)
         let ticks = inclusion(for: rows)
         GeometryReader { proxy in
-        VStack(spacing: 0) {
-            if let operation = project.status.operation {
-                OperationBanner(project: project, operation: operation)
-            }
-            if project.changes.count > 8 || !project.filter.isEmpty {
-                FilterField(text: $project.filter, placeholder: L("Filter files", "筛选文件"))
-            }
-            if let message = project.errorMessage, project.changes.isEmpty {
-                EmptyListState(symbol: "exclamationmark.triangle", title: L("Could not read repository", "无法读取仓库"), detail: message)
-            } else if project.changes.isEmpty {
-                if project.hasLoaded {
-                    EmptyListState(symbol: "checkmark.seal", title: L("Working tree clean", "工作区很干净"),
-                                   detail: L("Nothing to compare. Press ⌘9 to browse history.", "没有改动。按 ⌘9 查看提交历史。"))
-                } else {
-                    Spacer()
+            let showsCommit = !project.changes.isEmpty || project.amend
+            let availableHeight = max(0, proxy.size.height - store.titlebarHeight - 1 - IslandStyle.gap)
+            let ceiling = CommitPanel.heightCeiling(columnHeight: availableHeight)
+            VStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    ProjectTabsHeader(project: project)
+                    if let operation = project.status.operation {
+                        OperationBanner(project: project, operation: operation)
+                    }
+                    if project.changes.count > 8 || !project.filter.isEmpty {
+                        FilterField(text: $project.filter, placeholder: L("Filter files", "筛选文件"))
+                    }
+                    if let message = project.errorMessage, project.changes.isEmpty {
+                        EmptyListState(symbol: "exclamationmark.triangle", title: L("Could not read repository", "无法读取仓库"), detail: message)
+                    } else if project.changes.isEmpty {
+                        if project.hasLoaded {
+                            EmptyListState(symbol: "checkmark.seal", title: L("Working tree clean", "工作区很干净"),
+                                           detail: L("Nothing to compare. Press ⌘9 to browse history.", "没有改动。按 ⌘9 查看提交历史。"))
+                        } else {
+                            Spacer()
+                        }
+                    } else if rows.isEmpty {
+                        EmptyListState(symbol: "line.3.horizontal.decrease.circle", title: L("No files match", "没有匹配的文件"), detail: "")
+                    } else {
+                        KeyboardList(rows: rows, selection: $project.selectedChangeID, multiSelection: $project.selectedChangeIDs,
+                                     focusToken: store.listFocusToken,
+                                     onKey: { event, row in handleKey(event, row, rows) },
+                                     onDoubleClick: { row in
+                                         if row.file != nil { store.focusViewer() } else { toggle(row) }
+                                     },
+                                     menu: { row in rowMenu(row) },
+                                     dragURLs: { row in project.existingURLs(store.editTargets(for: row, in: project)) }) { row, _, _ in
+                            ChangeRowView(row: row, showDirectory: store.settings.flatList, inclusion: ticks[row.id],
+                                          onToggleInclusion: { toggleInclusion(row) }) { toggle(row) }
+                        }
+                    }
                 }
-            } else if rows.isEmpty {
-                EmptyListState(symbol: "line.3.horizontal.decrease.circle", title: L("No files match", "没有匹配的文件"), detail: "")
-            } else {
-                KeyboardList(rows: rows, selection: $project.selectedChangeID, multiSelection: $project.selectedChangeIDs,
-                             focusToken: store.listFocusToken,
-                             onKey: { event, row in handleKey(event, row, rows) },
-                             onDoubleClick: { row in
-                                 if row.file != nil { store.focusViewer() } else { toggle(row) }
-                             },
-                             menu: { row in rowMenu(row) },
-                             dragURLs: { row in project.existingURLs(store.editTargets(for: row, in: project)) }) { row, _, _ in
-                    ChangeRowView(row: row, showDirectory: store.settings.flatList, inclusion: ticks[row.id],
-                                  onToggleInclusion: { toggleInclusion(row) }) { toggle(row) }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .islandCard(background: .difPanel)
+
+                if showsCommit {
+                    HorizontalResizeHandle(height: $settings.commitBoxHeight,
+                                           range: Settings.commitBoxRange.lowerBound...ceiling,
+                                           islandGap: true) { settings.save() }
+                    CommitPanel(project: project, columnHeight: availableHeight)
+                        .islandCard(background: .difPanel)
                 }
             }
-            if !project.changes.isEmpty || project.amend {
-                CommitPanel(project: project, columnHeight: proxy.size.height)
-            }
-        }
         }
         .onChange(of: project.selectedChangeID) { _, _ in store.changeSelectionChanged(project) }
     }
@@ -403,6 +425,7 @@ struct ComparisonList: View {
         let rows = ChangeTree.rows(changes: project.compareChanges, flat: store.settings.flatList, collapsed: project.compareCollapsed,
                                    filter: project.filter, splitUnversioned: true)
         VStack(spacing: 0) {
+            ProjectTabsHeader(project: project)
             if let comparison = project.comparison {
                 if let stash = comparison.stash {
                     StashBanner(entry: stash, project: project)
@@ -445,6 +468,8 @@ struct ComparisonList: View {
                 }
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .islandCard(background: .difPanel)
         .onChange(of: project.compareSelectedID) { _, _ in store.compareSelectionChanged(project) }
     }
 
@@ -743,8 +768,8 @@ enum CommitDetailLayout {
         max(140, max(0, commitRowHeight) * 3.5 + 8)
     }
 
-    static func maxHeight(availableHeight: Double, minCommitListHeight: Double) -> Double {
-        max(0, availableHeight - max(0, minCommitListHeight) - 1)
+    static func maxHeight(availableHeight: Double, minCommitListHeight: Double, dividerHeight: Double = 1) -> Double {
+        max(0, availableHeight - max(0, minCommitListHeight) - max(0, dividerHeight))
     }
 
     static func clampedHeight(_ height: Double, minHeight: Double = Self.minHeight, maxHeight: Double) -> Double {
@@ -773,71 +798,89 @@ struct LogPanel: View {
     @Environment(AppStore.self) private var store
     @State private var manualFilesHeight: Double?
     @State private var dragStartHeight: Double?
+    @State private var topChromeHeight: Double = 75
     @State private var chromeHeight: Double = CommitDetailLayout.defaultChromeHeight
     @State private var filesFocusToken = 0
     @State private var searchWork: DispatchWorkItem?
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 4) {
-                FilterField(text: Binding(get: { project.logQuery }, set: { value in
-                    project.logQuery = value
-                    scheduleSearch()
-                }), placeholder: L("Search message, author or hash", "搜索提交信息、作者或哈希"))
-                IconButton(symbol: "arrow.triangle.branch", help: L("Show all branches", "显示所有分支"),
-                           isActive: project.logAllBranches, size: 11.5) {
-                    project.logAllBranches.toggle()
-                    if project.logAllBranches { project.logRef = nil }
-                    project.loadLog(reset: true)
-                }
-                .padding(.top, 6)
-                .padding(.trailing, 6)
-            }
-            if let history = project.history {
-                // The Log lists one file's commits (or its lines'); ✕ goes back to the branch.
-                FilterChip(symbol: history.lines == nil ? "clock.arrow.circlepath" : "text.line.first.and.arrowtriangle.forward",
-                           text: L("History of \(history.label)", "\(history.label) 的历史"),
-                           help: history.rev == "HEAD" ? history.path : "\(history.path) @ \(history.rev.prefix(7))",
-                           clearHelp: L("Back to the whole Log", "回到完整历史")) { store.endHistory() }
-            }
-            if let label = project.logRefLabel {
-                // The Log lists a branch picked in the Git graph; ✕ goes back to the current branch.
-                FilterChip(symbol: "arrow.triangle.branch", text: label, help: label,
-                           clearHelp: L("Back to the current branch", "回到当前分支")) {
-                    project.logRef = nil
-                    project.loadLog(reset: true)
-                }
-            }
-            if project.commits.isEmpty {
-                if project.isLoadingLog {
-                    Spacer()
-                    ProgressView().controlSize(.small)
-                    Spacer()
-                } else if let history = project.history {
-                    EmptyListState(symbol: "clock", title: history.lines == nil ? L("No commits changed this file", "没有提交改动过这个文件")
-                                                                                 : L("No commits changed these lines", "没有提交改动过这些行"),
-                                   detail: project.logQuery.isEmpty ? "" : L("Nothing matches the search.", "没有符合搜索条件的提交。"))
-                } else {
-                    EmptyListState(symbol: "clock", title: L("No commits", "没有提交"), detail: "")
-                }
-            } else {
-                GeometryReader { proxy in
-                    let availableHeight = Double(proxy.size.height)
-                    let minCommitListHeight = CommitDetailLayout.minCommitListHeight(commitRowHeight: Double(UI.s(44)))
-                    let maxHeight = CommitDetailLayout.maxHeight(availableHeight: availableHeight, minCommitListHeight: minCommitListHeight)
-                    let rows = ChangeTree.rows(changes: project.commitFiles, flat: store.settings.flatList,
-                                               collapsed: project.commitCollapsed, filter: "", splitUnversioned: false)
-                    let autoHeight = CommitDetailLayout.fittedHeight(
-                        rowCount: rows.count,
-                        rowHeight: Double(UI.s(24)),
-                        chromeHeight: chromeHeight,
-                        maxHeight: maxHeight
-                    )
-                    let detailHeight = manualFilesHeight.map {
-                        CommitDetailLayout.clampedHeight($0, minHeight: CommitDetailLayout.minHeight, maxHeight: maxHeight)
-                    } ?? autoHeight
+        GeometryReader { proxy in
+            let availableHeight = max(0, Double(proxy.size.height) - topChromeHeight)
+            let minCommitListHeight = CommitDetailLayout.minCommitListHeight(commitRowHeight: Double(UI.s(44)))
+            let maxHeight = CommitDetailLayout.maxHeight(
+                availableHeight: availableHeight,
+                minCommitListHeight: minCommitListHeight,
+                dividerHeight: Double(IslandStyle.gap)
+            )
+            let rows = ChangeTree.rows(changes: project.commitFiles, flat: store.settings.flatList,
+                                       collapsed: project.commitCollapsed, filter: "", splitUnversioned: false)
+            let autoHeight = CommitDetailLayout.fittedHeight(
+                rowCount: rows.count,
+                rowHeight: Double(UI.s(24)),
+                chromeHeight: chromeHeight,
+                maxHeight: maxHeight
+            )
+            let detailHeight = manualFilesHeight.map {
+                CommitDetailLayout.clampedHeight($0, minHeight: CommitDetailLayout.minHeight, maxHeight: maxHeight)
+            } ?? autoHeight
 
+            VStack(spacing: 0) {
+                VStack(spacing: 0) {
                     VStack(spacing: 0) {
+                        ProjectTabsHeader(project: project)
+                        HStack(spacing: 4) {
+                            FilterField(text: Binding(get: { project.logQuery }, set: { value in
+                                project.logQuery = value
+                                scheduleSearch()
+                            }), placeholder: L("Search message, author or hash", "搜索提交信息、作者或哈希"))
+                            IconButton(symbol: "arrow.triangle.branch", help: L("Show all branches", "显示所有分支"),
+                                       isActive: project.logAllBranches, size: 11.5) {
+                                project.logAllBranches.toggle()
+                                if project.logAllBranches { project.logRef = nil }
+                                project.loadLog(reset: true)
+                            }
+                            .padding(.top, 6)
+                            .padding(.trailing, 6)
+                        }
+                        if let history = project.history {
+                            // The Log lists one file's commits (or its lines'); ✕ goes back to the branch.
+                            FilterChip(symbol: history.lines == nil ? "clock.arrow.circlepath" : "text.line.first.and.arrowtriangle.forward",
+                                       text: L("History of \(history.label)", "\(history.label) 的历史"),
+                                       help: history.rev == "HEAD" ? history.path : "\(history.path) @ \(history.rev.prefix(7))",
+                                       clearHelp: L("Back to the whole Log", "回到完整历史")) { store.endHistory() }
+                        }
+                        if let label = project.logRefLabel {
+                            // The Log lists a branch picked in the Git graph; ✕ goes back to the current branch.
+                            FilterChip(symbol: "arrow.triangle.branch", text: label, help: label,
+                                       clearHelp: L("Back to the current branch", "回到当前分支")) {
+                                project.logRef = nil
+                                project.loadLog(reset: true)
+                            }
+                        }
+                    }
+                    .background(
+                        GeometryReader { geo in
+                            Color.clear.onChange(of: geo.size.height, initial: true) { _, height in
+                                let measured = Double(height)
+                                if abs(topChromeHeight - measured) > 0.5 {
+                                    topChromeHeight = measured
+                                }
+                            }
+                        }
+                    )
+                    if project.commits.isEmpty {
+                        if project.isLoadingLog {
+                            Spacer()
+                            ProgressView().controlSize(.small)
+                            Spacer()
+                        } else if let history = project.history {
+                            EmptyListState(symbol: "clock", title: history.lines == nil ? L("No commits changed this file", "没有提交改动过这个文件")
+                                                                                         : L("No commits changed these lines", "没有提交改动过这些行"),
+                                           detail: project.logQuery.isEmpty ? "" : L("Nothing matches the search.", "没有符合搜索条件的提交。"))
+                        } else {
+                            EmptyListState(symbol: "clock", title: L("No commits", "没有提交"), detail: "")
+                        }
+                    } else {
                         KeyboardList(rows: project.commits,
                                      selection: Binding(get: { project.selectedCommitID }, set: { id in
                                          project.selectedCommitID = id
@@ -857,43 +900,48 @@ struct LogPanel: View {
                                      menu: { commit in store.logCommitMenu(commit, in: project) }) { commit, _, _ in
                             CommitRowView(commit: commit)
                         }
-                        DividerGrip(
-                            axis: .rows,
-                            color: .difHairline,
-                            onDrag: { translation in
-                                guard let translation else {
-                                    dragStartHeight = nil
-                                    return
-                                }
-                                let start = dragStartHeight ?? detailHeight
-                                if dragStartHeight == nil { dragStartHeight = detailHeight }
-                                manualFilesHeight = CommitDetailLayout.clampedHeight(
-                                    start - Double(translation),
-                                    minHeight: CommitDetailLayout.minHeight,
-                                    maxHeight: maxHeight
-                                )
-                            },
-                            onDoubleClick: {
-                                withAnimation(.snappy(duration: 0.2)) {
-                                    manualFilesHeight = nil
-                                }
-                            }
-                        )
-                        CommitDetail(
-                            project: project,
-                            focusToken: filesFocusToken,
-                            rows: rows,
-                            onChromeHeightChange: { height in
-                                if abs(chromeHeight - height) > 0.5 {
-                                    chromeHeight = height
-                                }
-                            }
-                        )
-                        .frame(height: detailHeight)
-                        .clipped()
-                        .animation(dragStartHeight == nil ? .snappy(duration: 0.2) : nil, value: rows.count)
-                        .animation(dragStartHeight == nil ? .snappy(duration: 0.2) : nil, value: chromeHeight)
                     }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .islandCard(background: .difPanel)
+
+                if !project.commits.isEmpty, !project.selectedCommits.isEmpty {
+                    DividerGrip(
+                        axis: .rows,
+                        islandGap: true,
+                        onDrag: { translation in
+                            guard let translation else {
+                                dragStartHeight = nil
+                                return
+                            }
+                            let start = dragStartHeight ?? detailHeight
+                            if dragStartHeight == nil { dragStartHeight = detailHeight }
+                            manualFilesHeight = CommitDetailLayout.clampedHeight(
+                                start - Double(translation),
+                                minHeight: CommitDetailLayout.minHeight,
+                                maxHeight: maxHeight
+                            )
+                        },
+                        onDoubleClick: {
+                            withAnimation(.snappy(duration: 0.2)) {
+                                manualFilesHeight = nil
+                            }
+                        }
+                    )
+                    CommitDetail(
+                        project: project,
+                        focusToken: filesFocusToken,
+                        rows: rows,
+                        onChromeHeightChange: { height in
+                            if abs(chromeHeight - height) > 0.5 {
+                                chromeHeight = height
+                            }
+                        }
+                    )
+                    .frame(height: detailHeight)
+                    .islandCard(background: .difPanel)
+                    .animation(dragStartHeight == nil ? .snappy(duration: 0.2) : nil, value: rows.count)
+                    .animation(dragStartHeight == nil ? .snappy(duration: 0.2) : nil, value: chromeHeight)
                 }
             }
         }
