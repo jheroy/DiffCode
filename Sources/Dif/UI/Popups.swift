@@ -26,21 +26,29 @@ struct PopupLayer: View {
                 Color.black.opacity(0.22)
                     .contentShape(Rectangle())
                     .onTapGesture { store.dismissPopup() }
-                Group {
-                    switch popup {
-                    case .quickOpen: QuickOpenView().frame(width: UI.s(660))
-                    case .findInPath: FindInPathView().frame(width: UI.s(900), height: 640)
-                    case .references: ReferencesPopupView().frame(width: UI.s(840), height: 540)
-                    case .goToLine: GoToLineView().frame(width: UI.s(320))
-                    case .keymap: KeymapView().frame(width: UI.s(720))
-                    case .settings: SettingsView().frame(width: UI.s(460))
-                    case .gitGraph, .dialog: EmptyView()
+                switch popup {
+                case .quickOpen:
+                    ResizablePopup(spec: .quickOpen) { QuickOpenView() }
+                case .findInPath:
+                    ResizablePopup(spec: .findInPath) { FindInPathView() }
+                case .references:
+                    ResizablePopup(spec: .references) { ReferencesPopupView() }
+                case .goToLine, .keymap, .settings:
+                    Group {
+                        switch popup {
+                        case .goToLine: GoToLineView().frame(width: UI.s(320))
+                        case .keymap: KeymapView().frame(width: UI.s(720))
+                        case .settings: SettingsView().frame(width: UI.s(460))
+                        default: EmptyView()
+                        }
                     }
+                    .popupPanel()
+                    .padding(.top, 90)
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 24) // so a tall popup shrinks (and scrolls) in a short window
+                case .gitGraph, .dialog:
+                    EmptyView()
                 }
-                .popupPanel()
-                .padding(.top, (popup == .findInPath || popup == .references) ? 56 : 90)
-                .padding(.horizontal, 24)
-                .padding(.bottom, 24) // so a tall popup shrinks (and scrolls) in a short window
             }
         }
     }
@@ -81,8 +89,7 @@ struct QuickOpenView: View {
                 Text(emptyText(model))
                     .font(.ui(size: 12.5))
                     .foregroundStyle(Color.difText3)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: UI.s(76))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ScrollViewReader { proxy in
                     ScrollView {
@@ -96,8 +103,7 @@ struct QuickOpenView: View {
                         }
                         .padding(.vertical, 6)
                     }
-                    .frame(maxHeight: 440)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .onChange(of: model.selected) { _, index in proxy.scrollTo(index) }
                 }
             }
@@ -126,6 +132,7 @@ struct QuickOpenView: View {
                     Text(L("Tip: add :42 to jump to a line", "提示：末尾加 :42 可直接跳到该行"))
                         .font(.ui(size: 11))
                         .foregroundStyle(Color.difText3)
+                        .lineLimit(1)
                 }
             }
             .padding(.horizontal, 14)
@@ -337,6 +344,7 @@ private struct PreviewHost: NSViewRepresentable {
 
 struct FindInPathView: View {
     @Environment(AppStore.self) private var store
+    @AppStorage("popupSplit.findInPath") private var splitRatio: Double = 0.45
 
     var body: some View {
         @Bindable var model = store.finder
@@ -400,45 +408,58 @@ struct FindInPathView: View {
 
             Rectangle().fill(Color.difHairline).frame(height: 1)
 
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(model.hits) { hit in
-                            FindHitRow(hit: hit, isSelected: hit.id == model.selected,
-                                       projectName: model.allProjects ? store.project(hit.projectID)?.name : nil)
-                                .id(hit.id)
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    model.select(hit.id)
-                                    if (NSApp.currentEvent?.clickCount ?? 1) >= 2 { model.activate() }
+            GeometryReader { geo in
+                let previewHeaderHeight = UI.s(26)
+                let availableHeight = max(144, geo.size.height - previewHeaderHeight - 1)
+                let listHeight = PopupResizeGeometry.splitListHeight(
+                    availableHeight: availableHeight,
+                    ratio: splitRatio
+                )
+
+                VStack(spacing: 0) {
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(spacing: 0) {
+                                ForEach(model.hits) { hit in
+                                    FindHitRow(hit: hit, isSelected: hit.id == model.selected,
+                                               projectName: model.allProjects ? store.project(hit.projectID)?.name : nil)
+                                        .id(hit.id)
+                                        .contentShape(Rectangle())
+                                        .onTapGesture {
+                                            model.select(hit.id)
+                                            if (NSApp.currentEvent?.clickCount ?? 1) >= 2 { model.activate() }
+                                        }
                                 }
+                            }
+                            .padding(.vertical, 4)
+                        }
+                        .frame(height: listHeight)
+                        .onChange(of: model.selected) { _, index in proxy.scrollTo(index) }
+                    }
+
+                    PopupSplitDivider(availableHeight: availableHeight, ratio: $splitRatio)
+
+                    HStack(spacing: 6) {
+                        if !model.previewPath.isEmpty {
+                            FileIcon(path: model.previewPath, size: 11)
+                            Text(model.previewPath).font(.ui(size: 11.5)).foregroundStyle(Color.difText2).lineLimit(1).truncationMode(.head)
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .frame(height: previewHeaderHeight)
+                    .background(Color.difPanel.opacity(0.6))
+
+                    ZStack {
+                        PreviewHost { model.attachPreview($0) }
+                        if model.previewDocument == nil {
+                            Color.difWindow
+                            Text(model.query.count < 2 ? L("Type at least two characters", "至少输入两个字符") : (model.isSearching ? "" : L("No matches", "没有匹配项")))
+                                .font(.ui(size: 12.5))
+                                .foregroundStyle(Color.difText3)
                         }
                     }
-                    .padding(.vertical, 4)
-                }
-                .frame(height: 236)
-                .onChange(of: model.selected) { _, index in proxy.scrollTo(index) }
-            }
-
-            Rectangle().fill(Color.difHairline).frame(height: 1)
-            HStack(spacing: 6) {
-                if !model.previewPath.isEmpty {
-                    FileIcon(path: model.previewPath, size: 11)
-                    Text(model.previewPath).font(.ui(size: 11.5)).foregroundStyle(Color.difText2).lineLimit(1).truncationMode(.head)
-                }
-                Spacer()
-            }
-            .padding(.horizontal, 12)
-            .frame(height: UI.s(26))
-            .background(Color.difPanel.opacity(0.6))
-
-            ZStack {
-                PreviewHost { model.attachPreview($0) }
-                if model.previewDocument == nil {
-                    Color.difWindow
-                    Text(model.query.count < 2 ? L("Type at least two characters", "至少输入两个字符") : (model.isSearching ? "" : L("No matches", "没有匹配项")))
-                        .font(.ui(size: 12.5))
-                        .foregroundStyle(Color.difText3)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
 
@@ -541,6 +562,7 @@ private struct FindHitRow: View {
 
 struct ReferencesPopupView: View {
     @Environment(AppStore.self) private var store
+    @AppStorage("popupSplit.references") private var splitRatio: Double = 0.45
 
     var body: some View {
         @Bindable var model = store.references
@@ -613,92 +635,103 @@ struct ReferencesPopupView: View {
 
             Rectangle().fill(Color.difHairline).frame(height: 1)
 
-            // Top section (~45%): scrollable reference list
-            if model.filteredItems.isEmpty {
-                VStack(spacing: 6) {
-                    Text(L("No matching references", "没有匹配的引用"))
-                        .font(.ui(size: 12.5))
-                        .foregroundStyle(Color.difText3)
-                }
-                .frame(maxWidth: .infinity)
-                .frame(height: 196)
-            } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(spacing: 0) {
-                            ForEach(Array(model.filteredItems.enumerated()), id: \.element.id) { index, item in
-                                ReferenceItemRow(item: item, isSelected: index == model.selectedIndex)
-                                    .id(item.id)
-                                    .contentShape(Rectangle())
-                                    .onTapGesture {
-                                        model.select(index)
-                                        if (NSApp.currentEvent?.clickCount ?? 1) >= 2 {
-                                            model.activate(index)
-                                        }
+            GeometryReader { geo in
+                let previewHeaderHeight = UI.s(28)
+                let availableHeight = max(144, geo.size.height - previewHeaderHeight - 1)
+                let listHeight = PopupResizeGeometry.splitListHeight(
+                    availableHeight: availableHeight,
+                    ratio: splitRatio
+                )
+
+                VStack(spacing: 0) {
+                    // Top section: scrollable reference list
+                    if model.filteredItems.isEmpty {
+                        VStack(spacing: 6) {
+                            Text(L("No matching references", "没有匹配的引用"))
+                                .font(.ui(size: 12.5))
+                                .foregroundStyle(Color.difText3)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: listHeight)
+                    } else {
+                        ScrollViewReader { proxy in
+                            ScrollView {
+                                LazyVStack(spacing: 0) {
+                                    ForEach(Array(model.filteredItems.enumerated()), id: \.element.id) { index, item in
+                                        ReferenceItemRow(item: item, isSelected: index == model.selectedIndex)
+                                            .id(item.id)
+                                            .contentShape(Rectangle())
+                                            .onTapGesture {
+                                                model.select(index)
+                                                if (NSApp.currentEvent?.clickCount ?? 1) >= 2 {
+                                                    model.activate(index)
+                                                }
+                                            }
                                     }
+                                }
+                                .padding(.vertical, 4)
+                            }
+                            .frame(height: listHeight)
+                            .onChange(of: model.selectedIndex) { _, _ in
+                                if let id = model.selectedItem?.id {
+                                    proxy.scrollTo(id)
+                                }
                             }
                         }
-                        .padding(.vertical, 4)
                     }
-                    .frame(height: 196)
-                    .onChange(of: model.selectedIndex) { _, _ in
-                        if let id = model.selectedItem?.id {
-                            proxy.scrollTo(id)
+
+                    PopupSplitDivider(availableHeight: availableHeight, ratio: $splitRatio)
+
+                    // Preview sub-header with path:line and explicit Jump button
+                    HStack(spacing: 8) {
+                        if let item = model.selectedItem {
+                            FileIcon(path: item.displayPath, size: 11.5)
+                            Text("\(item.displayPath):\(item.lineNumber)")
+                                .font(.ui(size: 11.5, design: .monospaced))
+                                .foregroundStyle(Color.difText2)
+                                .lineLimit(1)
+                                .truncationMode(.head)
+                            if item.isDeclaration {
+                                Text(L("Declaration", "声明"))
+                                    .font(.ui(size: 10, weight: .semibold))
+                                    .foregroundStyle(Color.difAccent)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 1.5)
+                                    .background(Capsule().fill(Color.difAccent.opacity(0.14)))
+                            }
+                        }
+                        Spacer(minLength: 8)
+                        if model.selectedItem != nil {
+                            Button {
+                                model.activate()
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Text(L("Jump", "跳转"))
+                                        .font(.ui(size: 11, weight: .semibold))
+                                    Text("⏎")
+                                        .font(.ui(size: 10.5, weight: .medium))
+                                }
+                                .foregroundStyle(Color.difAccent)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.difAccent.opacity(0.14)))
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
+                    .padding(.horizontal, 12)
+                    .frame(height: previewHeaderHeight)
+                    .background(Color.difPanel.opacity(0.65))
+
+                    // Bottom section: syntax-highlighted code context preview
+                    ReferenceCodePreviewView(
+                        context: model.previewContext,
+                        isLoading: model.isLoadingPreviews,
+                        settings: store.settings
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
-
-            Rectangle().fill(Color.difHairline).frame(height: 1)
-
-            // Preview sub-header with path:line and explicit Jump button
-            HStack(spacing: 8) {
-                if let item = model.selectedItem {
-                    FileIcon(path: item.displayPath, size: 11.5)
-                    Text("\(item.displayPath):\(item.lineNumber)")
-                        .font(.ui(size: 11.5, design: .monospaced))
-                        .foregroundStyle(Color.difText2)
-                        .lineLimit(1)
-                        .truncationMode(.head)
-                    if item.isDeclaration {
-                        Text(L("Declaration", "声明"))
-                            .font(.ui(size: 10, weight: .semibold))
-                            .foregroundStyle(Color.difAccent)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1.5)
-                            .background(Capsule().fill(Color.difAccent.opacity(0.14)))
-                    }
-                }
-                Spacer(minLength: 8)
-                if model.selectedItem != nil {
-                    Button {
-                        model.activate()
-                    } label: {
-                        HStack(spacing: 4) {
-                            Text(L("Jump", "跳转"))
-                                .font(.ui(size: 11, weight: .semibold))
-                            Text("⏎")
-                                .font(.ui(size: 10.5, weight: .medium))
-                        }
-                        .foregroundStyle(Color.difAccent)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.difAccent.opacity(0.14)))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, 12)
-            .frame(height: UI.s(28))
-            .background(Color.difPanel.opacity(0.65))
-
-            // Bottom section (~55%): syntax-highlighted code context preview
-            ReferenceCodePreviewView(
-                context: model.previewContext,
-                isLoading: model.isLoadingPreviews,
-                settings: store.settings
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             Rectangle().fill(Color.difHairline).frame(height: 1)
 
