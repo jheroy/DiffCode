@@ -248,9 +248,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: Events
 
-    /// Watches for a double tap of Shift (Search Everywhere) and Escape while a popup is open.
+    /// Watches for a double tap of Shift (Search Everywhere), Escape while a popup is open,
+    /// GoLand secondary shortcuts, and mouse side navigation buttons.
     private func installEventMonitor() {
-        monitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown, .leftMouseDown]) { [weak self] event in
+        monitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown, .leftMouseDown, .otherMouseDown]) { [weak self] event in
             guard let self else { return event }
             switch event.type {
             case .flagsChanged:
@@ -285,12 +286,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self.store.dismissPopup()
                     return nil
                 }
+                if !composing, self.handleSecondaryShortcut(event) {
+                    return nil
+                }
+            case .otherMouseDown:
+                self.shiftDownAt = nil
+                self.lastShiftTap = nil
+                if AppEnvironment.hasLSP, self.store.popup == nil {
+                    if event.buttonNumber == 3 {
+                        self.store.navigateBack()
+                        return nil
+                    } else if event.buttonNumber == 4 {
+                        self.store.navigateForward()
+                        return nil
+                    }
+                }
             default:
                 self.shiftDownAt = nil
                 self.lastShiftTap = nil
             }
             return event
         }
+    }
+
+    /// Handles GoLand secondary shortcuts that share an action with a primary menu equivalent.
+    private func handleSecondaryShortcut(_ event: NSEvent) -> Bool {
+        let mods = event.modifierFlags.intersection([.shift, .control, .option, .command])
+        let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
+
+        // Find in Files secondary: ⇧⌘F (alongside ⌘F in Navigate menu).
+        if mods == [.shift, .command], chars == "f" {
+            store.showFindInPath()
+            return true
+        }
+
+        // Toggle Terminal secondary: ⌥F12 (alongside ⌘T in View menu).
+        if AppEnvironment.hasTerminal, store.popup == nil,
+           mods == .option, event.keyCode == 111 || chars == KeyLabel.function(12) {
+            store.terminals.toggle()
+            return true
+        }
+
+        // Find Action secondary: ⌃⌥A (alongside ⇧⌘A in Navigate menu).
+        if store.popup == nil, store.terminals.focusedID == nil,
+           mods == [.control, .option], chars == "a" {
+            store.showQuickOpen(.actions)
+            return true
+        }
+
+        // Navigate Back / Forward secondary: ⌥⌘← / ⌥⌘→.
+        if AppEnvironment.hasLSP, store.popup == nil, mods == [.option, .command] {
+            if event.keyCode == 123 {
+                store.navigateBack()
+                return true
+            }
+            if event.keyCode == 124 {
+                store.navigateForward()
+                return true
+            }
+        }
+
+        // Navigate Back via ⌃O when not in a text field, terminal, or Vim-handled canvas.
+        if AppEnvironment.hasLSP, store.popup == nil, store.terminals.focusedID == nil,
+           mods == .control, chars == "o",
+           !(store.window?.firstResponder is NSTextView),
+           !(store.settings.vimMode && store.window?.firstResponder === store.viewer.container?.canvas) {
+            store.navigateBack()
+            return true
+        }
+
+        // Next / Previous Diff via ⌘↓ / ⌘↑ when viewer is active (not in a popup, terminal, text field, or list).
+        if store.popup == nil, store.terminals.focusedID == nil,
+           !(store.window?.firstResponder is NSTextView),
+           store.focusedListName == nil,
+           store.viewer.isTextDocument,
+           mods == .command {
+            if event.keyCode == 125 {
+                store.viewer.stepDifference(1)
+                return true
+            }
+            if event.keyCode == 126 {
+                store.viewer.stepDifference(-1)
+                return true
+            }
+        }
+
+        return false
     }
 
     // MARK: Menu
@@ -311,7 +392,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         appMenu.addItem(.separator())
         appMenu.addItem(ClosureMenuItem(L("Settings…", "设置…"), key: ",", modifiers: .command) { [store] in store.present(.settings) })
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: L("Hide \(appName)", "隐藏 \(appName)"), action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: L("Hide \(appName)", "隐藏 \(appName)"), action: #selector(NSApplication.hide(_:)), keyEquivalent: "")
         let hideOthers = appMenu.addItem(withTitle: L("Hide Others", "隐藏其他"), action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
         hideOthers.keyEquivalentModifierMask = [.command, .option]
         appMenu.addItem(withTitle: L("Show All", "全部显示"), action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
@@ -332,7 +413,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         edit.addItem(withTitle: L("Paste", "粘贴"), action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         edit.addItem(withTitle: L("Select All", "全选"), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         edit.addItem(.separator())
-        edit.addItem(ClosureMenuItem(L("Find…", "查找…"), key: "f", modifiers: .command) { [store] in store.viewer.showFind() })
+        edit.addItem(ClosureMenuItem(L("Find…", "查找…"), key: "f", modifiers: [.control, .shift, .command]) { [store] in store.viewer.showFind() })
         edit.addItem(ClosureMenuItem(L("Find Next", "查找下一个"), key: "g", modifiers: .command) { [store] in store.viewer.stepFind(1) })
         edit.addItem(ClosureMenuItem(L("Find Previous", "查找上一个"), key: "g", modifiers: [.command, .shift]) { [store] in store.viewer.stepFind(-1) })
         add(edit, title: L("Edit", "编辑"), to: main)

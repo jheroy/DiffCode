@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 
 /// A menu item that runs a closure.
 final class ClosureMenuItem: NSMenuItem {
@@ -74,7 +75,7 @@ enum KeyLabel {
 }
 
 extension AppStore {
-    /// Shortcuts mirror Android Studio's default macOS keymap wherever an equivalent action exists.
+    /// Shortcuts mirror the user's GoLand macOS keymap (`macOS copy.xml`) wherever an equivalent action exists.
     var commands: [AppCommand] {
         let viewer = self.viewer
         return [
@@ -98,6 +99,20 @@ extension AppStore {
             // View
             AppCommand(id: "view.projects", title: L("Sidebar", "侧边栏"), symbol: "sidebar.left", group: .view,
                        key: "s", modifiers: [.command, .control]) { [weak self] in self?.toggleSidebar() },
+            // ⌘K toggles the Changes / History list panel, except when a terminal has focus (clears terminal buffer).
+            AppCommand(id: "view.list", title: L("Toggle Changes / History Panel", "显示/隐藏 变更/历史栏"), symbol: "sidebar.right", group: .view,
+                       key: "k", modifiers: .command) { [weak self] in
+                guard let self else { return }
+                if self.terminals.focusedID != nil {
+                    self.terminals.clearFocused()
+                } else {
+                    let hiding = self.listVisible
+                    withAnimation(.snappy(duration: 0.2)) { self.listVisible.toggle() }
+                    if hiding, let name = self.focusedListName, name != KeyboardListName.tree {
+                        self.viewer.focusCanvas()
+                    }
+                }
+            },
             AppCommand(id: "view.files", title: L("Project Files", "项目文件"), symbol: "folder", group: .view,
                        key: "1", modifiers: .command) { [weak self] in self?.toggleFileTree() },
             AppCommand(id: "view.changes", title: L("Local Changes", "本地变更"), symbol: "list.bullet.indent", group: .view,
@@ -105,7 +120,7 @@ extension AppStore {
             AppCommand(id: "view.log", title: L("Git Log", "提交历史"), symbol: "clock.arrow.circlepath", group: .view,
                        key: "9", modifiers: .command) { [weak self] in self?.toggleTab(.log) },
             AppCommand(id: "view.terminal", title: L("Terminal", "终端"), symbol: "terminal", group: .view,
-                       key: KeyLabel.function(12), modifiers: .option) { [weak self] in self?.terminals.toggle() },
+                       key: "t", modifiers: .command) { [weak self] in self?.terminals.toggle() },
             AppCommand(id: "view.maximize", title: L("Hide All Tool Windows", "隐藏所有工具栏"), symbol: "arrow.up.left.and.arrow.down.right",
                        group: .view, key: KeyLabel.function(12), modifiers: [.command, .shift]) { [weak self] in self?.toggleMaximizeViewer() },
             AppCommand(id: "view.unified", title: L("Toggle Side-by-Side / Unified", "切换 并排 / 合并 视图"), symbol: "rectangle.split.2x1",
@@ -115,6 +130,11 @@ extension AppStore {
             AppCommand(id: "view.flat", title: L("Toggle Tree / Flat List", "切换 目录树 / 平铺列表"), symbol: "list.bullet", group: .view) { [weak self] in
                 guard let self else { return }
                 self.settings.flatList.toggle()
+                self.settings.save()
+            },
+            AppCommand(id: "view.vimMode", title: L("Toggle Vim Mode", "切换 Vim 模式"), symbol: "v.square", group: .view) { [weak self] in
+                guard let self else { return }
+                self.settings.vimMode.toggle()
                 self.settings.save()
             },
             AppCommand(id: "view.fontUp", title: L("Increase Font Size", "增大字号"), symbol: "textformat.size.larger", group: .view,
@@ -139,17 +159,27 @@ extension AppStore {
             AppCommand(id: "nav.everywhere", title: L("Search Everywhere", "随处搜索"), symbol: "magnifyingglass", group: .navigate,
                        shortcutLabel: "⇧⇧") { [weak self] in self?.showQuickOpen(.all) },
             AppCommand(id: "nav.file", title: L("Go to File…", "查找文件…"), symbol: "doc.text.magnifyingglass", group: .navigate,
-                       key: "o", modifiers: [.command, .shift]) { [weak self] in self?.showQuickOpen(.files) },
+                       key: "p", modifiers: .command) { [weak self] in self?.showQuickOpen(.files) },
             AppCommand(id: "nav.findInPath", title: L("Find in Files…", "在文件中查找…"), symbol: "text.magnifyingglass", group: .navigate,
-                       key: "f", modifiers: [.command, .shift]) { [weak self] in self?.showFindInPath() },
+                       key: "f", modifiers: .command) { [weak self] in self?.showFindInPath() },
             AppCommand(id: "nav.action", title: L("Find Action…", "查找操作…"), symbol: "command", group: .navigate,
                        key: "a", modifiers: [.command, .shift]) { [weak self] in self?.showQuickOpen(.actions) },
             AppCommand(id: "nav.recent", title: L("Recent Files", "最近的文件"), symbol: "clock", group: .navigate,
                        key: "e", modifiers: .command) { [weak self] in self?.showQuickOpen(.recent) },
-            AppCommand(id: "nav.line", title: L("Go to Line…", "跳转到行…"), symbol: "arrow.right.to.line", group: .navigate,
-                       key: "l", modifiers: .command) { [weak self] in
+            AppCommand(id: "nav.line", title: L("Go to Line…", "跳转到行…"), symbol: "arrow.right.to.line", group: .navigate) { [weak self] in
                 guard let self, self.viewer.isTextDocument else { return }
                 self.present(.goToLine)
+            },
+            AppCommand(id: "nav.nextSplitter", title: L("Focus Viewer", "聚焦查看器"), symbol: "rectangle.righthalf.inset.filled", group: .navigate,
+                       key: "l", modifiers: .command, separatorBefore: true) { [weak self] in self?.focusViewer() },
+            AppCommand(id: "nav.prevSplitter", title: L("Focus File List", "聚焦文件列表"), symbol: "rectangle.lefthalf.inset.filled", group: .navigate,
+                       key: "h", modifiers: .command) { [weak self] in
+                guard let self else { return }
+                if self.focusedListName == KeyboardListName.list, self.sidebarVisible {
+                    self.focusTree()
+                } else {
+                    self.focusList()
+                }
             },
             AppCommand(id: "nav.back", title: L("Navigate Back", "后退"), symbol: "chevron.left", group: .navigate,
                        key: "[", modifiers: .command, separatorBefore: true) { [weak self] in self?.navigateBack() },
@@ -183,7 +213,7 @@ extension AppStore {
 
             // Git. Dif reads the repository and otherwise leaves it alone; these are the exceptions.
             AppCommand(id: "git.commit", title: L("Commit…", "提交…"), symbol: "checkmark.circle", group: .git,
-                       key: "k", modifiers: .command) { [weak self] in self?.commitShortcut() },
+                       key: "c", modifiers: [.shift, .control, .option]) { [weak self] in self?.focusCommitMessage() },
             AppCommand(id: "git.commitPush", title: L("Commit and Push…", "提交并推送…"), symbol: "arrow.up.circle", group: .git,
                        key: "k", modifiers: [.command, .option]) { [weak self] in self?.commitCurrent(thenPush: true) },
             AppCommand(id: "git.amend", title: L("Amend Last Commit", "修改上次提交 (Amend)"), symbol: "pencil.circle",
@@ -220,7 +250,8 @@ extension AppStore {
             AppCommand(id: "git.history", title: L("Show History for Current File", "查看当前文件的历史"), symbol: "clock.arrow.circlepath",
                        group: .git) { [weak self] in self?.showHistoryForCurrentFile() },
             AppCommand(id: "git.historySelection", title: L("Show History for Selection", "查看所选内容的历史"),
-                       symbol: "text.line.first.and.arrowtriangle.forward", group: .git) { [weak self] in self?.showHistoryForSelection() },
+                       symbol: "text.line.first.and.arrowtriangle.forward", group: .git,
+                       key: "b", modifiers: .command) { [weak self] in self?.showHistoryForSelection() },
             AppCommand(id: "git.compare", title: L("Compare with Branch…", "与分支比较…"), symbol: "arrow.left.arrow.right",
                        group: .git) { [weak self] in self?.showComparePicker() },
             AppCommand(id: "git.endCompare", title: L("Stop Comparing", "退出比较"), symbol: "xmark.circle", group: .git) { [weak self] in
@@ -236,14 +267,15 @@ extension AppStore {
                        shortcutLabel: "⌘Z", separatorBefore: true) { [weak self] in self?.undoEdit() },
 
             // Terminal
-            AppCommand(id: "term.new", title: L("New Terminal", "新建终端"), symbol: "plus.rectangle", group: .terminal,
-                       key: "t", modifiers: .command) { [weak self] in self?.terminals.openInCurrentProject() },
+            AppCommand(id: "term.new", title: L("New Terminal", "新建终端"), symbol: "plus.rectangle", group: .terminal) { [weak self] in
+                self?.terminals.openInCurrentProject()
+            },
             AppCommand(id: "term.focus", title: L("Focus Terminal", "聚焦终端"), symbol: "terminal", group: .terminal) { [weak self] in
                 self?.terminals.focusActive()
             },
             AppCommand(id: "term.insertPath", title: L("Insert File Path into Terminal", "把当前文件路径插入终端"), symbol: "text.insert", group: .terminal,
                        key: "t", modifiers: [.command, .option]) { [weak self] in self?.insertReferenceInTerminal() },
-            // ⌘K belongs to Commit; with a terminal focused, Commit hands it to the terminal.
+            // ⌘K belongs to Toggle Changes / History Panel; with a terminal focused, it clears the terminal.
             AppCommand(id: "term.clear", title: L("Clear Terminal", "清空终端"), symbol: "clear", group: .terminal,
                        shortcutLabel: "⌘K", separatorBefore: true) { [weak self] in self?.terminals.clearFocused() },
             AppCommand(id: "term.close", title: L("Close Terminal", "关闭终端"), symbol: "xmark.rectangle", group: .terminal) { [weak self] in

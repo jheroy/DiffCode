@@ -119,6 +119,10 @@ final class Settings {
     var projectsHeight: Double?
     /// Keep the file tree's selection on whatever file the viewer is showing.
     var followFile: Bool
+    /// Enable Vim keybindings in the code viewer/editor (`~/.ideavimrc`-compatible).
+    var vimMode: Bool
+    /// Show relative line numbers in the code gutter when Vim mode is enabled.
+    var vimRelativeLineNumbers: Bool
 
     @ObservationIgnored private let defaults: UserDefaults
 
@@ -146,6 +150,8 @@ final class Settings {
         commitBoxHeight = min(Self.commitBoxRange.upperBound,
                               max(Self.commitBoxRange.lowerBound, defaults.object(forKey: "commitBoxHeight") as? Double ?? 140))
         followFile = defaults.object(forKey: "followFile") as? Bool ?? false
+        vimMode = defaults.object(forKey: "vimMode") as? Bool ?? true
+        vimRelativeLineNumbers = defaults.object(forKey: "vimRelativeLineNumbers") as? Bool ?? false
         projectsHeight = (defaults.object(forKey: "projectsHeight") as? Double).map { max(0, $0) }
     }
 
@@ -167,6 +173,8 @@ final class Settings {
         defaults.set(terminalHeight, forKey: "terminalHeight")
         defaults.set(commitBoxHeight, forKey: "commitBoxHeight")
         defaults.set(followFile, forKey: "followFile")
+        defaults.set(vimMode, forKey: "vimMode")
+        defaults.set(vimRelativeLineNumbers, forKey: "vimRelativeLineNumbers")
         defaults.set(projectsHeight, forKey: "projectsHeight")  // nil removes the key
         // Not the language: it is written when chosen, so that quitting never puts back a stale one over a
         // choice made since in System Settings.

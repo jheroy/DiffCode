@@ -1049,7 +1049,7 @@ struct KeymapView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text(L("Keymap", "快捷键")).font(.ui(size: 15, weight: .semibold)).foregroundStyle(Color.difText)
-                Text(L("Aligned with Android Studio's macOS keymap", "与 Android Studio 的 macOS 键位保持一致"))
+                Text(L("Aligned with GoLand's macOS keymap & ~/.ideavimrc", "与 GoLand macOS 键位及 ~/.ideavimrc 保持一致"))
                     .font(.ui(size: 11.5))
                     .foregroundStyle(Color.difText3)
                 Spacer()
@@ -1060,7 +1060,10 @@ struct KeymapView: View {
             Rectangle().fill(Color.difHairline).frame(height: 1)
             ScrollView {
                 HStack(alignment: .top, spacing: 28) {
-                    column(commands, groups: AppEnvironment.hasTerminal ? [.navigate, .terminal] : [.navigate])
+                    VStack(alignment: .leading, spacing: 18) {
+                        column(commands, groups: AppEnvironment.hasTerminal ? [.navigate, .terminal] : [.navigate])
+                        vimExtras
+                    }
                     VStack(alignment: .leading, spacing: 18) {
                         column(commands, groups: [.view])
                         column(commands, groups: [.git, .file])
@@ -1090,20 +1093,41 @@ struct KeymapView: View {
     private var extras: some View {
         VStack(alignment: .leading, spacing: 7) {
             SectionLabel(text: L("In the viewer", "查看器内"))
+            shortcutRow(L("Next / Previous Difference", "下一处 / 上一处差异"), "⌘↓ / ⌘↑ · F7 / ⇧F7")
             shortcutRow(L("Next / Previous Change", "下一处 / 上一处变更"), "⌃⌥⇧↓ / ⌃⌥⇧↑")
-            shortcutRow(L("Find in File", "在文件中查找"), "⌘F")
+            shortcutRow(L("Find in File", "在文件中查找"), "⌃⇧⌘F")
             shortcutRow(L("Next / Previous Occurrence", "下一个 / 上一个匹配"), "⌘G / ⇧⌘G")
-            shortcutRow(L("Top / Bottom of File", "文件开头 / 末尾"), "⌘↑ / ⌘↓")
-            shortcutRow(L("Back to the File List", "回到文件列表"), "Esc")
+            shortcutRow(L("Find in Files (Secondary)", "在文件中查找（备用）"), "⇧⌘F")
+            shortcutRow(L("Back to the File List", "回到文件列表"), "Esc / ⌘H")
             shortcutRow(L("Zoom Text", "缩放文字"), L("Pinch", "双指捏合"))
             if AppEnvironment.hasLSP {
+                shortcutRow(L("Navigate Back / Forward", "后退 / 前进"), "⌥⌘← / ⌥⌘→")
                 shortcutRow(L("Go to Definition / References", "跳转到声明 / 查看引用"), "⌘+Click")
             }
             if AppEnvironment.hasTerminal {
+                shortcutRow(L("Toggle Terminal (Secondary)", "开关终端（备用）"), "⌥F12")
                 shortcutRow(L("Close Terminal (when focused)", "关闭终端（聚焦时）"), "⌘W")
                 shortcutRow(L("Next / Previous Terminal (when focused)", "下一个 / 上一个终端（聚焦时）"), "⇧⌘] / ⇧⌘[")
             }
         }
+    }
+
+    private var vimExtras: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            SectionLabel(text: "Vim (~/.ideavimrc)")
+            shortcutRow(L("Leader Key", "前导键 (Leader)"), "Space")
+            shortcutRow(L("Go to Definition / References", "定义 / 引用"), "gd / gr · Space r")
+            shortcutRow(L("Go to File / Everywhere / Action", "文件 / 随处 / 操作"), "⌘P / ⌃P · Space a · ga")
+            shortcutRow(L("Git Pull / Push / Graph", "拉取 / 推送 / 分支树"), "gl / gp / gb")
+            shortcutRow(L("Locate File / Tree / Maximize", "定位 / 文件树 / 最大化"), "Space e / ⌃E / Space o")
+            shortcutRow(L("Navigate Back / Forward", "后退 / 前进"), "⌃O / ⌃I")
+            shortcutRow(L("Prev / Next Function", "上一个 / 下一个函数"), "[[ / ]]")
+            shortcutRow(L("Function Text Objects", "函数文本对象"), "vif / vaf")
+            shortcutRow(L("Expand / Shrink Selection", "扩大 / 缩小选区"), "↩ / ⌫")
+            shortcutRow(L("Toggle Comment", "切换注释"), "gcc / gc")
+            shortcutRow(L("Visual Surround", "可视化包围"), "\" ' ( { [")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func shortcutRow(_ title: String, _ shortcut: String) -> some View {
@@ -1140,109 +1164,143 @@ struct SettingsView: View {
             .frame(height: UI.s(48))
             Rectangle().fill(Color.difHairline).frame(height: 1)
 
-            VStack(alignment: .leading, spacing: 14) {
-                row(L("Appearance", "外观")) {
-                    Picker("", selection: $settings.appearance) {
-                        ForEach(Settings.Appearance.allCases, id: \.self) { Text($0.title).tag($0) }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: UI.s(240))
-                }
-                VStack(alignment: .trailing, spacing: 8) {
-                    row(L("Language", "语言")) {
-                        Picker("", selection: Binding(get: { settings.language }, set: { settings.chooseLanguage($0) })) {
-                            ForEach(Settings.Language.allCases, id: \.self) { Text($0.title).tag($0) }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    row(L("Appearance", "外观")) {
+                        Picker("", selection: $settings.appearance) {
+                            ForEach(Settings.Appearance.allCases, id: \.self) { Text($0.title).tag($0) }
                         }
                         .pickerStyle(.segmented)
                         .labelsHidden()
                         .frame(width: UI.s(240))
                     }
-                    if settings.languageNeedsRestart {
-                        HStack(spacing: 8) {
-                            Text(L("Shows after \(appName) restarts", "重启 \(appName) 后生效"))
-                                .font(.ui(size: 11.5))
-                                .foregroundStyle(Color.difText3)
-                            BannerButton(title: L("Restart Now", "立即重启"), prominent: true) { store.restart() }
+                    VStack(alignment: .trailing, spacing: 8) {
+                        row(L("Language", "语言")) {
+                            Picker("", selection: Binding(get: { settings.language }, set: { settings.chooseLanguage($0) })) {
+                                ForEach(Settings.Language.allCases, id: \.self) { Text($0.title).tag($0) }
+                            }
+                            .pickerStyle(.segmented)
+                            .labelsHidden()
+                            .frame(width: UI.s(240))
+                        }
+                        if settings.languageNeedsRestart {
+                            HStack(spacing: 8) {
+                                Text(L("Shows after \(appName) restarts", "重启 \(appName) 后生效"))
+                                    .font(.ui(size: 11.5))
+                                    .foregroundStyle(Color.difText3)
+                                BannerButton(title: L("Restart Now", "立即重启"), prominent: true) { store.restart() }
+                            }
                         }
                     }
-                }
-                row(L("Code font", "代码字体")) {
-                    fontPicker(settings.codeFontFamily) { store.chooseCodeFont($0) }
-                }
-                row(L("Code font size", "代码字号")) {
-                    stepper(settings.fontSize, down: "⌃⇧,", up: "⌃⇧.") { store.viewer.changeFontSize(by: $0) }
-                }
-                row(L("Enable ligatures", "启用连字")) {
-                    Toggle("", isOn: Binding(
-                        get: { settings.codeFontLigatures },
-                        set: { store.setCodeFontLigatures($0) }
-                    ))
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                    .labelsHidden()
-                }
-                VStack(alignment: .leading, spacing: 10) {
-                    Button {
-                        withAnimation(.snappy(duration: 0.18)) { typographyExpanded.toggle() }
-                    } label: {
+                    row(L("Code font", "代码字体")) {
+                        fontPicker(settings.codeFontFamily) { store.chooseCodeFont($0) }
+                    }
+                    row(L("Code font size", "代码字号")) {
+                        stepper(settings.fontSize, down: "⌃⇧,", up: "⌃⇧.") { store.viewer.changeFontSize(by: $0) }
+                    }
+                    row(L("Enable ligatures", "启用连字")) {
+                        Toggle("", isOn: Binding(
+                            get: { settings.codeFontLigatures },
+                            set: { store.setCodeFontLigatures($0) }
+                        ))
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .labelsHidden()
+                    }
+                    VStack(alignment: .leading, spacing: 10) {
+                        Button {
+                            withAnimation(.snappy(duration: 0.18)) { typographyExpanded.toggle() }
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: typographyExpanded ? "chevron.down" : "chevron.right")
+                                    .font(.ui(size: 10, weight: .semibold))
+                                    .foregroundStyle(Color.difText3)
+                                    .frame(width: 12)
+                                Text(L("Typography Settings", "排版设置"))
+                                    .font(.ui(size: 12.5, weight: .medium))
+                                    .foregroundStyle(Color.difText)
+                                Rectangle()
+                                    .fill(Color.difHairline)
+                                    .frame(height: 1)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+
+                        if typographyExpanded {
+                            VStack(alignment: .leading, spacing: 10) {
+                                row(L("Main weight", "常规字重")) {
+                                    weightPicker(settings.codeFontMainWeight) { store.chooseCodeFontMainWeight($0) }
+                                }
+                                row(L("Bold weight", "粗体字重")) {
+                                    weightPicker(settings.codeFontBoldWeight) { store.chooseCodeFontBoldWeight($0) }
+                                }
+                                TypographyPreviewView(codeFont: codeFont, theme: previewTheme)
+                                    .frame(height: codeFont.lineHeight * 2 + 16)
+                                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                            .strokeBorder(Color.difHairline, lineWidth: 1)
+                                    )
+                            }
+                            .padding(.leading, 18)
+                        }
+                    }
+                    VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 6) {
-                            Image(systemName: typographyExpanded ? "chevron.down" : "chevron.right")
-                                .font(.ui(size: 10, weight: .semibold))
-                                .foregroundStyle(Color.difText3)
-                                .frame(width: 12)
-                            Text(L("Typography Settings", "排版设置"))
+                            Text(L("Editor / Vim Mode", "编辑器 / Vim 模式"))
                                 .font(.ui(size: 12.5, weight: .medium))
                                 .foregroundStyle(Color.difText)
                             Rectangle()
                                 .fill(Color.difHairline)
                                 .frame(height: 1)
                         }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-
-                    if typographyExpanded {
-                        VStack(alignment: .leading, spacing: 10) {
-                            row(L("Main weight", "常规字重")) {
-                                weightPicker(settings.codeFontMainWeight) { store.chooseCodeFontMainWeight($0) }
+                        VStack(alignment: .leading, spacing: 4) {
+                            row(L("Vim Mode", "Vim 模式")) {
+                                Toggle("", isOn: $settings.vimMode)
+                                    .toggleStyle(.switch)
+                                    .controlSize(.small)
+                                    .labelsHidden()
                             }
-                            row(L("Bold weight", "粗体字重")) {
-                                weightPicker(settings.codeFontBoldWeight) { store.chooseCodeFontBoldWeight($0) }
-                            }
-                            TypographyPreviewView(codeFont: codeFont, theme: previewTheme)
-                                .frame(height: codeFont.lineHeight * 2 + 16)
-                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                        .strokeBorder(Color.difHairline, lineWidth: 1)
-                                )
+                            Text(L("Normal/Insert/Visual · Space leader · ~/.ideavimrc",
+                                   "Normal/Insert/Visual · Space 前导键 · ~/.ideavimrc"))
+                                .font(.ui(size: 11.5))
+                                .foregroundStyle(Color.difText3)
                         }
-                        .padding(.leading, 18)
+                        if settings.vimMode {
+                            row(L("Relative line numbers", "相对行号")) {
+                                Toggle("", isOn: $settings.vimRelativeLineNumbers)
+                                    .toggleStyle(.switch)
+                                    .controlSize(.small)
+                                    .labelsHidden()
+                            }
+                            .padding(.leading, 12)
+                        }
+                    }
+                    row(L("Interface font size", "界面字号")) {
+                        stepper(settings.uiFontSize, down: L("Smaller", "减小"), up: L("Larger", "增大")) { store.changeInterfaceFontSize(by: $0) }
+                    }
+                    if AppEnvironment.hasTerminal {
+                        row(L("Terminal font", "终端字体")) {
+                            fontPicker(settings.terminalFontFamily) { store.chooseTerminalFont($0) }
+                        }
+                        row(L("Terminal font size", "终端字号")) {
+                            stepper(settings.terminalFontSize, down: L("Smaller", "减小"), up: L("Larger", "增大")) { store.changeTerminalFontSize(by: $0) }
+                        }
+                    }
+                    row(L("Default view", "默认视图")) {
+                        Picker("", selection: $settings.unified) {
+                            Text(L("Side-by-side", "并排")).tag(false)
+                            Text(L("Unified", "合并")).tag(true)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: UI.s(240))
                     }
                 }
-                row(L("Interface font size", "界面字号")) {
-                    stepper(settings.uiFontSize, down: L("Smaller", "减小"), up: L("Larger", "增大")) { store.changeInterfaceFontSize(by: $0) }
-                }
-                if AppEnvironment.hasTerminal {
-                    row(L("Terminal font", "终端字体")) {
-                        fontPicker(settings.terminalFontFamily) { store.chooseTerminalFont($0) }
-                    }
-                    row(L("Terminal font size", "终端字号")) {
-                        stepper(settings.terminalFontSize, down: L("Smaller", "减小"), up: L("Larger", "增大")) { store.changeTerminalFontSize(by: $0) }
-                    }
-                }
-                row(L("Default view", "默认视图")) {
-                    Picker("", selection: $settings.unified) {
-                        Text(L("Side-by-side", "并排")).tag(false)
-                        Text(L("Unified", "合并")).tag(true)
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: UI.s(240))
-                }
+                .padding(20)
             }
-            .padding(20)
+            .frame(maxHeight: 620)
         }
         .onAppear {
             settings.reloadLanguage()
@@ -1262,6 +1320,12 @@ struct SettingsView: View {
         .onChange(of: settings.unified) { _, _ in
             settings.save()
             store.viewer.container?.setMode(store.viewer.canvasMode)
+        }
+        .onChange(of: settings.vimMode) { _, _ in
+            settings.save()
+        }
+        .onChange(of: settings.vimRelativeLineNumbers) { _, _ in
+            settings.save()
         }
     }
 
