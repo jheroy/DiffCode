@@ -96,7 +96,7 @@ struct QuickOpenView: View {
                         LazyVStack(spacing: 0) {
                             ForEach(Array(model.items.enumerated()), id: \.element.id) { index, item in
                                 QuickOpenRow(item: item, isSelected: index == model.selected)
-                                    .id(index)
+                                    .id(item.id)
                                     .contentShape(Rectangle())
                                     .onTapGesture { model.activate(index) }
                             }
@@ -104,7 +104,18 @@ struct QuickOpenView: View {
                         .padding(.vertical, 6)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .onChange(of: model.selected) { _, index in proxy.scrollTo(index) }
+                    .onChange(of: model.selected) { _, index in
+                        if model.items.indices.contains(index) {
+                            proxy.scrollTo(model.items[index].id)
+                        }
+                    }
+                    .onChange(of: model.items.first?.id) { _, _ in
+                        if model.items.indices.contains(model.selected) {
+                            proxy.scrollTo(model.items[model.selected].id, anchor: .top)
+                        } else if let firstID = model.items.first?.id {
+                            proxy.scrollTo(firstID, anchor: .top)
+                        }
+                    }
                 }
             }
 
@@ -138,7 +149,6 @@ struct QuickOpenView: View {
             .padding(.horizontal, 14)
             .frame(height: UI.s(30))
         }
-        .onChange(of: model.query) { _, _ in model.update() }
     }
 
     private func placeholder(_ scope: QuickOpenModel.Scope) -> String {

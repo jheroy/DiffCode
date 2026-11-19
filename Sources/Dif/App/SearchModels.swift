@@ -1,6 +1,24 @@
 import AppKit
 import Observation
 
+/// Thread-safe cancellation flag shared across unstructured detached tasks.
+final class SearchCancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+}
+
 // MARK: - Quick open (Search Everywhere / Go to File / Find Action / Recent Files)
 
 @MainActor
@@ -35,26 +53,41 @@ final class QuickOpenModel {
     }
 
     var scope: Scope = .all
-    var query = ""
+    var query = "" {
+        didSet {
+            if query != oldValue, !isPreparing {
+                update()
+            }
+        }
+    }
     var items: [Item] = []
     var selected = 0
     var focusToken = 0
     var isIndexing = false
 
     @ObservationIgnored weak var store: AppStore?
+    @ObservationIgnored private var isPreparing = false
     @ObservationIgnored private var searchTask: Task<Void, Never>?
+    @ObservationIgnored private var searchCancelFlag: SearchCancelFlag?
+    @ObservationIgnored private var searchGeneration: UInt64 = 0
+    /// Test hook: overrides `project.files()` so tests can inject deterministic file lists and async delays.
+    @ObservationIgnored var filesProviderForTesting: (@MainActor (Project) async -> [String])?
+    /// Test hook: incremented on every `update()` invocation so tests can verify no duplicate calls in `prepare()`.
+    @ObservationIgnored private(set) var updateCallCountForTesting = 0
     /// The branches and tags offered for comparing, read as the picker opens.
     @ObservationIgnored private var refs: [GitRef]?
     /// The stash list, read as it opens.
     @ObservationIgnored private var stashList: [StashEntry]?
 
     func prepare(scope: Scope) {
+        isPreparing = true
         self.scope = scope
         // Like IntelliJ, reopening keeps the previous query selected so typing replaces it.
         if scope == .recent || scope == .actions || scope == .branches || scope == .stashes { query = "" }
         if scope == .branches { refs = nil }
         if scope == .stashes { stashList = nil }
         focusToken += 1
+        isPreparing = false
         update()
     }
 
@@ -81,16 +114,22 @@ final class QuickOpenModel {
     }
 
     func update() {
+        updateCallCountForTesting += 1
         searchTask?.cancel()
+        searchTask = nil
+        searchCancelFlag?.cancel()
+        searchCancelFlag = nil
+        searchGeneration &+= 1
+        let generation = searchGeneration
         guard let store else { return }
         let (text, _) = parse(query)
         let project = store.currentProject
         if scope == .branches {
-            updateBranches(text, in: project)
+            updateBranches(text, in: project, generation: generation)
             return
         }
         if scope == .stashes {
-            updateStashes(query.trimmingCharacters(in: .whitespaces), in: project)
+            updateStashes(query.trimmingCharacters(in: .whitespaces), in: project, generation: generation)
             return
         }
         let changeKinds = Dictionary(uniqueKeysWithValues: (project?.changes ?? []).map { ($0.path, $0.kind) })
@@ -104,17 +143,20 @@ final class QuickOpenModel {
             actions = matched.map { Item.action($0) }
         }
         if scope == .actions {
+            isIndexing = false
             items = actions
             selected = 0
             return
         }
         guard let project else {
+            isIndexing = false
             items = actions
             selected = 0
             return
         }
 
         if text.isEmpty {
+            isIndexing = false
             // No query: recently viewed files first, then everything with local changes.
             var seen = Set<String>()
             var list: [Item] = []
@@ -135,14 +177,26 @@ final class QuickOpenModel {
         }
 
         let projectID = project.id
-        isIndexing = project.cachedFiles == nil
+        let provider = filesProviderForTesting
+        isIndexing = provider == nil && project.cachedFiles == nil
+        let cancelFlag = SearchCancelFlag()
+        searchCancelFlag = cancelFlag
         searchTask = Task { @MainActor [weak self] in
-            let files = await project.files()
-            if Task.isCancelled { return }
-            let ranked = await Task.detached(priority: .userInitiated) {
-                Fuzzy.rank(query: text, in: files, limit: 80, isCancelled: { Task.isCancelled })
-            }.value
-            guard let self, !Task.isCancelled else { return }
+            let files: [String]
+            if let provider {
+                files = await provider(project)
+            } else {
+                files = await project.files()
+            }
+            guard let self, !Task.isCancelled, !cancelFlag.isCancelled, self.searchGeneration == generation else { return }
+            let ranked = await withTaskCancellationHandler {
+                await Task.detached(priority: .userInitiated) {
+                    Fuzzy.rank(query: text, in: files, limit: 80, isCancelled: { cancelFlag.isCancelled })
+                }.value
+            } onCancel: {
+                cancelFlag.cancel()
+            }
+            guard !Task.isCancelled, !cancelFlag.isCancelled, self.searchGeneration == generation else { return }
             self.isIndexing = false
             var list: [Item] = ranked.map { .file(projectID: projectID, path: $0.path, positions: $0.positions, kind: changeKinds[$0.path]) }
             if self.scope == .all { list += actions }
@@ -153,8 +207,9 @@ final class QuickOpenModel {
 
     /// The picker of what to compare with: local branches first (the current one at the top), then remote ones and
     /// tags; and, once something is typed that names none of them, that text as a commit.
-    private func updateBranches(_ text: String, in project: Project?) {
+    private func updateBranches(_ text: String, in project: Project?, generation: UInt64) {
         guard let project else {
+            isIndexing = false
             items = []
             return
         }
@@ -163,13 +218,14 @@ final class QuickOpenModel {
             items = []
             searchTask = Task { @MainActor [weak self] in
                 let refs = (try? await Git.refs(in: project.url)) ?? []
-                guard let self, !Task.isCancelled, self.scope == .branches else { return }
+                guard let self, !Task.isCancelled, self.searchGeneration == generation, self.scope == .branches else { return }
                 self.isIndexing = false
                 self.refs = refs
                 self.update()
             }
             return
         }
+        isIndexing = false
         let order: [GitRef.Kind] = [.local, .remote, .tag]
         let sorted = refs.enumerated().sorted { a, b in
             if a.element.isHead != b.element.isHead { return a.element.isHead }
@@ -192,8 +248,9 @@ final class QuickOpenModel {
     }
 
     /// The stash list, newest first, under Stash Changes… while there is something to stash.
-    private func updateStashes(_ text: String, in project: Project?) {
+    private func updateStashes(_ text: String, in project: Project?, generation: UInt64) {
         guard let project else {
+            isIndexing = false
             items = []
             return
         }
@@ -202,13 +259,14 @@ final class QuickOpenModel {
             items = []
             searchTask = Task { @MainActor [weak self] in
                 let list = await Git.stashes(in: project.url)
-                guard let self, !Task.isCancelled, self.scope == .stashes else { return }
+                guard let self, !Task.isCancelled, self.searchGeneration == generation, self.scope == .stashes else { return }
                 self.isIndexing = false
                 self.stashList = list
                 self.update()
             }
             return
         }
+        isIndexing = false
         var list: [Item] = []
         if text.isEmpty {
             if !project.changes.isEmpty { list.append(.stashChanges(count: project.changes.count)) }
@@ -317,7 +375,13 @@ final class FindInPathModel {
 
     static let limit = 3000
 
-    var query = ""
+    var query = "" {
+        didSet {
+            if query != oldValue, !isPreparing {
+                queryChanged()
+            }
+        }
+    }
     var options = GrepOptions()
     var allProjects = false
     var excludeTestGo: Bool {
@@ -353,6 +417,7 @@ final class FindInPathModel {
     @ObservationIgnored weak var previewContainer: CodeScrollContainer?
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private var allHits: [Hit] = []
+    @ObservationIgnored private var isPreparing = false
     @ObservationIgnored private var searchTask: Task<Void, Never>?
     @ObservationIgnored private var previewTask: Task<Void, Never>?
     @ObservationIgnored private var debounce: DispatchWorkItem?
@@ -369,8 +434,10 @@ final class FindInPathModel {
     }
 
     func prepare(seed: String?) {
+        isPreparing = true
         if let seed { query = seed }
         focusToken += 1
+        isPreparing = false
         if seed != nil || (hits.isEmpty && !query.isEmpty) { search() }
     }
 
