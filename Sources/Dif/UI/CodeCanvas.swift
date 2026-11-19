@@ -261,6 +261,7 @@ final class CodeCanvasView: NSView {
     }
 
     private(set) var theme: CanvasTheme = .dark
+    private var activeStyles: [TokenStyle] = CanvasTheme.dark.syntax
 
     var scrollOrigin: CGPoint = .zero {
         didSet {
@@ -478,6 +479,7 @@ final class CodeCanvasView: NSView {
 
     func setDocument(_ doc: DiffDocument?, mode: Mode) {
         document = doc
+        activeStyles = theme.styles(for: doc?.language)
         editor = nil
         annotations = nil
         requestedMode = mode
@@ -552,6 +554,7 @@ final class CodeCanvasView: NSView {
         let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         guard dark != theme.isDark else { return }
         theme = dark ? .dark : .light
+        activeStyles = theme.styles(for: document?.language)
         invalidateTextCaches()
         invalidate(.everything)
     }
@@ -820,6 +823,7 @@ final class CodeCanvasView: NSView {
     }
 
     private static let colorKey = NSAttributedString.Key(kCTForegroundColorAttributeName as String)
+    private static let fontKey = NSAttributedString.Key(kCTFontAttributeName as String)
 
     private func makeLine(_ side: Side, _ index: Int) -> CTLine {
         guard let doc = document, index >= 0, index < doc.buffer(side).lines.count else {
@@ -830,9 +834,11 @@ final class CodeCanvasView: NSView {
         if text.utf8.count > Self.maxDisplayBytes {
             text = String(text.prefix(Self.maxDisplayBytes / 2)) + " …"
         }
+        let styles = activeStyles
+        let defaultColor = styles.first?.color ?? theme.text
         let attributed = NSMutableAttributedString(string: text, attributes: [
-            .font: codeFont.font,
-            Self.colorKey: theme.text,
+            Self.fontKey: codeFont.regularFont,
+            Self.colorKey: defaultColor,
             .paragraphStyle: paragraphStyle,
             .ligature: 0,
         ])
@@ -841,8 +847,13 @@ final class CodeCanvasView: NSView {
             let start = Int(span.start)
             let count = min(Int(span.length), length - start)
             guard start < length, count > 0 else { continue }
-            attributed.addAttribute(Self.colorKey, value: theme.syntax[Int(span.kind.rawValue)],
-                                    range: NSRange(location: start, length: count))
+            let kindIndex = Int(span.kind.rawValue)
+            let style = kindIndex < styles.count ? styles[kindIndex] : TokenStyle(defaultColor)
+            let range = NSRange(location: start, length: count)
+            attributed.addAttribute(Self.colorKey, value: style.color, range: range)
+            if style.bold || style.italic {
+                attributed.addAttribute(Self.fontKey, value: codeFont.ctFont(bold: style.bold, italic: style.italic), range: range)
+            }
         }
         return CTLineCreateWithAttributedString(attributed)
     }

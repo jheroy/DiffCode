@@ -87,14 +87,30 @@ extension Color {
 
 // MARK: - Code canvas theme
 
-/// Pre-resolved CGColors for the code canvas, so drawing never touches dynamic colour lookup.
+/// Foreground colour and font traits for one `TokenKind`.
+struct TokenStyle: Equatable, Sendable {
+    let color: CGColor
+    let bold: Bool
+    let italic: Bool
+
+    init(_ color: CGColor, bold: Bool = false, italic: Bool = false) {
+        self.color = color
+        self.bold = bold
+        self.italic = italic
+    }
+}
+
+/// Pre-resolved CGColors and token styles for the code canvas, so drawing never touches dynamic colour lookup.
 struct CanvasTheme {
     let isDark: Bool
     let background: CGColor
     let text: CGColor
     let gutterText: CGColor
     let gutterTextStrong: CGColor
-    let syntax: [CGColor]
+    /// Default token styles indexed by `TokenKind.rawValue` (0...19).
+    let syntax: [TokenStyle]
+    /// Authentic JetBrains GoLand palette for Go files, indexed by `TokenKind.rawValue` (0...19).
+    let goSyntax: [TokenStyle]
     // Side-by-side follows the IntelliJ convention: blue = modified, green = inserted, grey = deleted.
     let modified: CGColor, modifiedWord: CGColor, modifiedMark: CGColor
     let added: CGColor, addedWord: CGColor, addedMark: CGColor
@@ -111,24 +127,93 @@ struct CanvasTheme {
 
     private static func c(_ hex: UInt32, _ alpha: CGFloat = 1) -> CGColor { NSColor(hex: hex, alpha: alpha).cgColor }
 
+    func styles(for language: LanguageSpec?) -> [TokenStyle] {
+        language?.name == "Go" ? goSyntax : syntax
+    }
+
+    func style(for kind: TokenKind, language: LanguageSpec? = nil) -> TokenStyle {
+        let table = styles(for: language)
+        let idx = Int(kind.rawValue)
+        return idx < table.count ? table[idx] : TokenStyle(text)
+    }
+
+    private static let darkPalette: [TokenStyle] = [
+        TokenStyle(c(0xBCBEC4)),                   // 0: plain
+        TokenStyle(c(0xCF8E6D)),                   // 1: keyword (GoLand New UI Dark)
+        TokenStyle(c(0x6AAB73)),                   // 2: string
+        TokenStyle(c(0x7A7E85), italic: true),     // 3: comment
+        TokenStyle(c(0x2AACB8)),                   // 4: number
+        TokenStyle(c(0xB3AE60)),                   // 5: annotation / struct tag
+        TokenStyle(c(0x56A8F5)),                   // 6: function
+        TokenStyle(c(0xC77DBB), italic: true),     // 7: constant
+        TokenStyle(c(0xD5B778)),                   // 8: tag
+        TokenStyle(c(0xBABABA)),                   // 9: attribute
+        TokenStyle(c(0x6FAFBD)),                   // 10: type (struct / named type)
+        TokenStyle(c(0x6FAFBD), italic: true),     // 11: interface
+        TokenStyle(c(0x56A8F5)),                   // 12: method
+        TokenStyle(c(0x8888C6)),                   // 13: builtin (Darcula / GoLand predeclared & builtin)
+        TokenStyle(c(0xAFBF7E)),                   // 14: namespace (package identifier)
+        TokenStyle(c(0xC77DBB)),                   // 15: property (struct field)
+        TokenStyle(c(0xBCBEC4)),                   // 16: parameter
+        TokenStyle(c(0xBCBEC4)),                   // 17: variable
+        TokenStyle(c(0x16BAAC)),                   // 18: typeParameter (generic type param)
+        TokenStyle(c(0xBCBEC4)),                   // 19: operator
+    ]
+
+    private static let lightSyntaxPalette: [TokenStyle] = [
+        TokenStyle(c(0x1F2329)),                   // 0: plain
+        TokenStyle(c(0x0033B3), bold: true),       // 1: keyword (classic IntelliJ Light bold blue)
+        TokenStyle(c(0x067D17)),                   // 2: string
+        TokenStyle(c(0x8C8C8C), italic: true),     // 3: comment
+        TokenStyle(c(0x1750EB)),                   // 4: number
+        TokenStyle(c(0x9E880D)),                   // 5: annotation / struct tag
+        TokenStyle(c(0x00627A)),                   // 6: function
+        TokenStyle(c(0x871094), italic: true),     // 7: constant
+        TokenStyle(c(0x0033B3)),                   // 8: tag
+        TokenStyle(c(0x174AD4)),                   // 9: attribute
+        TokenStyle(c(0x007E8A)),                   // 10: type
+        TokenStyle(c(0x007E8A), italic: true),     // 11: interface
+        TokenStyle(c(0x00627A)),                   // 12: method
+        TokenStyle(c(0x0033B3)),                   // 13: builtin
+        TokenStyle(c(0x20999D)),                   // 14: namespace
+        TokenStyle(c(0x871094)),                   // 15: property
+        TokenStyle(c(0x080808)),                   // 16: parameter
+        TokenStyle(c(0x080808)),                   // 17: variable
+        TokenStyle(c(0x007E8A)),                   // 18: typeParameter
+        TokenStyle(c(0x080808)),                   // 19: operator
+    ]
+
+    private static let lightGoLandPalette: [TokenStyle] = [
+        TokenStyle(c(0x080808)),                   // 0: plain (GoLand Light)
+        TokenStyle(c(0x0033B3), bold: true),       // 1: keyword (bold blue)
+        TokenStyle(c(0x067D17)),                   // 2: string
+        TokenStyle(c(0x8C8C8C), italic: true),     // 3: comment
+        TokenStyle(c(0x1750EB)),                   // 4: number
+        TokenStyle(c(0x9E880D)),                   // 5: annotation / struct tag
+        TokenStyle(c(0x00627A)),                   // 6: function
+        TokenStyle(c(0x871094), italic: true),     // 7: constant
+        TokenStyle(c(0x0033B3)),                   // 8: tag
+        TokenStyle(c(0x174AD4)),                   // 9: attribute
+        TokenStyle(c(0x007E8A)),                   // 10: type
+        TokenStyle(c(0x007E8A), italic: true),     // 11: interface
+        TokenStyle(c(0x00627A)),                   // 12: method
+        TokenStyle(c(0x0033B3)),                   // 13: builtin
+        TokenStyle(c(0x20999D)),                   // 14: namespace
+        TokenStyle(c(0x871094)),                   // 15: property
+        TokenStyle(c(0x080808)),                   // 16: parameter
+        TokenStyle(c(0x080808)),                   // 17: variable
+        TokenStyle(c(0x007E8A)),                   // 18: typeParameter
+        TokenStyle(c(0x080808)),                   // 19: operator
+    ]
+
     static let dark = CanvasTheme(
         isDark: true,
         background: c(0x1E1F22),
         text: c(0xBCBEC4),
         gutterText: c(0x4E525A),
         gutterTextStrong: c(0xA1A5AD),
-        syntax: [
-            c(0xBCBEC4), // plain
-            c(0xCF8E6D), // keyword
-            c(0x6AAB73), // string
-            c(0x7A7E85), // comment
-            c(0x2AACB8), // number
-            c(0xB3AE60), // annotation
-            c(0x56A8F5), // function
-            c(0xC77DBB), // constant
-            c(0xD5B778), // tag
-            c(0xBABABA), // attribute
-        ],
+        syntax: darkPalette,
+        goSyntax: darkPalette,
         modified: c(0x3574F0, 0.20), modifiedWord: c(0x3574F0, 0.40), modifiedMark: c(0x5C92F7),
         added: c(0x3FA65A, 0.20), addedWord: c(0x3FA65A, 0.42), addedMark: c(0x57B46F),
         deleted: c(0x868A93, 0.20), deletedWord: c(0x868A93, 0.40), deletedMark: c(0x8E929B),
@@ -148,18 +233,8 @@ struct CanvasTheme {
         text: c(0x1F2329),
         gutterText: c(0xB4B8C2),
         gutterTextStrong: c(0x5A5E69),
-        syntax: [
-            c(0x1F2329), // plain
-            c(0x0033B3), // keyword
-            c(0x067D17), // string
-            c(0x8C8C8C), // comment
-            c(0x1750EB), // number
-            c(0x9E880D), // annotation
-            c(0x00627A), // function
-            c(0x871094), // constant
-            c(0x0033B3), // tag
-            c(0x174AD4), // attribute
-        ],
+        syntax: lightSyntaxPalette,
+        goSyntax: lightGoLandPalette,
         modified: c(0x3574F0, 0.13), modifiedWord: c(0x3574F0, 0.28), modifiedMark: c(0x3574F0),
         added: c(0x2DA44E, 0.15), addedWord: c(0x2DA44E, 0.32), addedMark: c(0x2DA44E),
         deleted: c(0x6E7481, 0.14), deletedWord: c(0x6E7481, 0.28), deletedMark: c(0x868B97),
@@ -245,6 +320,10 @@ enum MonospaceFonts {
 /// Font and derived metrics for code rendering.
 struct CodeFont: Equatable {
     let font: NSFont
+    let regularFont: CTFont
+    let boldFont: CTFont
+    let italicFont: CTFont
+    let boldItalicFont: CTFont
     let size: CGFloat
     let lineHeight: CGFloat
     let baseline: CGFloat
@@ -254,10 +333,68 @@ struct CodeFont: Equatable {
     init(size: CGFloat, family: String? = nil) {
         self.size = size
         font = MonospaceFonts.font(family: family, size: size)
+        let base: CTFont = font
+        regularFont = base
+        let boldBase = Self.makeBold(from: base, nsFont: font, size: size)
+        boldFont = boldBase
+        italicFont = Self.makeItalic(from: base, nsFont: font)
+        boldItalicFont = Self.makeBoldItalic(from: base, boldBase: boldBase, nsFont: font)
         lineHeight = (size * 1.5).rounded()
         let ascent = CTFontGetAscent(font), descent = CTFontGetDescent(font)
         baseline = ((lineHeight - (ascent + descent)) / 2 + ascent).rounded()
         charWidth = ("0" as NSString).size(withAttributes: [.font: font]).width
+    }
+
+    func ctFont(bold: Bool, italic: Bool) -> CTFont {
+        switch (bold, italic) {
+        case (false, false): return regularFont
+        case (true, false): return boldFont
+        case (false, true): return italicFont
+        case (true, true): return boldItalicFont
+        }
+    }
+
+    private static func makeBold(from base: CTFont, nsFont: NSFont, size: CGFloat) -> CTFont {
+        if let f = CTFontCreateCopyWithSymbolicTraits(base, 0, nil, .traitBold, .traitBold) {
+            return f
+        }
+        let converted = NSFontManager.shared.convert(nsFont, toHaveTrait: .boldFontMask)
+        if converted.fontDescriptor.symbolicTraits.contains(.bold) {
+            return converted
+        }
+        if nsFont.fontName.hasPrefix(".") {
+            return NSFont.monospacedSystemFont(ofSize: size, weight: .bold)
+        }
+        return base
+    }
+
+    private static func makeItalic(from base: CTFont, nsFont: NSFont) -> CTFont {
+        if let f = CTFontCreateCopyWithSymbolicTraits(base, 0, nil, .traitItalic, .traitItalic) {
+            return f
+        }
+        let converted = NSFontManager.shared.convert(nsFont, toHaveTrait: .italicFontMask)
+        if converted.fontDescriptor.symbolicTraits.contains(.italic) {
+            return converted
+        }
+        // Synthesize a clean ~12-degree oblique slant when the face has no native italic.
+        var matrix = CGAffineTransform(a: 1, b: 0, c: 0.21, d: 1, tx: 0, ty: 0)
+        return CTFontCreateCopyWithAttributes(base, 0, &matrix, nil)
+    }
+
+    private static func makeBoldItalic(from base: CTFont, boldBase: CTFont, nsFont: NSFont) -> CTFont {
+        let both: CTFontSymbolicTraits = [.traitBold, .traitItalic]
+        if let f = CTFontCreateCopyWithSymbolicTraits(base, 0, nil, both, both) {
+            return f
+        }
+        if let f = CTFontCreateCopyWithSymbolicTraits(boldBase, 0, nil, .traitItalic, .traitItalic) {
+            return f
+        }
+        let converted = NSFontManager.shared.convert(boldBase as NSFont, toHaveTrait: .italicFontMask)
+        if converted.fontDescriptor.symbolicTraits.contains(.italic) {
+            return converted
+        }
+        var matrix = CGAffineTransform(a: 1, b: 0, c: 0.21, d: 1, tx: 0, ty: 0)
+        return CTFontCreateCopyWithAttributes(boldBase, 0, &matrix, nil)
     }
 
     /// The code font Settings asks for.
