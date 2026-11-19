@@ -104,6 +104,12 @@ struct DialogView: View {
                 }
             }
 
+            if let form = request.worktreeForm {
+                WorktreeFormView(form: form)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 14)
+            }
+
             if let option = request.option {
                 Toggle(isOn: Binding(get: { option.isOn }, set: { _ in store.toggleDialogOption() })) {
                     Text(option.title)
@@ -139,7 +145,10 @@ struct DialogView: View {
                 if let alternate = request.alternateTitle {
                     DialogButton(title: alternate, keys: "", style: .plain) { store.answerDialogAlternate() }
                 }
-                let blocked = request.input.map { $0.problem(text.trimmingCharacters(in: .whitespaces)) != nil } ?? false
+                let inputBlocked = request.input.map { $0.problem(text.trimmingCharacters(in: .whitespaces)) != nil } ?? false
+                let optionBlocked = request.option.map { $0.required && !$0.isOn } ?? false
+                let formBlocked = request.worktreeForm?.problem != nil
+                let blocked = inputBlocked || optionBlocked || formBlocked
                 let destructive = request.style == .destructive
                     || (request.choices.indices.contains(request.choice) && request.choices[request.choice].destructive)
                 DialogButton(title: request.confirmTitle, keys: "↩", style: destructive ? .destructive : .primary) {
@@ -274,5 +283,142 @@ struct DialogButton: View {
         case .primary: return Color.difAccent.opacity(hovering ? 0.85 : 1)
         case .destructive: return Color(NSColor(hex: 0xD9453C)).opacity(hovering ? 0.85 : 1)
         }
+    }
+}
+
+private struct WorktreeFormView: View {
+    @Bindable var form: WorktreeDialogForm
+    @Environment(AppStore.self) private var store
+    @FocusState private var branchFocused: Bool
+    @FocusState private var pathFocused: Bool
+    @State private var chooseHovering = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Picker("", selection: Binding(get: { form.mode }, set: { form.setMode($0) })) {
+                Text(L("New branch", "新建分支")).tag(WorktreeDialogForm.Mode.newBranch)
+                Text(L("Existing branch", "已有分支")).tag(WorktreeDialogForm.Mode.existingBranch)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+
+            switch form.mode {
+            case .newBranch:
+                let branchError = form.newBranchName.isEmpty ? nil : form.branchProblem
+                VStack(alignment: .leading, spacing: 5) {
+                    fieldLabel(L("Branch name", "分支名"))
+                    TextField(L("e.g. feature/my-task", "例如 feature/my-task"),
+                              text: Binding(get: { form.newBranchName }, set: { form.setNewBranchName($0) }))
+                        .textFieldStyle(.plain)
+                        .font(.ui(size: 13))
+                        .padding(.horizontal, 10)
+                        .frame(height: UI.s(30))
+                        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.difChip))
+                        .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .strokeBorder(branchError != nil ? Color.difRemoved.opacity(0.8)
+                                                             : Color.difAccent.opacity(branchFocused ? 0.7 : 0),
+                                          lineWidth: 1.5))
+                        .focused($branchFocused)
+                        .onSubmit { store.answerDialog(confirmed: true) }
+                        .onExitCommand { store.answerDialog(confirmed: false) }
+                    if let branchError {
+                        Text(branchError)
+                            .font(.ui(size: 11))
+                            .foregroundStyle(Color.difRemoved)
+                            .lineLimit(1)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 5) {
+                    fieldLabel(L("Base branch", "基于分支"))
+                    Picker("", selection: $form.baseRef) {
+                        Text(form.currentBranch.map { "HEAD (\($0))" } ?? "HEAD").tag("")
+                        if !form.baseRefChoices.isEmpty {
+                            Divider()
+                            ForEach(form.baseRefChoices, id: \.self) { ref in
+                                Text(ref).tag(ref)
+                            }
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+            case .existingBranch:
+                VStack(alignment: .leading, spacing: 5) {
+                    fieldLabel(L("Branch", "分支"))
+                    if form.existingBranchChoices.isEmpty {
+                        Text(L("All local branches are already checked out in a work tree.",
+                               "所有本地分支都已在工作树中检出。"))
+                            .font(.ui(size: 12))
+                            .foregroundStyle(Color.difText3)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.difChip))
+                    } else {
+                        Picker("", selection: Binding(get: { form.selectedExistingID }, set: { form.setSelectedExistingID($0) })) {
+                            ForEach(form.existingBranchChoices) { option in
+                                Text(option.refName).tag(option.id)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+
+            let pathError = form.pathProblem
+            VStack(alignment: .leading, spacing: 5) {
+                fieldLabel(L("Location", "目录位置"))
+                HStack(spacing: 8) {
+                    TextField(L("Folder path", "目录路径"),
+                              text: Binding(get: { form.pathText }, set: { form.setPathText($0) }))
+                        .textFieldStyle(.plain)
+                        .font(.code(12))
+                        .padding(.horizontal, 10)
+                        .frame(height: UI.s(30))
+                        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.difChip))
+                        .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .strokeBorder(pathError != nil ? Color.difRemoved.opacity(0.8)
+                                                           : Color.difAccent.opacity(pathFocused ? 0.7 : 0),
+                                          lineWidth: 1.5))
+                        .focused($pathFocused)
+                        .onSubmit { store.answerDialog(confirmed: true) }
+                        .onExitCommand { store.answerDialog(confirmed: false) }
+
+                    Button {
+                        store.chooseWorktreeParentFolder(for: form)
+                    } label: {
+                        Text(L("Choose…", "选择…"))
+                            .font(.ui(size: 12, weight: .medium))
+                            .foregroundStyle(Color.difText)
+                            .padding(.horizontal, 10)
+                            .frame(height: UI.s(30))
+                            .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                .fill(chooseHovering ? Color.difText.opacity(0.14) : Color.difChip))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { chooseHovering = $0 }
+                }
+                Text(pathError ?? " ")
+                    .font(.ui(size: 11))
+                    .foregroundStyle(Color.difRemoved)
+                    .lineLimit(1)
+            }
+        }
+        .onAppear {
+            guard form.mode == .newBranch else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { branchFocused = true }
+        }
+    }
+
+    private func fieldLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.ui(size: 11.5, weight: .medium))
+            .foregroundStyle(Color.difText2)
     }
 }

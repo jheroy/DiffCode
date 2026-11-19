@@ -170,8 +170,9 @@ struct FileTreePanel: View {
         if row.isDirectory {
             add(row.isExpanded ? L("Collapse", "折叠") : L("Expand", "展开")) { toggle(row) }
             add(L("Collapse All", "全部折叠")) { project.treeExpanded.removeAll() }
+            menu.addItem(.separator())
+            add(L("New Branch…", "新建分支…")) { store.newBranch(in: project) }
             if AppEnvironment.hasTerminal {
-                menu.addItem(.separator())
                 add(L("Open Terminal Here", "在这里打开终端")) { store.terminals.open(in: project, directory: url) }
             }
         } else {
