@@ -9,8 +9,8 @@ struct SidebarView: View {
     var body: some View {
         GeometryReader { proxy in
             VStack(spacing: 0) {
-                // Clear space for the traffic lights; still draggable.
-                WindowDragArea().frame(height: store.titlebarHeight)
+                // Clear space for the traffic lights (offset by the outer island frame padding); still draggable.
+                WindowDragArea().frame(height: store.isFullScreen ? 10 : max(26, store.titlebarHeight - IslandStyle.outerPadding))
 
                 HStack {
                     SectionLabel(text: L("Projects", "项目"))

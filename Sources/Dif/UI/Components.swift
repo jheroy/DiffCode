@@ -803,7 +803,34 @@ struct FileIcon: View {
     }
 }
 
-// MARK: - Dividers
+// MARK: - Islands & Dividers
+
+enum IslandStyle {
+    static let cornerRadius: CGFloat = 10
+    static let gap: CGFloat = 7
+    static let outerPadding: CGFloat = 7
+}
+
+/// Frames a workspace region as a floating rounded island card with a subtle 1pt border.
+struct IslandCard: ViewModifier {
+    var background: Color = .difWindow
+    var cornerRadius: CGFloat = IslandStyle.cornerRadius
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        content
+            .background(background)
+            .clipShape(shape)
+            .overlay(shape.strokeBorder(Color.difIslandBorder, lineWidth: 1))
+    }
+}
+
+extension View {
+    /// Frames a workspace region as a floating rounded island card.
+    func islandCard(background: Color = .difWindow, cornerRadius: CGFloat = IslandStyle.cornerRadius) -> some View {
+        modifier(IslandCard(background: background, cornerRadius: cornerRadius))
+    }
+}
 
 /// What a divider resizes: columns sit side by side and are dragged left and right, rows are dragged up and down.
 enum ResizeAxis {
@@ -902,10 +929,11 @@ private struct GripArea: NSViewRepresentable {
     }
 }
 
-/// The line between two panels: a hairline that lights up, a wider invisible strip to grab, and the resize pointer.
+/// The divider between two panels: either a 1px hairline or an invisible island gap with a hover/drag pill.
 struct DividerGrip: View {
     var axis: ResizeAxis
     var color = Color.difBorder
+    var islandGap = false
     /// The drag's translation along the axis since it began, or nil once it has ended.
     var onDrag: (CGFloat?) -> Void
     /// A double-click on the divider, where it puts something back (nil: a double-click is two clicks).
@@ -917,24 +945,41 @@ struct DividerGrip: View {
 
     var body: some View {
         let lit = hovering || dragging
-        Rectangle()
-            .fill(color)
-            .frame(width: axis == .columns ? 1 : nil, height: axis == .rows ? 1 : nil)
-            .overlay(
+        let thickness = islandGap ? IslandStyle.gap : 1
+        let grabSpan = max(Self.grabWidth, thickness)
+        Group {
+            if islandGap {
+                Color.clear
+                    .frame(width: axis == .columns ? thickness : nil, height: axis == .rows ? thickness : nil)
+                    .overlay {
+                        Capsule()
+                            .fill(dragging ? Color.difAccent.opacity(0.85) : Color.difText3.opacity(0.55))
+                            .frame(width: axis == .columns ? 3 : 36, height: axis == .rows ? 3 : 36)
+                            .opacity(lit ? 1 : 0)
+                            .animation(.easeOut(duration: 0.12), value: lit)
+                            .allowsHitTesting(false)
+                    }
+            } else {
                 Rectangle()
-                    .fill(lit ? Color.difAccent.opacity(0.6) : Color.clear)
-                    .frame(width: axis == .columns ? 3 : nil, height: axis == .rows ? 3 : nil)
-                    .allowsHitTesting(false)
-            )
-            .overlay(
-                GripArea(axis: axis, onHover: { hovering = $0 }, onDrag: { translation in
-                    dragging = translation != nil
-                    onDrag(translation)
-                }, onDoubleClick: onDoubleClick)
-                .frame(width: axis == .columns ? Self.grabWidth : nil, height: axis == .rows ? Self.grabWidth : nil)
-                .resizePointer(axis)
-            )
-            .zIndex(1)
+                    .fill(color)
+                    .frame(width: axis == .columns ? 1 : nil, height: axis == .rows ? 1 : nil)
+                    .overlay(
+                        Rectangle()
+                            .fill(lit ? Color.difAccent.opacity(0.6) : Color.clear)
+                            .frame(width: axis == .columns ? 3 : nil, height: axis == .rows ? 3 : nil)
+                            .allowsHitTesting(false)
+                    )
+            }
+        }
+        .overlay(
+            GripArea(axis: axis, onHover: { hovering = $0 }, onDrag: { translation in
+                dragging = translation != nil
+                onDrag(translation)
+            }, onDoubleClick: onDoubleClick)
+            .frame(width: axis == .columns ? grabSpan : nil, height: axis == .rows ? grabSpan : nil)
+            .resizePointer(axis)
+        )
+        .zIndex(1)
     }
 }
 
@@ -942,11 +987,12 @@ struct DividerGrip: View {
 struct ResizeHandle: View {
     @Binding var width: Double
     var range: ClosedRange<Double>
+    var islandGap = false
     var onEnd: () -> Void = {}
     @State private var startWidth: Double?
 
     var body: some View {
-        DividerGrip(axis: .columns) { translation in
+        DividerGrip(axis: .columns, islandGap: islandGap) { translation in
             guard let translation else {
                 startWidth = nil
                 onEnd()
@@ -963,11 +1009,12 @@ struct ResizeHandle: View {
 struct HorizontalResizeHandle: View {
     @Binding var height: Double
     var range: ClosedRange<Double>
+    var islandGap = false
     var onEnd: () -> Void = {}
     @State private var startHeight: Double?
 
     var body: some View {
-        DividerGrip(axis: .rows, color: .difHairline) { translation in
+        DividerGrip(axis: .rows, color: .difHairline, islandGap: islandGap) { translation in
             guard let translation else {
                 startHeight = nil
                 onEnd()
