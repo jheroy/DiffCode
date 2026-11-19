@@ -295,6 +295,7 @@ enum Attr {
     typealias Foreground = AttributeScopes.SwiftUIAttributes.ForegroundColorAttribute
     typealias Background = AttributeScopes.SwiftUIAttributes.BackgroundColorAttribute
     typealias Font = AttributeScopes.SwiftUIAttributes.FontAttribute
+    typealias Ligature = AttributeScopes.AppKitAttributes.LigatureAttribute
 }
 
 @MainActor
@@ -856,12 +857,13 @@ private struct ReferenceCodePreviewView: View {
     ) -> AttributedString {
         if line.text.isEmpty {
             var empty = AttributedString(" ")
-            empty[Attr.Font.self] = Font(codeFont.font)
+            empty[Attr.Font.self] = Font(codeFont.regularFont as NSFont)
             return empty
         }
         var result = AttributedString(line.text)
         result[Attr.Foreground.self] = Color(cgColor: theme.text)
-        result[Attr.Font.self] = Font(codeFont.font)
+        result[Attr.Font.self] = Font(codeFont.regularFont as NSFont)
+        result[Attr.Ligature.self] = codeFont.ligatures ? 1 : 0
 
         let utf16Len = (line.text as NSString).length
         let styles = theme.styles(for: language)
@@ -1020,11 +1022,17 @@ struct KeymapView: View {
 
 struct SettingsView: View {
     @Environment(AppStore.self) private var store
+    @Environment(\.colorScheme) private var colorScheme
     /// Installed monospace families for the font pickers, read when Settings opens.
     @State private var families: [String] = []
+    /// Weights genuinely available for the currently selected code font family.
+    @State private var availableWeights: [CodeFontWeight] = CodeFontWeight.allCases
+    @State private var typographyExpanded = true
 
     var body: some View {
         @Bindable var settings = store.settings
+        let codeFont = CodeFont.current(settings)
+        let previewTheme: CanvasTheme = colorScheme == .dark ? .dark : .light
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text(L("Settings", "设置")).font(.ui(size: 15, weight: .semibold)).foregroundStyle(Color.difText)
@@ -1035,7 +1043,7 @@ struct SettingsView: View {
             .frame(height: UI.s(48))
             Rectangle().fill(Color.difHairline).frame(height: 1)
 
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 14) {
                 row(L("Appearance", "外观")) {
                     Picker("", selection: $settings.appearance) {
                         ForEach(Settings.Appearance.allCases, id: \.self) { Text($0.title).tag($0) }
@@ -1068,6 +1076,54 @@ struct SettingsView: View {
                 row(L("Code font size", "代码字号")) {
                     stepper(settings.fontSize, down: "⌃⇧,", up: "⌃⇧.") { store.viewer.changeFontSize(by: $0) }
                 }
+                row(L("Enable ligatures", "启用连字")) {
+                    Toggle("", isOn: Binding(
+                        get: { settings.codeFontLigatures },
+                        set: { store.setCodeFontLigatures($0) }
+                    ))
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .labelsHidden()
+                }
+                VStack(alignment: .leading, spacing: 10) {
+                    Button {
+                        withAnimation(.snappy(duration: 0.18)) { typographyExpanded.toggle() }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: typographyExpanded ? "chevron.down" : "chevron.right")
+                                .font(.ui(size: 10, weight: .semibold))
+                                .foregroundStyle(Color.difText3)
+                                .frame(width: 12)
+                            Text(L("Typography Settings", "排版设置"))
+                                .font(.ui(size: 12.5, weight: .medium))
+                                .foregroundStyle(Color.difText)
+                            Rectangle()
+                                .fill(Color.difHairline)
+                                .frame(height: 1)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+
+                    if typographyExpanded {
+                        VStack(alignment: .leading, spacing: 10) {
+                            row(L("Main weight", "常规字重")) {
+                                weightPicker(settings.codeFontMainWeight) { store.chooseCodeFontMainWeight($0) }
+                            }
+                            row(L("Bold weight", "粗体字重")) {
+                                weightPicker(settings.codeFontBoldWeight) { store.chooseCodeFontBoldWeight($0) }
+                            }
+                            TypographyPreviewView(codeFont: codeFont, theme: previewTheme)
+                                .frame(height: codeFont.lineHeight * 2 + 16)
+                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .strokeBorder(Color.difHairline, lineWidth: 1)
+                                )
+                        }
+                        .padding(.leading, 18)
+                    }
+                }
                 row(L("Interface font size", "界面字号")) {
                     stepper(settings.uiFontSize, down: L("Smaller", "减小"), up: L("Larger", "增大")) { store.changeInterfaceFontSize(by: $0) }
                 }
@@ -1091,10 +1147,16 @@ struct SettingsView: View {
             }
             .padding(20)
         }
-        .onAppear { settings.reloadLanguage() }
+        .onAppear {
+            settings.reloadLanguage()
+            availableWeights = MonospaceFonts.availableWeights(for: settings.codeFontFamily)
+        }
         .task {
             // Fonts installed since the last time show too.
             families = await Task.detached(priority: .userInitiated) { MonospaceFonts.installed() }.value
+        }
+        .onChange(of: settings.codeFontFamily) { _, family in
+            availableWeights = MonospaceFonts.availableWeights(for: family)
         }
         .onChange(of: settings.appearance) { _, _ in
             settings.save()
@@ -1131,11 +1193,110 @@ struct SettingsView: View {
         .frame(width: UI.s(240))
     }
 
+    private func weightPicker(_ selection: CodeFontWeight, choose: @escaping (CodeFontWeight) -> Void) -> some View {
+        let options = availableWeights.isEmpty ? CodeFontWeight.allCases : availableWeights
+        let resolved = MonospaceFonts.nearestWeight(selection, in: options)
+        return Picker("", selection: Binding(get: { resolved }, set: { choose($0) })) {
+            ForEach(options) { weight in
+                Text(weight.title).tag(weight)
+            }
+        }
+        .pickerStyle(.menu)
+        .labelsHidden()
+        .frame(width: UI.s(240))
+    }
+
     private func stepper(_ value: Double, down: String, up: String, change: @escaping (Double) -> Void) -> some View {
         HStack(spacing: 8) {
             IconButton(symbol: "minus", help: down) { change(-1) }
             Text("\(Int(value)) pt").font(.ui(size: 12.5, design: .rounded)).frame(width: UI.s(44))
             IconButton(symbol: "plus", help: up) { change(1) }
+        }
+    }
+}
+
+/// CoreText-backed live preview of the current `CodeFont` (Main weight, Bold weight, Italic, and Ligatures).
+private struct TypographyPreviewView: NSViewRepresentable {
+    let codeFont: CodeFont
+    let theme: CanvasTheme
+
+    func makeNSView(context: Context) -> PreviewCanvas {
+        let view = PreviewCanvas()
+        view.update(codeFont: codeFont, theme: theme)
+        return view
+    }
+
+    func updateNSView(_ view: PreviewCanvas, context: Context) {
+        view.update(codeFont: codeFont, theme: theme)
+    }
+
+    final class PreviewCanvas: NSView {
+        private static let sampleLines = [
+            "func DeleteSignup(lid int64) {",
+            "    if lid <= 0 && ok != nil { return }",
+        ]
+        private static let sampleSpans = Highlighter.highlight(sampleLines, language: .go)
+        private static let colorKey = NSAttributedString.Key(kCTForegroundColorAttributeName as String)
+        private static let fontKey = NSAttributedString.Key(kCTFontAttributeName as String)
+
+        private var codeFont = CodeFont(size: 12)
+        private var theme: CanvasTheme = .dark
+        private var ctLines: [CTLine] = []
+
+        override var isFlipped: Bool { true }
+
+        func update(codeFont: CodeFont, theme: CanvasTheme) {
+            let needsRebuild = ctLines.isEmpty || self.codeFont != codeFont || self.theme.isDark != theme.isDark
+            self.codeFont = codeFont
+            self.theme = theme
+            if needsRebuild {
+                rebuildLines()
+                needsDisplay = true
+            }
+        }
+
+        private func rebuildLines() {
+            let styles = theme.styles(for: .go)
+            let defaultColor = styles.first?.color ?? theme.text
+            let ligatureValue = codeFont.ligatures ? 1 : 0
+            ctLines = Self.sampleLines.enumerated().map { index, text in
+                let attributed = NSMutableAttributedString(string: text, attributes: [
+                    Self.fontKey: codeFont.regularFont,
+                    Self.colorKey: defaultColor,
+                    .ligature: ligatureValue,
+                ])
+                let length = attributed.length
+                let spans = index < Self.sampleSpans.count ? Self.sampleSpans[index] : []
+                for span in spans where span.kind != .plain {
+                    let start = Int(span.start)
+                    let count = min(Int(span.length), length - start)
+                    guard start < length, count > 0 else { continue }
+                    let kindIndex = Int(span.kind.rawValue)
+                    let style = kindIndex < styles.count ? styles[kindIndex] : TokenStyle(defaultColor)
+                    let range = NSRange(location: start, length: count)
+                    attributed.addAttribute(Self.colorKey, value: style.color, range: range)
+                    if style.bold || style.italic {
+                        attributed.addAttribute(
+                            Self.fontKey,
+                            value: codeFont.ctFont(bold: style.bold, italic: style.italic),
+                            range: range
+                        )
+                    }
+                }
+                return CTLineCreateWithAttributedString(attributed)
+            }
+        }
+
+        override func draw(_ dirtyRect: NSRect) {
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return }
+            ctx.setFillColor(theme.background)
+            ctx.fill(bounds)
+            ctx.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+            let lh = codeFont.lineHeight
+            for (index, line) in ctLines.enumerated() {
+                ctx.textPosition = CGPoint(x: 10, y: 8 + CGFloat(index) * lh + codeFont.baseline)
+                CTLineDraw(line, ctx)
+            }
         }
     }
 }

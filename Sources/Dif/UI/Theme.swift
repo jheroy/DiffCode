@@ -320,12 +320,123 @@ struct CanvasTheme {
     }
 }
 
+/// Selectable font weights for code rendering (GoLand-style Main weight and Bold weight).
+enum CodeFontWeight: String, CaseIterable, Identifiable, Sendable {
+    case thin
+    case extraLight
+    case light
+    case regular
+    case medium
+    case semiBold
+    case bold
+    case extraBold
+    case black
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .thin: return "Thin"
+        case .extraLight: return "ExtraLight"
+        case .light: return "Light"
+        case .regular: return "Regular"
+        case .medium: return "Medium"
+        case .semiBold: return "SemiBold"
+        case .bold: return "Bold"
+        case .extraBold: return "ExtraBold"
+        case .black: return "Black"
+        }
+    }
+
+    var cssWeight: CGFloat {
+        switch self {
+        case .thin: return 100
+        case .extraLight: return 200
+        case .light: return 300
+        case .regular: return 400
+        case .medium: return 500
+        case .semiBold: return 600
+        case .bold: return 700
+        case .extraBold: return 800
+        case .black: return 900
+        }
+    }
+
+    var nsWeight: NSFont.Weight {
+        switch self {
+        case .thin: return .ultraLight
+        case .extraLight: return .thin
+        case .light: return .light
+        case .regular: return .regular
+        case .medium: return .medium
+        case .semiBold: return .semibold
+        case .bold: return .bold
+        case .extraBold: return .heavy
+        case .black: return .black
+        }
+    }
+
+    /// CoreText `kCTFontWeightTrait` scale (`-1.0 ... 1.0`).
+    var ctWeightTrait: CGFloat {
+        switch self {
+        case .thin: return -0.80
+        case .extraLight: return -0.60
+        case .light: return -0.40
+        case .regular: return 0.00
+        case .medium: return 0.23
+        case .semiBold: return 0.30
+        case .bold: return 0.40
+        case .extraBold: return 0.56
+        case .black: return 0.62
+        }
+    }
+
+    /// AppKit `NSFontManager` weight scale (`2, 3, 4, 5, 6, 8, 9, 10, 11`).
+    var appKitWeight: Int {
+        switch self {
+        case .thin: return 2
+        case .extraLight: return 3
+        case .light: return 4
+        case .regular: return 5
+        case .medium: return 6
+        case .semiBold: return 8
+        case .bold: return 9
+        case .extraBold: return 10
+        case .black: return 11
+        }
+    }
+}
+
 /// The monospace faces code and terminals are drawn in: a family picked in Settings, else JetBrains Mono when it is
 /// installed, else the system's own monospace face. A picked family that is no longer installed counts as none.
 enum MonospaceFonts {
+    /// Four-character OpenType `'wght'` variation axis identifier.
+    static let wghtAxisTag: Int = 0x77676874
+
+    struct FamilyMember {
+        let postScriptName: String
+        let styleName: String
+        let appKitWeight: Int
+        let isItalic: Bool
+        let parsedWeight: CodeFontWeight?
+    }
+
     /// What "Default" stands for in Settings.
     static var defaultName: String {
         NSFont(name: "JetBrainsMono-Regular", size: 12) != nil ? "JetBrains Mono" : "SF Mono"
+    }
+
+    /// Resolves a Settings family choice to an installed named family, or `nil` when using the system monospaced font.
+    static func resolvedFamilyName(for family: String?) -> String? {
+        if let family, !family.isEmpty {
+            if family.hasPrefix(".") { return nil }
+            if regular(family, size: 12) != nil { return family }
+        }
+        if let jb = NSFont(name: "JetBrainsMono-Regular", size: 12), let name = jb.familyName, !name.hasPrefix(".") {
+            return name
+        }
+        if regular("JetBrains Mono", size: 12) != nil { return "JetBrains Mono" }
+        return nil
     }
 
     static func font(family: String?, size: CGFloat) -> NSFont {
@@ -362,6 +473,128 @@ enum MonospaceFonts {
         let width = advances[0].width
         return width > 0 && advances.allSatisfy { abs($0.width - width) < 0.01 }
     }
+
+    /// Parses a family's installed static members from `NSFontManager`.
+    static func familyMembers(of family: String) -> [FamilyMember] {
+        guard let rawMembers = NSFontManager.shared.availableMembers(ofFontFamily: family) else { return [] }
+        return rawMembers.compactMap { entry in
+            guard entry.count >= 4,
+                  let psName = entry[0] as? String,
+                  let styleName = entry[1] as? String,
+                  let akWeight = entry[2] as? Int else { return nil }
+            let traits = (entry[3] as? UInt) ?? (entry[3] as? Int).map { UInt(bitPattern: $0) } ?? 0
+            let lowerStyle = styleName.lowercased()
+            let isItalic = (traits & NSFontTraitMask.italicFontMask.rawValue) != 0
+                || lowerStyle.contains("italic")
+                || lowerStyle.contains("oblique")
+            return FamilyMember(
+                postScriptName: psName,
+                styleName: styleName,
+                appKitWeight: akWeight,
+                isItalic: isItalic,
+                parsedWeight: parseWeight(fromStyle: styleName)
+            )
+        }
+    }
+
+    /// Maps a font face's localized/OpenType style name (e.g. `"ExtraBold Italic"`, `"Semibold"`, `"Thin"`) to a
+    /// canonical `CodeFontWeight`, or `nil` for custom optical names like `"Retina"`.
+    static func parseWeight(fromStyle styleName: String) -> CodeFontWeight? {
+        var token = styleName.lowercased()
+        for strip in ["italic", "oblique", "slanted", "roman", "upright", "mono", "nerd", "font", " ", "-", "_"] {
+            token = token.replacingOccurrences(of: strip, with: "")
+        }
+        switch token {
+        case "", "regular", "normal", "book", "plain", "text":
+            return .regular
+        case "thin", "hairline":
+            return .thin
+        case "extralight", "ultralight", "xlight":
+            return .extraLight
+        case "light":
+            return .light
+        case "medium":
+            return .medium
+        case "semibold", "demibold", "demi":
+            return .semiBold
+        case "bold":
+            return .bold
+        case "extrabold", "ultrabold", "xbold", "heavy":
+            return .extraBold
+        case "black", "extrablack", "ultrablack":
+            return .black
+        default:
+            return nil
+        }
+    }
+
+    /// Returns the `[min, max]` range of a font's variable `'wght'` axis, if it has one.
+    static func variationWeightRange(of font: CTFont) -> ClosedRange<CGFloat>? {
+        guard let axes = CTFontCopyVariationAxes(font) as? [[CFString: Any]] else { return nil }
+        for axis in axes {
+            guard let tag = axis[kCTFontVariationAxisIdentifierKey] as? Int, tag == wghtAxisTag else { continue }
+            guard let minVal = (axis[kCTFontVariationAxisMinimumValueKey] as? NSNumber)?.doubleValue,
+                  let maxVal = (axis[kCTFontVariationAxisMaximumValueKey] as? NSNumber)?.doubleValue,
+                  maxVal > minVal else { continue }
+            return CGFloat(minVal)...CGFloat(maxVal)
+        }
+        return nil
+    }
+
+    /// Detects the ordered weights genuinely available for a font family.
+    /// Variable fonts with a `'wght'` axis expose all weights within `[min, max]`, the system monospaced font exposes
+    /// all 9 weights, and static families expose their distinct installed weights (falling back to all 9 if only 1).
+    static func availableWeights(for family: String?) -> [CodeFontWeight] {
+        guard let resolved = resolvedFamilyName(for: family) else {
+            return CodeFontWeight.allCases
+        }
+        let members = familyMembers(of: resolved)
+        guard !members.isEmpty else { return CodeFontWeight.allCases }
+
+        let upright = members.filter { !$0.isItalic }
+        let pool = upright.isEmpty ? members : upright
+
+        // Variable font check on a representative face (prefer Regular).
+        let representative = pool.first { $0.parsedWeight == .regular } ?? pool[0]
+        let repFont = CTFontCreateWithName(representative.postScriptName as CFString, 12, nil)
+        if let range = variationWeightRange(of: repFont) {
+            let matched = CodeFontWeight.allCases.filter {
+                $0.cssWeight >= range.lowerBound - 1 && $0.cssWeight <= range.upperBound + 1
+            }
+            return matched.isEmpty ? CodeFontWeight.allCases : matched
+        }
+
+        // Static multi-weight family: collect distinct matched weights in canonical order.
+        var found: Set<CodeFontWeight> = []
+        for member in pool {
+            if let parsed = member.parsedWeight {
+                found.insert(parsed)
+            } else {
+                let face = CTFontCreateWithName(member.postScriptName as CFString, 12, nil)
+                let traits = CTFontCopyTraits(face) as? [CFString: Any]
+                if let ctWeight = (traits?[kCTFontWeightTrait] as? NSNumber)?.doubleValue {
+                    let nearest = CodeFontWeight.allCases.min {
+                        abs(Double($0.ctWeightTrait) - ctWeight) < abs(Double($1.ctWeightTrait) - ctWeight)
+                    }
+                    if let nearest { found.insert(nearest) }
+                }
+            }
+        }
+        let ordered = CodeFontWeight.allCases.filter { found.contains($0) }
+        return ordered.count > 1 ? ordered : CodeFontWeight.allCases
+    }
+
+    /// Maps any persisted weight to the closest available weight in `available`.
+    static func nearestWeight(_ target: CodeFontWeight, in available: [CodeFontWeight]) -> CodeFontWeight {
+        guard !available.isEmpty else { return target }
+        if available.contains(target) { return target }
+        return available.min { a, b in
+            let da = abs(a.cssWeight - target.cssWeight)
+            let db = abs(b.cssWeight - target.cssWeight)
+            if da != db { return da < db }
+            return a.cssWeight < b.cssWeight
+        } ?? target
+    }
 }
 
 /// Font and derived metrics for code rendering.
@@ -372,24 +605,40 @@ struct CodeFont: Equatable {
     let italicFont: CTFont
     let boldItalicFont: CTFont
     let size: CGFloat
+    let mainWeight: CodeFontWeight
+    let boldWeight: CodeFontWeight
+    let ligatures: Bool
     let lineHeight: CGFloat
     let baseline: CGFloat
     let charWidth: CGFloat
 
     /// `family`: a family picked in Settings, or nil for the default face.
-    init(size: CGFloat, family: String? = nil) {
+    init(
+        size: CGFloat,
+        family: String? = nil,
+        mainWeight: CodeFontWeight = .regular,
+        boldWeight: CodeFontWeight = .bold,
+        ligatures: Bool = true
+    ) {
         self.size = size
-        font = MonospaceFonts.font(family: family, size: size)
-        let base: CTFont = font
-        regularFont = base
-        let boldBase = Self.makeBold(from: base, nsFont: font, size: size)
-        boldFont = boldBase
-        italicFont = Self.makeItalic(from: base, nsFont: font)
-        boldItalicFont = Self.makeBoldItalic(from: base, boldBase: boldBase, nsFont: font)
+        self.mainWeight = mainWeight
+        self.boldWeight = boldWeight
+        self.ligatures = ligatures
+
+        let regular = Self.resolveFont(family: family, size: size, weight: mainWeight, italic: false, ligatures: ligatures)
+        let bold = Self.resolveFont(family: family, size: size, weight: boldWeight, italic: false, ligatures: ligatures)
+        let italic = Self.resolveFont(family: family, size: size, weight: mainWeight, italic: true, ligatures: ligatures)
+        let boldItalic = Self.resolveFont(family: family, size: size, weight: boldWeight, italic: true, ligatures: ligatures)
+
+        regularFont = regular
+        boldFont = bold
+        italicFont = italic
+        boldItalicFont = boldItalic
+        font = regular as NSFont
         lineHeight = (size * 1.5).rounded()
-        let ascent = CTFontGetAscent(font), descent = CTFontGetDescent(font)
+        let ascent = CTFontGetAscent(regular), descent = CTFontGetDescent(regular)
         baseline = ((lineHeight - (ascent + descent)) / 2 + ascent).rounded()
-        charWidth = ("0" as NSString).size(withAttributes: [.font: font]).width
+        charWidth = ("0" as NSString).size(withAttributes: [.font: regular as NSFont]).width
     }
 
     func ctFont(bold: Bool, italic: Bool) -> CTFont {
@@ -401,56 +650,150 @@ struct CodeFont: Equatable {
         }
     }
 
-    private static func makeBold(from base: CTFont, nsFont: NSFont, size: CGFloat) -> CTFont {
-        if let f = CTFontCreateCopyWithSymbolicTraits(base, 0, nil, .traitBold, .traitBold) {
-            return f
+    /// Resolves an exact CoreText face for the given family, size, weight, italic polarity, and ligature setting.
+    static func resolveFont(
+        family: String?,
+        size: CGFloat,
+        weight: CodeFontWeight,
+        italic: Bool,
+        ligatures: Bool = true
+    ) -> CTFont {
+        let resolved: CTFont
+        if let familyName = MonospaceFonts.resolvedFamilyName(for: family) {
+            resolved = resolveNamedFamily(familyName, size: size, weight: weight, italic: italic)
+        } else {
+            resolved = resolveSystemMonospace(size: size, weight: weight, italic: italic)
         }
-        let converted = NSFontManager.shared.convert(nsFont, toHaveTrait: .boldFontMask)
-        if converted.fontDescriptor.symbolicTraits.contains(.bold) {
-            return converted
-        }
-        if nsFont.fontName.hasPrefix(".") {
-            return NSFont.monospacedSystemFont(ofSize: size, weight: .bold)
-        }
-        return base
+        return applyLigatures(to: resolved, enabled: ligatures)
     }
 
-    private static func makeItalic(from base: CTFont, nsFont: NSFont) -> CTFont {
-        if let f = CTFontCreateCopyWithSymbolicTraits(base, 0, nil, .traitItalic, .traitItalic) {
-            return f
+    private static func resolveSystemMonospace(size: CGFloat, weight: CodeFontWeight, italic: Bool) -> CTFont {
+        let base: CTFont = NSFont.monospacedSystemFont(ofSize: size, weight: weight.nsWeight)
+        guard italic else { return base }
+        if let nativeItalic = CTFontCreateCopyWithSymbolicTraits(base, 0, nil, .traitItalic, .traitItalic) {
+            return nativeItalic
         }
-        let converted = NSFontManager.shared.convert(nsFont, toHaveTrait: .italicFontMask)
-        if converted.fontDescriptor.symbolicTraits.contains(.italic) {
-            return converted
+        return synthesizeOblique(from: base)
+    }
+
+    private static func resolveNamedFamily(
+        _ family: String,
+        size: CGFloat,
+        weight: CodeFontWeight,
+        italic: Bool
+    ) -> CTFont {
+        let members = MonospaceFonts.familyMembers(of: family)
+        guard !members.isEmpty else {
+            let fallback: CTFont = MonospaceFonts.font(family: family, size: size)
+            return italic ? synthesizeOblique(from: fallback) : fallback
         }
-        // Synthesize a clean ~12-degree oblique slant when the face has no native italic.
+
+        let polarityMatches = members.filter { $0.isItalic == italic }
+        let candidates = polarityMatches.isEmpty ? members : polarityMatches
+        let needsSyntheticItalic = italic && polarityMatches.isEmpty
+
+        let exactStatic = candidates.first { $0.parsedWeight == weight }
+
+        // Variable font support: if a candidate exposes a `'wght'` axis and there is no exact static PostScript member,
+        // instantiate the continuous weight directly via `kCTFontVariationAttribute`.
+        let representative = candidates.first { $0.parsedWeight == .regular } ?? candidates[0]
+        let repFont = CTFontCreateWithName(representative.postScriptName as CFString, size, nil)
+        if exactStatic == nil, let range = MonospaceFonts.variationWeightRange(of: repFont) {
+            let clamped = min(range.upperBound, max(range.lowerBound, weight.cssWeight))
+            let variations: [NSNumber: NSNumber] = [
+                NSNumber(value: MonospaceFonts.wghtAxisTag): NSNumber(value: Double(clamped)),
+            ]
+            let descriptor = CTFontDescriptorCreateWithAttributes([
+                kCTFontVariationAttribute: variations,
+            ] as CFDictionary)
+            let varied = CTFontCreateCopyWithAttributes(repFont, size, nil, descriptor)
+            return needsSyntheticItalic ? synthesizeOblique(from: varied) : varied
+        }
+
+        // Static multi-weight family: exact style match first, else closest weight by parsed CSS weight,
+        // CoreText `kCTFontWeightTrait`, and AppKit weight.
+        let chosen: MonospaceFonts.FamilyMember
+        if let exactStatic {
+            chosen = exactStatic
+        } else {
+            chosen = candidates.min { a, b in
+                weightDistance(of: a, to: weight, size: size) < weightDistance(of: b, to: weight, size: size)
+            } ?? candidates[0]
+        }
+
+        let face = CTFontCreateWithName(chosen.postScriptName as CFString, size, nil)
+        return needsSyntheticItalic ? synthesizeOblique(from: face) : face
+    }
+
+    private static func weightDistance(
+        of member: MonospaceFonts.FamilyMember,
+        to target: CodeFontWeight,
+        size: CGFloat
+    ) -> Double {
+        if let parsed = member.parsedWeight {
+            return abs(Double(parsed.cssWeight - target.cssWeight))
+        }
+        let face = CTFontCreateWithName(member.postScriptName as CFString, size, nil)
+        let traits = CTFontCopyTraits(face) as? [CFString: Any]
+        let ctWeight = (traits?[kCTFontWeightTrait] as? NSNumber)?.doubleValue
+        let ctDistance = ctWeight.map { abs($0 - Double(target.ctWeightTrait)) * 400.0 }
+        let akDistance = abs(Double(member.appKitWeight - target.appKitWeight)) * 50.0
+        // Slight penalty (+5) so canonical named weights beat optical aliases like "Retina" on ties.
+        return (ctDistance ?? akDistance) + Double(abs(member.appKitWeight - target.appKitWeight)) + 5.0
+    }
+
+    /// Synthesizes a clean ~12-degree oblique slant when a face has no native italic member.
+    private static func synthesizeOblique(from base: CTFont) -> CTFont {
         var matrix = CGAffineTransform(a: 1, b: 0, c: 0.21, d: 1, tx: 0, ty: 0)
         return CTFontCreateCopyWithAttributes(base, 0, &matrix, nil)
     }
 
-    private static func makeBoldItalic(from base: CTFont, boldBase: CTFont, nsFont: NSFont) -> CTFont {
-        let both: CTFontSymbolicTraits = [.traitBold, .traitItalic]
-        if let f = CTFontCreateCopyWithSymbolicTraits(base, 0, nil, both, both) {
-            return f
-        }
-        if let f = CTFontCreateCopyWithSymbolicTraits(boldBase, 0, nil, .traitItalic, .traitItalic) {
-            return f
-        }
-        let converted = NSFontManager.shared.convert(boldBase as NSFont, toHaveTrait: .italicFontMask)
-        if converted.fontDescriptor.symbolicTraits.contains(.italic) {
-            return converted
-        }
-        var matrix = CGAffineTransform(a: 1, b: 0, c: 0.21, d: 1, tx: 0, ty: 0)
-        return CTFontCreateCopyWithAttributes(boldBase, 0, &matrix, nil)
+    /// Enables or explicitly disables CoreText + OpenType programming ligatures (`liga` and `calt`).
+    private static func applyLigatures(to font: CTFont, enabled: Bool) -> CTFont {
+        let features: [[CFString: Any]] = [
+            [
+                kCTFontFeatureTypeIdentifierKey: kLigaturesType,
+                kCTFontFeatureSelectorIdentifierKey: enabled ? kCommonLigaturesOnSelector : kCommonLigaturesOffSelector,
+            ],
+            [
+                kCTFontFeatureTypeIdentifierKey: kContextualAlternatesType,
+                kCTFontFeatureSelectorIdentifierKey: enabled ? kContextualAlternatesOnSelector : kContextualAlternatesOffSelector,
+            ],
+            [
+                kCTFontOpenTypeFeatureTag: "liga",
+                kCTFontOpenTypeFeatureValue: enabled ? 1 : 0,
+            ],
+            [
+                kCTFontOpenTypeFeatureTag: "calt",
+                kCTFontOpenTypeFeatureValue: enabled ? 1 : 0,
+            ],
+        ]
+        let descriptor = CTFontDescriptorCreateWithAttributes([
+            kCTFontFeatureSettingsAttribute: features,
+        ] as CFDictionary)
+        return CTFontCreateCopyWithAttributes(font, 0, nil, descriptor)
     }
 
     /// The code font Settings asks for.
     @MainActor
     static func current(_ settings: Settings = .shared) -> CodeFont {
-        CodeFont(size: settings.fontSize, family: settings.codeFontFamily)
+        CodeFont(
+            size: settings.fontSize,
+            family: settings.codeFontFamily,
+            mainWeight: settings.codeFontMainWeight,
+            boldWeight: settings.codeFontBoldWeight,
+            ligatures: settings.codeFontLigatures
+        )
     }
 
-    static func == (a: CodeFont, b: CodeFont) -> Bool { a.size == b.size && a.font.fontName == b.font.fontName }
+    static func == (a: CodeFont, b: CodeFont) -> Bool {
+        a.size == b.size
+            && a.mainWeight == b.mainWeight
+            && a.boldWeight == b.boldWeight
+            && a.ligatures == b.ligatures
+            && (CTFontCopyPostScriptName(a.regularFont) as String) == (CTFontCopyPostScriptName(b.regularFont) as String)
+            && (CTFontCopyPostScriptName(a.boldFont) as String) == (CTFontCopyPostScriptName(b.boldFont) as String)
+    }
 }
 
 /// Interface metrics. Sizes in the views are written for the default 13 pt interface font and

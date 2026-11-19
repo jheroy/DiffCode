@@ -928,7 +928,7 @@ final class CodeCanvasView: NSView {
             Self.fontKey: codeFont.regularFont,
             Self.colorKey: defaultColor,
             .paragraphStyle: paragraphStyle,
-            .ligature: 0,
+            .ligature: codeFont.ligatures ? 1 : 0,
         ])
         let length = attributed.length
         for span in buffer.spans(at: index) where span.kind != .plain {

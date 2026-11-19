@@ -825,6 +825,31 @@ final class AppStore {
         settings.codeFontFamily = family
         settings.save()
         viewer.applyCodeFont()
+        finder.applyCodeFont()
+    }
+
+    func chooseCodeFontMainWeight(_ weight: CodeFontWeight) {
+        guard weight != settings.codeFontMainWeight else { return }
+        settings.codeFontMainWeight = weight
+        settings.save()
+        viewer.applyCodeFont()
+        finder.applyCodeFont()
+    }
+
+    func chooseCodeFontBoldWeight(_ weight: CodeFontWeight) {
+        guard weight != settings.codeFontBoldWeight else { return }
+        settings.codeFontBoldWeight = weight
+        settings.save()
+        viewer.applyCodeFont()
+        finder.applyCodeFont()
+    }
+
+    func setCodeFontLigatures(_ enabled: Bool) {
+        guard enabled != settings.codeFontLigatures else { return }
+        settings.codeFontLigatures = enabled
+        settings.save()
+        viewer.applyCodeFont()
+        finder.applyCodeFont()
     }
 
     /// A font family picked in Settings for terminals; nil puts back the default face.
