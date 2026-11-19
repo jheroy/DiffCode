@@ -12,16 +12,22 @@ enum TokenKind: UInt8, CaseIterable, Sendable {
     case constant
     case tag
     case attribute
-    case type          // 10: structs, named types, classes, enums
-    case interface     // 11: interfaces
-    case method        // 12: method declarations & calls
-    case builtin       // 13: builtin functions & predeclared types (len, make, error, string, int, ...)
-    case namespace     // 14: packages / modules / namespaces
-    case property      // 15: struct fields / object properties
-    case parameter     // 16: function/method parameters
-    case variable      // 17: local / package variables
-    case typeParameter // 18: generic type parameters
-    case `operator`    // 19: operators
+    case type             // 10: unexported types/structs in Go; named types, classes, enums
+    case interface        // 11: interfaces
+    case method           // 12: unexported methods in Go; method declarations & calls
+    case builtin          // 13: builtin functions (len, make, delete, append, ...)
+    case namespace        // 14: packages / modules / namespaces
+    case property         // 15: unexported struct fields in Go; object properties
+    case parameter        // 16: function/method parameters & receivers
+    case variable         // 17: local / unexported variables
+    case typeParameter    // 18: generic type parameters
+    case `operator`       // 19: operators
+    case exportedFunction // 20: exported Go functions & methods (declarations & calls)
+    case exportedConstant // 21: exported Go constants (declarations & references)
+    case exportedVariable // 22: exported Go package-level variables
+    case builtinType      // 23: Go predeclared builtin types (int64, bool, string, error, ...)
+    case exportedType     // 24: exported Go types / structs
+    case exportedProperty // 25: exported Go struct fields
 }
 
 /// A coloured run inside one line, in UTF-16 units (what CoreText wants).
@@ -44,6 +50,7 @@ final class LanguageSpec: @unchecked Sendable {
     var keywords: Set<String> = []
     var typeKeywords: Set<String> = []
     var builtinKeywords: Set<String> = []
+    var builtinTypeKeywords: Set<String> = []
     var constantKeywords: Set<String> = []
     var defKeywords: Set<String> = []
     var lineComments: [[UInt8]] = []
@@ -69,6 +76,7 @@ final class LanguageSpec: @unchecked Sendable {
         maxKeywordLength = keywords
             .union(typeKeywords)
             .union(builtinKeywords)
+            .union(builtinTypeKeywords)
             .union(constantKeywords)
             .map(\.utf8.count).max() ?? 0
     }
@@ -76,6 +84,7 @@ final class LanguageSpec: @unchecked Sendable {
     func keywords(_ list: String) { keywords.formUnion(list.split(separator: " ").map(String.init)) }
     func types(_ list: String) { typeKeywords.formUnion(list.split(separator: " ").map(String.init)) }
     func builtins(_ list: String) { builtinKeywords.formUnion(list.split(separator: " ").map(String.init)) }
+    func builtinTypes(_ list: String) { builtinTypeKeywords.formUnion(list.split(separator: " ").map(String.init)) }
     func constants(_ list: String) { constantKeywords.formUnion(list.split(separator: " ").map(String.init)) }
     func defs(_ list: String) { defKeywords.formUnion(list.split(separator: " ").map(String.init)) }
     func slashComments() {
@@ -166,9 +175,11 @@ extension LanguageSpec {
         package range return select struct switch type var
         """)
         $0.builtins("""
-        bool byte complex64 complex128 error float32 float64 int int8 int16 int32 int64 rune string \
-        uint uint8 uint16 uint32 uint64 uintptr any comparable \
         append cap clear close complex copy delete imag len make max min new panic print println real recover
+        """)
+        $0.builtinTypes("""
+        bool byte complex64 complex128 error float32 float64 int int8 int16 int32 int64 rune string \
+        uint uint8 uint16 uint32 uint64 uintptr any comparable
         """)
         $0.constants("true false nil iota")
         $0.defs("func")
@@ -391,12 +402,13 @@ enum Highlighter {
     /// Lines longer than this are left uncoloured; they are almost always minified or generated.
     static let maxLineBytes = 4000
 
-    /// What the lexer carries from one line into the next: an open comment, string or fence.
+    /// What the lexer carries from one line into the next: an open comment, string, fence, or Go block.
     struct State: Equatable {
         enum Mode: UInt8 { case normal, blockComment, string, markupComment, markupTag, markupString, cdata, fence }
         var mode: Mode = .normal
         var delimiter: UInt8 = 0
         var triple = false
+        var goBlock: UInt8 = 0 // 0 = none, 1 = const (...), 2 = var (...)
     }
 
     static func highlight(_ lines: [String], language: LanguageSpec) -> [[SyntaxSpan]] {
@@ -539,13 +551,22 @@ enum Highlighter {
 
     // MARK: C-like
 
-    private enum GoDecl { case none, packageName, importAlias, typeName, funcOrReceiver, methodName }
+    private enum GoDecl { case none, packageName, importAlias, typeName, funcOrReceiver, methodName, constName, varName, funcParams }
+
+    private static func isGoExported(_ buf: UnsafeBufferPointer<UInt8>, start: Int, end: Int) -> Bool {
+        guard start < end else { return false }
+        let first = buf[start]
+        if first < 0x80 { return first >= 65 && first <= 90 }
+        let s = String(decoding: UnsafeBufferPointer(rebasing: buf[start..<end]), as: UTF8.self)
+        return s.first?.isUppercase == true
+    }
 
     private static func scanCLike(_ buf: UnsafeBufferPointer<UInt8>, _ spec: LanguageSpec,
                                   _ state: inout State, _ spans: inout [SyntaxSpan]) {
         let n = buf.count
         var i = 0
         var prevNonSpace: UInt8 = 0
+        var prev2NonSpace: UInt8 = 0
 
         switch state.mode {
         case .blockComment:
@@ -562,6 +583,7 @@ enum Highlighter {
             if let end = stringEnd(buf, from: 0, delimiter: state.delimiter, triple: state.triple, raw: raw) {
                 emit(&spans, 0, end, .string)
                 i = end
+                prev2NonSpace = prevNonSpace
                 prevNonSpace = state.delimiter
                 state.mode = .normal
             } else {
@@ -576,6 +598,8 @@ enum Highlighter {
         var previousTypeish = false // previous token could be a return type (`String foo(`)
         var sawContent = false
         var goDecl = GoDecl.none
+        var goBlockLineDecl = spec.goReceivers && state.goBlock != 0
+        var goParenDepth = 0
 
         while i < n {
             let c = buf[i]
@@ -601,7 +625,7 @@ enum Highlighter {
                 // Rust lifetimes (`'a`) look like an unterminated char literal.
                 if spec.lifetimes, c == 39 {
                     let isChar = (i + 2 < n && buf[i + 2] == 39) || (i + 1 < n && buf[i + 1] == 92)
-                    if !isChar { i += 1; prevNonSpace = c; sawContent = true; continue }
+                    if !isChar { i += 1; prev2NonSpace = prevNonSpace; prevNonSpace = c; sawContent = true; continue }
                 }
                 let triple = spec.tripleQuotes && i + 2 < n && buf[i + 1] == c && buf[i + 2] == c
                 let bodyStart = triple ? i + 3 : i + 1
@@ -627,6 +651,8 @@ enum Highlighter {
                     return
                 }
                 goDecl = .none
+                goBlockLineDecl = false
+                prev2NonSpace = prevNonSpace
                 prevNonSpace = c
                 previousTypeish = false
                 sawContent = true
@@ -644,6 +670,8 @@ enum Highlighter {
                 emit(&spans, i, j, .number)
                 i = j
                 goDecl = .none
+                goBlockLineDecl = false
+                prev2NonSpace = prevNonSpace
                 prevNonSpace = buf[j - 1]
                 previousTypeish = false
                 sawContent = true
@@ -668,10 +696,14 @@ enum Highlighter {
                             case "type": goDecl = .typeName
                             case "package": goDecl = .packageName
                             case "import": goDecl = .importAlias
+                            case "const": goDecl = .constName
+                            case "var": goDecl = .varName
                             default: goDecl = .none
                             }
+                            goBlockLineDecl = false
                             emit(&spans, i, j, kind)
                             i = j
+                            prev2NonSpace = prevNonSpace
                             prevNonSpace = buf[j - 1]
                             previousTypeish = false
                             sawContent = true
@@ -680,22 +712,40 @@ enum Highlighter {
                             expectName = true
                             emit(&spans, i, j, kind)
                             i = j
+                            prev2NonSpace = prevNonSpace
                             prevNonSpace = buf[j - 1]
                             previousTypeish = false
                             sawContent = true
                             continue
                         }
                     } else if spec.goReceivers {
-                        if goDecl != .none {
+                        if goDecl != .none && goDecl != .funcParams {
                             kind = resolveGoDecl(&goDecl, buf, start: i, end: j)
-                        } else if spec.builtinKeywords.contains(word) {
-                            kind = .builtin
-                        } else if spec.constantKeywords.contains(word) {
-                            kind = .constant
-                            typeish = false
+                            goBlockLineDecl = false
+                        } else if goBlockLineDecl {
+                            let exported = isGoExported(buf, start: i, end: j)
+                            if state.goBlock == 1 {
+                                kind = exported ? .exportedConstant : .constant
+                            } else if state.goBlock == 2 {
+                                kind = exported ? .exportedVariable : .plain
+                            }
+                            var k = j
+                            while k < n, isSpace(buf[k]) { k += 1 }
+                            if k >= n || buf[k] != 44 { goBlockLineDecl = false }
+                        } else if prevNonSpace != 46 {
+                            if spec.builtinTypeKeywords.contains(word) {
+                                kind = .builtinType
+                            } else if spec.builtinKeywords.contains(word) {
+                                kind = .builtin
+                            } else if spec.constantKeywords.contains(word) {
+                                kind = .constant
+                                typeish = false
+                            }
                         }
                     } else if spec.typeKeywords.contains(word) {
                         kind = .keyword
+                    } else if spec.builtinTypeKeywords.contains(word) {
+                        kind = .builtinType
                     } else if spec.builtinKeywords.contains(word) {
                         kind = .builtin
                     } else if spec.constantKeywords.contains(word) {
@@ -708,12 +758,34 @@ enum Highlighter {
                     while k < n, isSpace(buf[k]) { k += 1 }
                     let next: UInt8 = k < n ? buf[k] : 0
                     if spec.goReceivers {
-                        if goDecl != .none {
+                        if goDecl != .none && goDecl != .funcParams {
                             kind = resolveGoDecl(&goDecl, buf, start: i, end: j)
+                            goBlockLineDecl = false
+                        } else if goBlockLineDecl {
+                            let exported = isGoExported(buf, start: i, end: j)
+                            if state.goBlock == 1 {
+                                kind = exported ? .exportedConstant : .constant
+                            } else if state.goBlock == 2 {
+                                kind = exported ? .exportedVariable : .plain
+                            }
+                            if next != 44 { goBlockLineDecl = false }
                         } else if next == 40 || (next == 91 && isGoGenericCall(buf, from: k)) {
-                            kind = prevNonSpace == 46 ? .method : .function
-                        } else if length >= 2, isConstantName(buf, i, j) {
-                            kind = .constant
+                            if isGoExported(buf, start: i, end: j) {
+                                kind = .exportedFunction
+                            } else {
+                                kind = prevNonSpace == 46 ? .method : .function
+                            }
+                        } else if next == 123, isGoExported(buf, start: i, end: j) {
+                            kind = .exportedType
+                        } else if length >= 2, isConstantName(buf, i, j), next != 46, next != 123 {
+                            kind = .exportedConstant
+                        } else if prev2NonSpace == 93 && prevNonSpace == 42 {
+                            // Pointer-slice type `[]*Type` / `[]*unexportedType`
+                            kind = isGoExported(buf, start: i, end: j) ? .exportedType : .type
+                        } else if prevNonSpace == 46 {
+                            kind = isGoExported(buf, start: i, end: j) ? .exportedProperty : .property
+                        } else if next == 58, (k + 1 >= n || buf[k + 1] != 61), isGoExported(buf, start: i, end: j) {
+                            kind = .exportedProperty
                         }
                     } else if expectName {
                         // `fun Receiver.name()` — keep waiting for the real name after the dot.
@@ -731,6 +803,7 @@ enum Highlighter {
                 }
                 if kind != .plain { emit(&spans, i, j, kind) }
                 previousTypeish = typeish
+                prev2NonSpace = prevNonSpace
                 prevNonSpace = buf[j - 1]
                 i = j
                 sawContent = true
@@ -742,6 +815,7 @@ enum Highlighter {
                 while j < n, isIdentPart(buf[j]) || buf[j] == 46 || buf[j] == 58 { j += 1 }
                 emit(&spans, i, j, .annotation)
                 i = j
+                prev2NonSpace = prevNonSpace
                 prevNonSpace = buf[j - 1]
                 sawContent = true
                 continue
@@ -753,6 +827,7 @@ enum Highlighter {
                 while j < n, isIdentPart(buf[j]) { j += 1 }
                 emit(&spans, i, j, .annotation)
                 i = j
+                prev2NonSpace = prevNonSpace
                 prevNonSpace = buf[j - 1]
                 sawContent = true
                 continue
@@ -768,23 +843,87 @@ enum Highlighter {
                 }
                 if j > i + 1 { emit(&spans, i, j, .constant) }
                 i = max(j, i + 1)
+                prev2NonSpace = prevNonSpace
                 prevNonSpace = buf[i - 1]
                 sawContent = true
                 continue
             }
 
             // Punctuation.
-            if spec.goReceivers, goDecl == .funcOrReceiver {
-                if c == 40, let after = scanGoReceiver(buf, openParen: i, spec: spec, spans: &spans) {
-                    goDecl = .methodName
-                    prevNonSpace = 41
+            if spec.goReceivers {
+                if goDecl == .funcOrReceiver {
+                    if c == 40 {
+                        if let after = scanGoReceiver(buf, openParen: i, spec: spec, spans: &spans) {
+                            goDecl = .methodName
+                            prev2NonSpace = prevNonSpace
+                            prevNonSpace = 41
+                            sawContent = true
+                            i = after
+                            continue
+                        }
+                        // Anonymous `func(...)` parameter list.
+                        if let after = scanGoParamList(buf, openParen: i, spec: spec, spans: &spans) {
+                            goDecl = .none
+                            prev2NonSpace = prevNonSpace
+                            prevNonSpace = 41
+                            sawContent = true
+                            i = after
+                            continue
+                        }
+                    }
+                    goDecl = .none
+                } else if goDecl == .funcParams {
+                    if c == 91, let after = scanGoTypeParams(buf, openBracket: i, spec: spec, spans: &spans) {
+                        prev2NonSpace = prevNonSpace
+                        prevNonSpace = 93
+                        sawContent = true
+                        i = after
+                        continue
+                    }
+                    if c == 40, let after = scanGoParamList(buf, openParen: i, spec: spec, spans: &spans) {
+                        // Also scan an immediately following return-value list `(T, error)` or `(r T, err error)`.
+                        var nextIdx = after
+                        while nextIdx < n, isSpace(buf[nextIdx]) { nextIdx += 1 }
+                        if nextIdx < n, buf[nextIdx] == 40,
+                           let afterRet = scanGoParamList(buf, openParen: nextIdx, spec: spec, spans: &spans) {
+                            i = afterRet
+                        } else {
+                            i = after
+                        }
+                        goDecl = .none
+                        prev2NonSpace = prevNonSpace
+                        prevNonSpace = 41
+                        sawContent = true
+                        continue
+                    }
+                    goDecl = .none
+                } else if (goDecl == .constName || goDecl == .varName), c == 40 {
+                    state.goBlock = goDecl == .constName ? 1 : 2
+                    goDecl = .none
+                    goBlockLineDecl = true
+                    prev2NonSpace = prevNonSpace
+                    prevNonSpace = c
                     sawContent = true
-                    i = after
+                    i += 1
                     continue
+                } else if goDecl != .none {
+                    goDecl = .none
                 }
-                goDecl = .none
-            } else if spec.goReceivers, goDecl != .none {
-                goDecl = .none
+
+                if state.goBlock != 0 {
+                    if c == 40 {
+                        goParenDepth += 1
+                    } else if c == 41 {
+                        if goParenDepth == 0 {
+                            state.goBlock = 0
+                            goBlockLineDecl = false
+                        } else {
+                            goParenDepth -= 1
+                        }
+                    } else if c != 44 {
+                        goBlockLineDecl = false
+                    }
+                }
             }
 
             if expectName {
@@ -802,6 +941,7 @@ enum Highlighter {
             }
             // `>` and `]` close generic and array types, `*`/`&` decorate pointer types.
             previousTypeish = (c == 62 || c == 93 || c == 42 || c == 38) && previousTypeish || (c == 62 || c == 93)
+            prev2NonSpace = prevNonSpace
             prevNonSpace = c
             sawContent = true
             i += 1
@@ -811,13 +951,206 @@ enum Highlighter {
     private static func resolveGoDecl(_ goDecl: inout GoDecl, _ buf: UnsafeBufferPointer<UInt8>, start: Int, end: Int) -> TokenKind {
         let decl = goDecl
         goDecl = .none
+        let exported = isGoExported(buf, start: start, end: end)
         switch decl {
-        case .funcOrReceiver: return .function
-        case .methodName: return .method
-        case .packageName: return .namespace
-        case .importAlias: return (end - start == 1 && buf[start] == 95) ? .plain : .namespace
-        case .typeName: return isGoInterfaceDecl(buf, after: end) ? .interface : .type
-        case .none: return .plain
+        case .funcOrReceiver:
+            goDecl = .funcParams
+            return exported ? .exportedFunction : .function
+        case .methodName:
+            goDecl = .funcParams
+            return exported ? .exportedFunction : .method
+        case .packageName:
+            return .namespace
+        case .importAlias:
+            return (end - start == 1 && buf[start] == 95) ? .plain : .namespace
+        case .typeName:
+            if isGoInterfaceDecl(buf, after: end) { return .interface }
+            return exported ? .exportedType : .type
+        case .constName:
+            return exported ? .exportedConstant : .constant
+        case .varName:
+            return exported ? .exportedVariable : .plain
+        case .funcParams, .none:
+            return .plain
+        }
+    }
+
+    /// Scans a Go generic type parameter list `[T comparable, U any]` right after a function/method name.
+    private static func scanGoTypeParams(_ buf: UnsafeBufferPointer<UInt8>, openBracket: Int,
+                                         spec: LanguageSpec, spans: inout [SyntaxSpan]) -> Int? {
+        let n = buf.count
+        var k = openBracket + 1
+        var depth = 1
+        while k < n, depth > 0 {
+            if buf[k] == 91 { depth += 1 } else if buf[k] == 93 { depth -= 1 }
+            k += 1
+        }
+        guard depth == 0 else { return nil }
+        let closeBracket = k - 1
+
+        var p = openBracket + 1
+        var expectParamName = true
+        while p < closeBracket {
+            let b = buf[p]
+            if isSpace(b) { p += 1; continue }
+            if b == 44 { expectParamName = true; p += 1; continue }
+            if isIdentStart(b) {
+                var q = p + 1
+                while q < closeBracket, isIdentPart(buf[q]) { q += 1 }
+                let w = String(decoding: UnsafeBufferPointer(rebasing: buf[p..<q]), as: UTF8.self)
+                if spec.keywords.contains(w) {
+                    emit(&spans, p, q, .keyword)
+                } else if spec.builtinTypeKeywords.contains(w) {
+                    emit(&spans, p, q, .builtinType)
+                } else if expectParamName {
+                    emit(&spans, p, q, .typeParameter)
+                    expectParamName = false
+                } else {
+                    emit(&spans, p, q, isGoExported(buf, start: p, end: q) ? .exportedType : .type)
+                }
+                p = q
+                continue
+            }
+            p += 1
+        }
+        return closeBracket + 1
+    }
+
+    /// Scans a Go parameter or return list `(a, b int64, corps datastruct.Event)` and emits `.parameter` + type spans.
+    private static func scanGoParamList(_ buf: UnsafeBufferPointer<UInt8>, openParen: Int,
+                                        spec: LanguageSpec, spans: inout [SyntaxSpan]) -> Int? {
+        let n = buf.count
+        var k = openParen + 1
+        var parenDepth = 1
+        var bracketDepth = 0
+        var braceDepth = 0
+        var segments: [(Int, Int)] = []
+        var segStart = openParen + 1
+
+        while k < n, parenDepth > 0 {
+            let b = buf[k]
+            if b == 40 { parenDepth += 1 }
+            else if b == 41 {
+                parenDepth -= 1
+                if parenDepth == 0 {
+                    segments.append((segStart, k))
+                    break
+                }
+            } else if b == 91 { bracketDepth += 1 }
+            else if b == 93 { bracketDepth = max(0, bracketDepth - 1) }
+            else if b == 123 { braceDepth += 1 }
+            else if b == 125 { braceDepth = max(0, braceDepth - 1) }
+            else if b == 44, parenDepth == 1, bracketDepth == 0, braceDepth == 0 {
+                segments.append((segStart, k))
+                segStart = k + 1
+            }
+            k += 1
+        }
+        guard parenDepth == 0 else { return nil }
+        let closeParen = k
+
+        // Inspect each comma-separated entry to decide whether this list uses named parameters.
+        struct Entry {
+            var nameStart: Int?
+            var nameEnd: Int?
+            var typeStart: Int
+            var typeEnd: Int
+            var isBareIdent: Bool
+        }
+        var entries: [Entry] = []
+        var hasExplicitNamed = false
+
+        for (rawStart, rawEnd) in segments {
+            var s = rawStart
+            var e = rawEnd
+            while s < e, isSpace(buf[s]) { s += 1 }
+            while e > s, isSpace(buf[e - 1]) { e -= 1 }
+            guard s < e else { continue }
+
+            if isIdentStart(buf[s]) {
+                var identEnd = s + 1
+                while identEnd < e, isIdentPart(buf[identEnd]) { identEnd += 1 }
+                let word = String(decoding: UnsafeBufferPointer(rebasing: buf[s..<identEnd]), as: UTF8.self)
+                var after = identEnd
+                while after < e, isSpace(buf[after]) { after += 1 }
+                if after == e {
+                    let isBareParamCandidate = !spec.keywords.contains(word) && !spec.builtinTypeKeywords.contains(word)
+                    entries.append(Entry(nameStart: s, nameEnd: identEnd, typeStart: s, typeEnd: e, isBareIdent: isBareParamCandidate))
+                    continue
+                }
+                // `name Type` requires at least one space between name and type (not `pkg.Type` or `Generic[T]`).
+                let hasSpace = after > identEnd
+                if hasSpace, !spec.keywords.contains(word), !spec.builtinTypeKeywords.contains(word) {
+                    hasExplicitNamed = true
+                    entries.append(Entry(nameStart: s, nameEnd: identEnd, typeStart: after, typeEnd: e, isBareIdent: false))
+                    continue
+                }
+            }
+            entries.append(Entry(nameStart: nil, nameEnd: nil, typeStart: s, typeEnd: e, isBareIdent: false))
+        }
+
+        for entry in entries {
+            if hasExplicitNamed {
+                if let ns = entry.nameStart, let ne = entry.nameEnd {
+                    if entry.isBareIdent {
+                        // Grouped parameter name like `a` in `(a, b int64)`
+                        emit(&spans, ns, ne, .parameter)
+                    } else {
+                        emit(&spans, ns, ne, .parameter)
+                        scanGoTypeExpr(buf, start: entry.typeStart, end: entry.typeEnd, spec: spec, spans: &spans)
+                    }
+                    continue
+                }
+            }
+            scanGoTypeExpr(buf, start: entry.typeStart, end: entry.typeEnd, spec: spec, spans: &spans)
+        }
+        return closeParen + 1
+    }
+
+    /// Scans a Go type expression inside a parameter/return list (e.g. `int64`, `datastruct.Event`, `[]*foo`, `map[string]int`).
+    private static func scanGoTypeExpr(_ buf: UnsafeBufferPointer<UInt8>, start: Int, end: Int,
+                                       spec: LanguageSpec, spans: inout [SyntaxSpan]) {
+        var p = start
+        var prevByte: UInt8 = 0
+        while p < end {
+            let b = buf[p]
+            if isSpace(b) { p += 1; continue }
+            if isDigit(b) {
+                var q = p + 1
+                while q < end, isIdentPart(buf[q]) && buf[q] < 0x80 { q += 1 }
+                emit(&spans, p, q, .number)
+                prevByte = buf[q - 1]
+                p = q
+                continue
+            }
+            if isIdentStart(b) {
+                var q = p + 1
+                while q < end, isIdentPart(buf[q]) { q += 1 }
+                let w = String(decoding: UnsafeBufferPointer(rebasing: buf[p..<q]), as: UTF8.self)
+                var nextIdx = q
+                while nextIdx < end, isSpace(buf[nextIdx]) { nextIdx += 1 }
+                let nextByte: UInt8 = nextIdx < end ? buf[nextIdx] : 0
+
+                if spec.keywords.contains(w) {
+                    emit(&spans, p, q, .keyword)
+                    if w == "func", nextByte == 40, let after = scanGoParamList(buf, openParen: nextIdx, spec: spec, spans: &spans) {
+                        p = after
+                        prevByte = 41
+                        continue
+                    }
+                } else if prevByte != 46, spec.builtinTypeKeywords.contains(w) {
+                    emit(&spans, p, q, .builtinType)
+                } else if nextByte == 46 {
+                    emit(&spans, p, q, .namespace)
+                } else {
+                    emit(&spans, p, q, isGoExported(buf, start: p, end: q) ? .exportedType : .type)
+                }
+                prevByte = buf[q - 1]
+                p = q
+                continue
+            }
+            prevByte = b
+            p += 1
         }
     }
 
@@ -919,13 +1252,18 @@ enum Highlighter {
         }
         if topIdents.count >= 2 {
             emit(&spans, topIdents[0].0, topIdents[0].1, .parameter)
-            emit(&spans, topIdents.last!.0, topIdents.last!.1, .type)
+            let last = topIdents.last!
+            emit(&spans, last.0, last.1, isGoExported(buf, start: last.0, end: last.1) ? .exportedType : .type)
         } else if let only = topIdents.first {
-            emit(&spans, only.0, only.1, .type)
+            emit(&spans, only.0, only.1, isGoExported(buf, start: only.0, end: only.1) ? .exportedType : .type)
         }
         for (ts, te) in typeParamIdents {
             let w = String(decoding: UnsafeBufferPointer(rebasing: buf[ts..<te]), as: UTF8.self)
-            emit(&spans, ts, te, spec.builtinKeywords.contains(w) ? .builtin : .typeParameter)
+            let kind: TokenKind
+            if spec.builtinTypeKeywords.contains(w) { kind = .builtinType }
+            else if spec.builtinKeywords.contains(w) { kind = .builtin }
+            else { kind = .typeParameter }
+            emit(&spans, ts, te, kind)
         }
         return closeParen + 1
     }

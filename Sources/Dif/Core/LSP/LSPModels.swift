@@ -296,7 +296,7 @@ enum LSPURI {
 
 // MARK: - Semantic Tokens
 
-/// Semantic token categories aligned with DiffCode's extended syntax palette.
+/// Semantic token categories aligned 1:1 with DiffCode's extended `TokenKind` palette.
 enum LSPSemanticTokenKind: UInt8, CaseIterable, Sendable, Equatable, Hashable {
     case plain = 0
     case keyword
@@ -318,6 +318,12 @@ enum LSPSemanticTokenKind: UInt8, CaseIterable, Sendable, Equatable, Hashable {
     case variable
     case typeParameter
     case `operator`
+    case exportedFunction
+    case exportedConstant
+    case exportedVariable
+    case builtinType
+    case exportedType
+    case exportedProperty
 
     /// Maps an LSP semantic token type and modifier list (from the server's negotiated legend)
     /// into DiffCode's semantic token categories.
@@ -331,7 +337,9 @@ enum LSPSemanticTokenKind: UInt8, CaseIterable, Sendable, Equatable, Hashable {
         case "interface":
             return hasDefaultLibrary ? .builtin : .interface
         case "type", "class", "struct", "enum":
-            return hasDefaultLibrary ? .builtin : .type
+            if hasDefaultLibrary { return .builtin }
+            if modifiers.contains("interface") { return .interface }
+            return .type
         case "typeParameter":
             return .typeParameter
         case "parameter":
@@ -372,11 +380,63 @@ enum LSPSemanticTokenKind: UInt8, CaseIterable, Sendable, Equatable, Hashable {
     }
 }
 
+/// Standard and gopls semantic token modifiers preserved on decoded spans for fine-grained syntax refinement.
+struct LSPSemanticTokenModifiers: OptionSet, Sendable, Equatable, Hashable {
+    let rawValue: UInt16
+
+    static let declaration    = LSPSemanticTokenModifiers(rawValue: 1 << 0)
+    static let definition     = LSPSemanticTokenModifiers(rawValue: 1 << 1)
+    static let readonly       = LSPSemanticTokenModifiers(rawValue: 1 << 2)
+    static let defaultLibrary = LSPSemanticTokenModifiers(rawValue: 1 << 3)
+    static let interface      = LSPSemanticTokenModifiers(rawValue: 1 << 4)
+    static let `struct`       = LSPSemanticTokenModifiers(rawValue: 1 << 5)
+    static let pointer        = LSPSemanticTokenModifiers(rawValue: 1 << 6)
+
+    init(rawValue: UInt16) {
+        self.rawValue = rawValue
+    }
+
+    init(names: [String]) {
+        var bits: LSPSemanticTokenModifiers = []
+        for name in names {
+            switch name {
+            case "declaration": bits.insert(.declaration)
+            case "definition": bits.insert(.definition)
+            case "readonly": bits.insert(.readonly)
+            case "defaultLibrary": bits.insert(.defaultLibrary)
+            case "interface": bits.insert(.interface)
+            case "struct": bits.insert(.struct)
+            case "pointer": bits.insert(.pointer)
+            default: break
+            }
+        }
+        self = bits
+    }
+}
+
 /// A single LSP semantic highlight run on one line, using UTF-16 code units.
 struct LSPSemanticSpan: Sendable, Equatable, Hashable {
     var start: Int32
     var length: Int32
     var kind: LSPSemanticTokenKind
+    var modifiers: LSPSemanticTokenModifiers
+
+    init(start: Int32, length: Int32, kind: LSPSemanticTokenKind, modifiers: LSPSemanticTokenModifiers = []) {
+        self.start = start
+        self.length = length
+        self.kind = kind
+        self.modifiers = modifiers
+    }
+
+    static func == (lhs: LSPSemanticSpan, rhs: LSPSemanticSpan) -> Bool {
+        lhs.start == rhs.start && lhs.length == rhs.length && lhs.kind == rhs.kind
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(start)
+        hasher.combine(length)
+        hasher.combine(kind)
+    }
 }
 
 /// The token type and modifier legend announced by an LSP server in `initialize`.
@@ -449,7 +509,12 @@ enum LSPSemanticTokensDecoder {
 
             let kind = LSPSemanticTokenKind.map(tokenType: legend.tokenTypes[typeIndex], modifiers: modifiers)
             guard kind != .plain else { continue }
-            let span = LSPSemanticSpan(start: Int32(start), length: Int32(length), kind: kind)
+            let span = LSPSemanticSpan(
+                start: Int32(start),
+                length: Int32(length),
+                kind: kind,
+                modifiers: LSPSemanticTokenModifiers(names: modifiers)
+            )
             result[line, default: []].append(span)
         }
 
