@@ -348,6 +348,83 @@ actor LSPManager {
         await definition(uri: LSPURI.uri(from: fileURL), line: line, character: character)
     }
 
+    /// Resolves `textDocument/references` at a 0-based `(line, character)` UTF-16 position.
+    func references(
+        uri: String,
+        line: Int,
+        character: Int,
+        includeDeclaration: Bool = true
+    ) async -> [LSPLocation] {
+        guard isEffectivelyEnabled else { return [] }
+        let normalizedURI = LSPURI.normalize(uri)
+        guard let key = documentToServer[normalizedURI],
+              let server = servers[key] else {
+            return []
+        }
+
+        servers[key]?.lastActivity = .now
+        let params: JSONValue = .object([
+            "textDocument": .object(["uri": .string(normalizedURI)]),
+            "position": .object([
+                "line": .int(line),
+                "character": .int(character),
+            ]),
+            "context": .object([
+                "includeDeclaration": .bool(includeDeclaration),
+            ]),
+        ])
+
+        do {
+            let response = try await server.transport.request(
+                method: "textDocument/references",
+                params: params,
+                timeout: .seconds(15)
+            )
+            servers[key]?.lastActivity = .now
+            let decoded = LSPDefinitionDecoder.decode(from: response)
+            return Self.deduplicateLocations(decoded)
+        } catch {
+            return []
+        }
+    }
+
+    /// Convenience `fileURL` overload for `references`.
+    func references(
+        fileURL: URL,
+        line: Int,
+        character: Int,
+        includeDeclaration: Bool = true
+    ) async -> [LSPLocation] {
+        await references(
+            uri: LSPURI.uri(from: fileURL),
+            line: line,
+            character: character,
+            includeDeclaration: includeDeclaration
+        )
+    }
+
+    /// Deduplicates identical `(canonicalFileURL, range.start.line, range.start.character)` entries
+    /// while preserving stable first-seen order.
+    nonisolated static func deduplicateLocations(_ locations: [LSPLocation]) -> [LSPLocation] {
+        struct Key: Hashable {
+            let path: String
+            let line: Int
+            let character: Int
+        }
+        var seen: Set<Key> = []
+        seen.reserveCapacity(locations.count)
+        var result: [LSPLocation] = []
+        result.reserveCapacity(locations.count)
+        for loc in locations {
+            let keyPath = loc.fileURL.map { LSPURI.canonicalFileURL($0).path } ?? LSPURI.normalize(loc.uri)
+            let key = Key(path: keyPath, line: loc.range.start.line, character: loc.range.start.character)
+            if seen.insert(key).inserted {
+                result.append(loc)
+            }
+        }
+        return result
+    }
+
     // MARK: - Shutdown & Idle Reaping
 
     /// Gracefully shuts down all active LSP server processes and clears internal state.
@@ -553,6 +630,9 @@ actor LSPManager {
                     "definition": .object([
                         "dynamicRegistration": .bool(false),
                         "linkSupport": .bool(true),
+                    ]),
+                    "references": .object([
+                        "dynamicRegistration": .bool(false),
                     ]),
                     "semanticTokens": .object([
                         "dynamicRegistration": .bool(false),

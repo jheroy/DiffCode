@@ -30,6 +30,7 @@ struct PopupLayer: View {
                     switch popup {
                     case .quickOpen: QuickOpenView().frame(width: UI.s(660))
                     case .findInPath: FindInPathView().frame(width: UI.s(900), height: 640)
+                    case .references: ReferencesPopupView().frame(width: UI.s(840), height: 540)
                     case .goToLine: GoToLineView().frame(width: UI.s(320))
                     case .keymap: KeymapView().frame(width: UI.s(720))
                     case .settings: SettingsView().frame(width: UI.s(460))
@@ -37,7 +38,7 @@ struct PopupLayer: View {
                     }
                 }
                 .popupPanel()
-                .padding(.top, popup == .findInPath ? 56 : 90)
+                .padding(.top, (popup == .findInPath || popup == .references) ? 56 : 90)
                 .padding(.horizontal, 24)
                 .padding(.bottom, 24) // so a tall popup shrinks (and scrolls) in a short window
             }
@@ -536,6 +537,383 @@ private struct FindHitRow: View {
     }
 }
 
+// MARK: - LSP References & Definitions Picker
+
+struct ReferencesPopupView: View {
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        @Bindable var model = store.references
+        VStack(spacing: 0) {
+            // Header: title + count + filter field + close button
+            HStack(spacing: 10) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.ui(size: 13.5, weight: .medium))
+                    .foregroundStyle(Color.difAccent)
+
+                Text(model.title)
+                    .font(.ui(size: 13.5, weight: .semibold))
+                    .foregroundStyle(Color.difText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(1)
+
+                Text(countLabel(model))
+                    .font(.ui(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(Color.difText2)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(Color.difChip))
+
+                Spacer(minLength: 8)
+
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.ui(size: 11))
+                        .foregroundStyle(Color.difText3)
+                    SearchField(
+                        text: $model.filterQuery,
+                        placeholder: L("Filter by path or code…", "按路径或代码过滤…"),
+                        font: .systemFont(ofSize: 12.5 * UI.scale),
+                        focusToken: model.focusToken,
+                        onMove: { model.move($0) },
+                        onSubmit: { model.activate() },
+                        onCancel: { store.dismissPopup() }
+                    )
+                    .frame(width: UI.s(220), height: UI.s(20))
+                    if !model.filterQuery.isEmpty {
+                        Button {
+                            model.filterQuery = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.ui(size: 11))
+                                .foregroundStyle(Color.difText3)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .frame(height: UI.s(26))
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.difChip))
+
+                Button {
+                    store.dismissPopup()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.ui(size: 11, weight: .semibold))
+                        .foregroundStyle(Color.difText2)
+                        .frame(width: UI.s(24), height: UI.s(24))
+                        .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.difChip))
+                }
+                .buttonStyle(.plain)
+                .help(L("Close (Esc)", "关闭 (Esc)"))
+            }
+            .padding(.horizontal, 14)
+            .frame(height: UI.s(46))
+
+            Rectangle().fill(Color.difHairline).frame(height: 1)
+
+            // Top section (~45%): scrollable reference list
+            if model.filteredItems.isEmpty {
+                VStack(spacing: 6) {
+                    Text(L("No matching references", "没有匹配的引用"))
+                        .font(.ui(size: 12.5))
+                        .foregroundStyle(Color.difText3)
+                }
+                .frame(maxWidth: .infinity)
+                .frame(height: 196)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(Array(model.filteredItems.enumerated()), id: \.element.id) { index, item in
+                                ReferenceItemRow(item: item, isSelected: index == model.selectedIndex)
+                                    .id(item.id)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {
+                                        model.select(index)
+                                        if (NSApp.currentEvent?.clickCount ?? 1) >= 2 {
+                                            model.activate(index)
+                                        }
+                                    }
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                    .frame(height: 196)
+                    .onChange(of: model.selectedIndex) { _, _ in
+                        if let id = model.selectedItem?.id {
+                            proxy.scrollTo(id)
+                        }
+                    }
+                }
+            }
+
+            Rectangle().fill(Color.difHairline).frame(height: 1)
+
+            // Preview sub-header with path:line and explicit Jump button
+            HStack(spacing: 8) {
+                if let item = model.selectedItem {
+                    FileIcon(path: item.displayPath, size: 11.5)
+                    Text("\(item.displayPath):\(item.lineNumber)")
+                        .font(.ui(size: 11.5, design: .monospaced))
+                        .foregroundStyle(Color.difText2)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                    if item.isDeclaration {
+                        Text(L("Declaration", "声明"))
+                            .font(.ui(size: 10, weight: .semibold))
+                            .foregroundStyle(Color.difAccent)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1.5)
+                            .background(Capsule().fill(Color.difAccent.opacity(0.14)))
+                    }
+                }
+                Spacer(minLength: 8)
+                if model.selectedItem != nil {
+                    Button {
+                        model.activate()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(L("Jump", "跳转"))
+                                .font(.ui(size: 11, weight: .semibold))
+                            Text("⏎")
+                                .font(.ui(size: 10.5, weight: .medium))
+                        }
+                        .foregroundStyle(Color.difAccent)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.difAccent.opacity(0.14)))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 12)
+            .frame(height: UI.s(28))
+            .background(Color.difPanel.opacity(0.65))
+
+            // Bottom section (~55%): syntax-highlighted code context preview
+            ReferenceCodePreviewView(
+                context: model.previewContext,
+                isLoading: model.isLoadingPreviews,
+                settings: store.settings
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            Rectangle().fill(Color.difHairline).frame(height: 1)
+
+            // Footer hints
+            HStack(spacing: 14) {
+                Hint(keys: "↑↓", text: L("Preview", "预览"))
+                Hint(keys: "⏎", text: L("or Double-Click Jump", "或双击跳转"))
+                Hint(keys: "Esc", text: L("Close", "关闭"))
+                Spacer()
+                if model.isLoadingPreviews {
+                    ProgressView().controlSize(.small).scaleEffect(0.6)
+                }
+            }
+            .padding(.horizontal, 14)
+            .frame(height: UI.s(30))
+        }
+    }
+
+    private func countLabel(_ model: ReferencesPickerModel) -> String {
+        if model.filterQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "\(model.items.count)"
+        }
+        return "\(model.filteredItems.count)/\(model.items.count)"
+    }
+}
+
+private struct ReferenceItemRow: View {
+    var item: ReferenceItem
+    var isSelected: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            FileIcon(path: item.displayPath, size: 12)
+
+            Text(previewSnippet)
+                .font(.code(12))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .layoutPriority(1)
+
+            if item.isDeclaration {
+                Text(L("Def", "声明"))
+                    .font(.ui(size: 9.5, weight: .semibold))
+                    .foregroundStyle(Color.difAccent)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Color.difAccent.opacity(0.14)))
+            }
+
+            Spacer(minLength: 8)
+
+            Text(item.displayPath)
+                .font(.ui(size: 11.5))
+                .foregroundStyle(Color.difText2)
+                .lineLimit(1)
+                .truncationMode(.head)
+                .frame(maxWidth: 260, alignment: .trailing)
+
+            Text(":\(item.lineNumber)")
+                .font(.ui(size: 11, design: .monospaced))
+                .foregroundStyle(Color.difText3)
+                .frame(minWidth: 40, alignment: .trailing)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: UI.s(26))
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(isSelected ? Color.difSelection : Color.clear)
+                .padding(.horizontal, 6)
+        )
+        .help("\(item.displayPath):\(item.lineNumber)")
+    }
+
+    private var previewSnippet: AttributedString {
+        guard !item.linePreview.isEmpty else {
+            var placeholder = AttributedString("…")
+            placeholder[Attr.Foreground.self] = Color.difText3
+            return placeholder
+        }
+        let ns = item.linePreview as NSString
+        guard let match = item.matchRangeInPreview,
+              match.lowerBound >= 0,
+              match.upperBound <= ns.length,
+              match.lowerBound < match.upperBound else {
+            var plain = AttributedString(String(item.linePreview.prefix(240)))
+            plain[Attr.Foreground.self] = Color.difText
+            return plain
+        }
+        var before = AttributedString(ns.substring(to: match.lowerBound))
+        before[Attr.Foreground.self] = Color.difText2
+        var middle = AttributedString(ns.substring(with: NSRange(location: match.lowerBound, length: match.count)))
+        middle[Attr.Foreground.self] = Color.difText
+        middle[Attr.Background.self] = Color(NSColor.dyn(0xF5C242, 0xE8B339, lightAlpha: 0.42, darkAlpha: 0.36))
+        let tailEnd = min(ns.length, match.upperBound + 200)
+        var after = AttributedString(ns.substring(with: NSRange(location: match.upperBound, length: tailEnd - match.upperBound)))
+        after[Attr.Foreground.self] = Color.difText2
+        return before + middle + after
+    }
+}
+
+private struct ReferenceCodePreviewView: View {
+    var context: ReferencePreviewContext?
+    var isLoading: Bool
+    var settings: Settings
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        let theme: CanvasTheme = colorScheme == .dark ? .dark : .light
+        let codeFont = CodeFont.current(settings)
+        ZStack {
+            Color(cgColor: theme.background)
+            if let context, !context.lines.isEmpty {
+                let maxDigits = max(3, String(context.lines.last?.lineNumber ?? 1).count)
+                let gutterWidth = max(38, CGFloat(maxDigits) * codeFont.charWidth + 16)
+                ScrollView([.vertical, .horizontal]) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(context.lines) { line in
+                            HStack(spacing: 0) {
+                                Rectangle()
+                                    .fill(line.isMatchedLine ? Color.difAccent : Color.clear)
+                                    .frame(width: 2.5)
+
+                                Text("\(line.lineNumber)")
+                                    .font(Font(codeFont.font))
+                                    .foregroundStyle(Color(cgColor: line.isMatchedLine ? theme.gutterTextStrong : theme.gutterText))
+                                    .frame(width: gutterWidth, alignment: .trailing)
+                                    .padding(.trailing, 12)
+
+                                Text(highlightedLine(line, theme: theme, language: context.language, codeFont: codeFont))
+                                    .lineLimit(1)
+                                    .fixedSize(horizontal: true, vertical: false)
+
+                                Spacer(minLength: 20)
+                            }
+                            .frame(minHeight: codeFont.lineHeight)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(line.isMatchedLine ? Color(cgColor: theme.focusLine) : Color.clear)
+                        }
+                    }
+                    .padding(.vertical, 6)
+                }
+            } else {
+                Text(isLoading ? L("Loading preview…", "正在加载预览…") : L("Preview unavailable", "无法预览该文件"))
+                    .font(.ui(size: 12.5))
+                    .foregroundStyle(Color.difText3)
+            }
+        }
+    }
+
+    private func highlightedLine(
+        _ line: ReferencePreviewLine,
+        theme: CanvasTheme,
+        language: LanguageSpec,
+        codeFont: CodeFont
+    ) -> AttributedString {
+        if line.text.isEmpty {
+            var empty = AttributedString(" ")
+            empty[Attr.Font.self] = Font(codeFont.font)
+            return empty
+        }
+        var result = AttributedString(line.text)
+        result[Attr.Foreground.self] = Color(cgColor: theme.text)
+        result[Attr.Font.self] = Font(codeFont.font)
+
+        let utf16Len = (line.text as NSString).length
+        let styles = theme.styles(for: language)
+
+        for span in line.spans {
+            let start = max(0, min(Int(span.start), utf16Len))
+            let end = max(start, min(Int(span.start + span.length), utf16Len))
+            guard end > start else { continue }
+            let idx = Int(span.kind.rawValue)
+            guard idx < styles.count else { continue }
+            let style = styles[idx]
+            if let range = utf16Range(start..<end, in: line.text, attributed: result) {
+                result[range][Attr.Foreground.self] = Color(cgColor: style.color)
+                if style.bold || style.italic {
+                    result[range][Attr.Font.self] = Font(codeFont.ctFont(bold: style.bold, italic: style.italic) as NSFont)
+                }
+            }
+        }
+
+        if let hl = line.highlightRange {
+            let start = max(0, min(hl.lowerBound, utf16Len))
+            let end = max(start, min(hl.upperBound, utf16Len))
+            if end > start, let range = utf16Range(start..<end, in: line.text, attributed: result) {
+                result[range][Attr.Background.self] = Color(
+                    NSColor.dyn(0xF5C242, 0xE8B339, lightAlpha: 0.44, darkAlpha: 0.38)
+                )
+            }
+        }
+
+        return result
+    }
+
+    private func utf16Range(
+        _ range: Range<Int>,
+        in text: String,
+        attributed: AttributedString
+    ) -> Range<AttributedString.Index>? {
+        let utf16 = text.utf16
+        guard range.lowerBound >= 0, range.upperBound <= utf16.count, range.lowerBound < range.upperBound else {
+            return nil
+        }
+        let start16 = utf16.index(utf16.startIndex, offsetBy: range.lowerBound)
+        let end16 = utf16.index(utf16.startIndex, offsetBy: range.upperBound)
+        guard let start = start16.samePosition(in: text),
+              let end = end16.samePosition(in: text),
+              start < end else {
+            return nil
+        }
+        return Range(start..<end, in: attributed)
+    }
+}
+
 // MARK: - Go to line
 
 struct GoToLineView: View {
@@ -619,6 +997,9 @@ struct KeymapView: View {
             shortcutRow(L("Top / Bottom of File", "文件开头 / 末尾"), "⌘↑ / ⌘↓")
             shortcutRow(L("Back to the File List", "回到文件列表"), "Esc")
             shortcutRow(L("Zoom Text", "缩放文字"), L("Pinch", "双指捏合"))
+            if AppEnvironment.hasLSP {
+                shortcutRow(L("Go to Definition / References", "跳转到声明 / 查看引用"), "⌘+Click")
+            }
             if AppEnvironment.hasTerminal {
                 shortcutRow(L("Close Terminal (when focused)", "关闭终端（聚焦时）"), "⌘W")
                 shortcutRow(L("Next / Previous Terminal (when focused)", "下一个 / 上一个终端（聚焦时）"), "⇧⌘] / ⇧⌘[")

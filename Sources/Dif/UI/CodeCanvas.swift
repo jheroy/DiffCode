@@ -292,6 +292,8 @@ final class CodeCanvasView: NSView {
     }
     /// The change that was under the pointer when the context menu was last asked for.
     private(set) var contextHunk: Int?
+    /// The eligible LSP symbol that was under the pointer when the context menu was last asked for.
+    private(set) var contextLSPSymbol: LSPHoverTarget?
 
     /// Gives every change a tick for the next commit, and pales the lines that stay out of it.
     var commitTicks: CommitTicks? {
@@ -409,17 +411,25 @@ final class CodeCanvasView: NSView {
     private var compositionUnderline: RectGroup!
     private var caretFrame: CGRect = .null
 
-    /// An eligible symbol currently underlined under ⌘+Hover on the right/live pane.
+    /// An eligible symbol currently underlined under ⌘+Hover (or right-clicked) on the right/live pane.
     struct LSPHoverTarget: Equatable {
         var row: Int
         var line: Int
         var column: Int
         var range: Range<Int>
+
+        /// 0-based UTF-16 column offset on `line`.
+        var utf16Column: Int { column }
     }
 
     /// True while the right pane shows a live LSP-backed workspace file (never HEAD left pane, commits, or App Store).
     var isLSPEnabled = false {
-        didSet { if !isLSPEnabled { clearLSPHover() } }
+        didSet {
+            if !isLSPEnabled {
+                clearLSPHover()
+                contextLSPSymbol = nil
+            }
+        }
     }
     private(set) var lspHover: LSPHoverTarget?
     private var lspHoverUnderline: RectGroup!
@@ -504,6 +514,7 @@ final class CodeCanvasView: NSView {
         matchesByLine = [[:], [:]]
         currentMatch = -1
         clearLSPHover()
+        contextLSPSymbol = nil
         invalidateTextCaches()
         rebuildHunkRows()
         invalidate(.everything)
@@ -2061,11 +2072,16 @@ final class CodeCanvasView: NSView {
 
     /// Remembers what the pointer is over, for the context menu that is about to be built.
     func noteContextMenu(_ event: NSEvent) {
-        contextHunk = hunkIndex(at: convert(event.locationInWindow, from: nil))
+        let point = convert(event.locationInWindow, from: nil)
+        contextHunk = hunkIndex(at: point)
+        contextLSPSymbol = lspSymbolTarget(at: point)
     }
 
     /// The change a context menu is for, set directly (the debug hooks build menus without a click).
     func noteContextHunk(_ index: Int?) { contextHunk = index }
+
+    /// The LSP symbol a context menu is for, set directly (for tests and debug hooks).
+    func noteContextLSPSymbol(_ target: LSPHoverTarget?) { contextLSPSymbol = target }
 
     /// What each visible commit tick shows, top to bottom, for the debug hooks: "0:on 1:mixed".
     var visibleTickStates: String {

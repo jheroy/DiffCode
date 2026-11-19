@@ -10,6 +10,8 @@ enum Popup: Equatable {
     case settings
     /// Branches and the commit graph, dropped down from the branch button.
     case gitGraph
+    /// LSP references / multiple definitions picker with code preview.
+    case references
     /// A question or notice (`AppStore.dialog`).
     case dialog
 }
@@ -31,6 +33,7 @@ final class AppStore {
     let finder = FindInPathModel()
     let terminals = TerminalManager()
     let gitGraph = GitGraphModel()
+    let references = ReferencesPickerModel()
     /// Where each project's branch sits in the sidebar, in window coordinates: ⌥⌘B opens the graph under it.
     @ObservationIgnored var branchLabelFrames: [UUID: CGRect] = [:]
 
@@ -104,11 +107,12 @@ final class AppStore {
         // A save shows in the Changes list straight away, without waiting for the file watcher.
         viewer.onFileWritten = { [weak self] root in self?.projects.first { $0.url == root }?.refresh() }
         viewer.onOpenAnnotation = { [weak self] entry in self?.openAnnotation(entry) }
-        viewer.onGoToDefinition = { [weak self] line, col in self?.goToDefinition(line: line, character: col) }
+        viewer.onGoToDefinition = { [weak self] line, col in self?.smartLSPNavigate(line: line, character: col) }
         quickOpen.store = self
         finder.store = self
         terminals.store = self
         gitGraph.store = self
+        references.store = self
     }
 
     var currentProject: Project? {
@@ -912,6 +916,7 @@ final class AppStore {
             request.onCancel()
         }
         if popup == .gitGraph, kind != .gitGraph { gitGraph.release() }
+        if popup == .references, kind != .references { references.release() }
         popup = kind
     }
 
@@ -919,6 +924,7 @@ final class AppStore {
         guard popup != nil else { return }
         let unanswered = popup == .dialog ? dialog : nil
         if popup == .gitGraph { gitGraph.release() }
+        if popup == .references { references.release() }
         dialog = nil
         popup = nil
         if restoreFocus {
@@ -1007,6 +1013,18 @@ final class AppStore {
     func viewerContextMenu() -> NSMenu? {
         guard viewer.request != nil else { return nil }
         let menu = NSMenu()
+        if AppEnvironment.hasLSP,
+           let canvas = viewer.container?.canvas,
+           canvas.isLSPEnabled,
+           let target = canvas.contextLSPSymbol {
+            menu.addItem(ClosureMenuItem(L("Go to Definition", "跳转到声明")) { [weak self] in
+                self?.goToDefinition(atLine: target.line, utf16Column: target.utf16Column)
+            })
+            menu.addItem(ClosureMenuItem(L("Find All References", "查找所有引用")) { [weak self] in
+                self?.findAllReferences(atLine: target.line, utf16Column: target.utf16Column)
+            })
+            menu.addItem(.separator())
+        }
         if let canvas = viewer.container?.canvas, canvas.editSelection != nil {
             menu.addItem(ClosureMenuItem(L("Cut", "剪切")) { [weak canvas] in canvas?.cut(nil) })
             menu.addItem(ClosureMenuItem(L("Copy", "复制")) { [weak canvas] in canvas?.copy(nil) })
