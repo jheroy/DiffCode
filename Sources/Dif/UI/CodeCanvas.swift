@@ -2,7 +2,7 @@ import AppKit
 import CoreText
 import QuartzCore
 
-struct TextPosition: Comparable {
+struct TextPosition: Comparable, Sendable {
     var row: Int
     var column: Int // UTF-16 offset within the row's text
 
@@ -60,6 +60,10 @@ protocol CodeCanvasDelegate: AnyObject {
     func canvas(_ canvas: CodeCanvasView, openAnnotation entry: LineAnnotations.Entry)
     /// ⌘+Click on a symbol in an LSP-enabled pane (`line` is 0-based buffer line, `character` is 0-based UTF-16 offset).
     func canvas(_ canvas: CodeCanvasView, goToDefinitionAt line: Int, character: Int)
+    /// Vim modal state, pending keys, or cursor position changed.
+    func canvas(_ canvas: CodeCanvasView, didUpdateVimState state: VimUIState)
+    /// A Vim command triggered an IDE / viewer action (`line` is 0-based, `column` is 0-based UTF-16).
+    func canvas(_ canvas: CodeCanvasView, performVimAction action: VimAction, line: Int, column: Int)
 }
 
 // MARK: - Layers
@@ -274,7 +278,16 @@ final class CodeCanvasView: NSView {
     }
 
     var selection: TextSelection? {
-        didSet { if selection != oldValue { invalidate(.selection) } }
+        didSet {
+            if selection != oldValue {
+                if !isApplyingVimSelection, let sel = selection, mode != .sideBySide || sel.pane == .right {
+                    vimCursor = linePosition(sel.head)
+                }
+                refreshRelativeLineNumbersIfNeeded()
+                invalidate(.selection)
+                reportVimStateIfNeeded()
+            }
+        }
     }
 
     var focusedHunk: Int? {
@@ -401,6 +414,53 @@ final class CodeCanvasView: NSView {
             invalidate(.selection)
         }
     }
+
+    // MARK: Vim state
+
+    let vimEngine = VimEngine()
+    var vimModeEnabled: Bool = true {
+        didSet {
+            guard vimModeEnabled != oldValue else { return }
+            if !vimModeEnabled {
+                vimEngine.resetToNormal(switchInputSource: false)
+            }
+            if vimRelativeLineNumbers {
+                panes[1].dropGutterTiles()
+                invalidate(.scroll)
+            }
+            invalidate(.selection)
+            reportVimStateIfNeeded(force: true)
+        }
+    }
+    var vimRelativeLineNumbers: Bool = false {
+        didSet {
+            guard vimRelativeLineNumbers != oldValue else { return }
+            lastRelativeCursorLine = -1
+            panes[1].dropGutterTiles()
+            invalidate(.scroll)
+        }
+    }
+    var vimCursor = TextPosition(row: 0, column: 0)
+    var isApplyingVimSelection = false
+    private var lastReportedVimState: VimUIState?
+    private var lastRelativeCursorLine = -1
+
+    func reportVimStateIfNeeded(force: Bool = false) {
+        let state = vimEngine.uiState(cursor: vimCursor)
+        if force || state != lastReportedVimState {
+            lastReportedVimState = state
+            delegate?.canvas(self, didUpdateVimState: state)
+        }
+    }
+
+    func refreshRelativeLineNumbersIfNeeded() {
+        guard vimModeEnabled && vimRelativeLineNumbers else { return }
+        if vimCursor.row != lastRelativeCursorLine {
+            lastRelativeCursorLine = vimCursor.row
+            panes[1].dropGutterTiles()
+            invalidate(.scroll)
+        }
+    }
     /// Where vertical caret moves try to stay, so passing a short line does not pull the caret left for good.
     var goalX: CGFloat?
     /// The last whole line copied with no selection, so pasting it can go in as a line, as in the IDE.
@@ -496,9 +556,14 @@ final class CodeCanvasView: NSView {
 
     // MARK: Configuration
 
+    /// True when `doc` is a newly added / untracked file whose left side has no lines and all hunks are additions.
+    static func isAddedOnlyDocument(_ doc: DiffDocument) -> Bool {
+        !doc.isPlainFile && doc.left.lines.isEmpty && !doc.right.lines.isEmpty && doc.hunks.allSatisfy { $0.kind == .added }
+    }
+
     var mode: Mode {
         guard let doc = document else { return .single }
-        return doc.isPlainFile ? .single : requestedMode
+        return (doc.isPlainFile || Self.isAddedOnlyDocument(doc)) ? .single : requestedMode
     }
 
     func setDocument(_ doc: DiffDocument?, mode: Mode) {
@@ -507,6 +572,9 @@ final class CodeCanvasView: NSView {
         editor = nil
         annotations = nil
         requestedMode = mode
+        vimEngine.resetToNormal(switchInputSource: false)
+        vimCursor = TextPosition(row: 0, column: 0)
+        lastRelativeCursorLine = -1
         selection = nil
         focusedHunk = nil
         focusLine = nil
@@ -518,6 +586,7 @@ final class CodeCanvasView: NSView {
         invalidateTextCaches()
         rebuildHunkRows()
         invalidate(.everything)
+        reportVimStateIfNeeded(force: true)
     }
 
     func setMode(_ mode: Mode) {
@@ -1005,11 +1074,17 @@ final class CodeCanvasView: NSView {
             if shift > 0, let annotations { drawAnnotations(annotations, in: ctx, rows: firstRow...lastRow) }
             if mode == .unified {
                 let numberWidth = unifiedNumberWidth
+                let useRelative = vimModeEnabled && vimRelativeLineNumbers
+                let activeLine = vimCursor.row
                 for row in firstRow...lastRow {
                     let r = doc.unifiedRows[row]
                     let y = CGFloat(row - firstRow) * lh
                     if r.left >= 0 { drawNumber(ctx, Int(r.left) + 1, rightEdge: shift + numberWidth - 4, y: y) }
-                    if r.right >= 0 { drawNumber(ctx, Int(r.right) + 1, rightEdge: shift + numberWidth * 2 - 4, y: y) }
+                    if r.right >= 0 {
+                        let lineIdx = Int(r.right)
+                        let shown = useRelative ? (lineIdx == activeLine ? lineIdx + 1 : abs(lineIdx - activeLine)) : (lineIdx + 1)
+                        drawNumber(ctx, shown, rightEdge: shift + numberWidth * 2 - 4, y: y)
+                    }
                     if r.kind != .context {
                         ctx.textPosition = CGPoint(x: shift + numberWidth * 2 + 4, y: y + codeFont.baseline)
                         CTLineDraw(signLine(added: r.kind == .added), ctx)
@@ -1018,8 +1093,11 @@ final class CodeCanvasView: NSView {
             } else {
                 // Line numbers hug the divider on both sides, as in IntelliJ.
                 let rightEdge = shift + gutterWidth - 10
+                let useRelative = vimModeEnabled && vimRelativeLineNumbers && tile.pane == .right
+                let activeLine = vimCursor.row
                 for row in firstRow...lastRow {
-                    drawNumber(ctx, row + 1, rightEdge: rightEdge, y: CGFloat(row - firstRow) * lh)
+                    let shown = useRelative ? (row == activeLine ? row + 1 : abs(row - activeLine)) : (row + 1)
+                    drawNumber(ctx, shown, rightEdge: rightEdge, y: CGFloat(row - firstRow) * lh)
                 }
             }
         }
@@ -1284,10 +1362,10 @@ final class CodeCanvasView: NSView {
     // MARK: Caret
 
     /// The caret: at the moving end of the selection in the right side, while the keyboard is here and
-    /// the text can be edited. It blinks on the compositor, so a blinking caret costs the app nothing.
+    /// the text can be edited (or Vim mode is active on any text document).
     private func updateCaret() {
-        guard let editor, let doc = document, case .text = doc.content, let sel = selection,
-              mode != .sideBySide || sel.pane == .right, let src = source(pane: .right, row: sel.head.row), src.side == .right,
+        guard let doc = document, case .text = doc.content, !doc.right.lines.isEmpty,
+              editor != nil || vimModeEnabled,
               let window, window.isKeyWindow || Self.assumeKeyWindow, window.firstResponder === self else {
             caretLayer.isHidden = true
             caretLayer.removeAllAnimations()
@@ -1295,29 +1373,123 @@ final class CodeCanvasView: NSView {
             compositionUnderline.clear()
             return
         }
+
+        let headPos: TextPosition
+        if vimModeEnabled {
+            if mode == .sideBySide, let sel = selection, sel.pane != .right {
+                caretLayer.isHidden = true
+                caretLayer.removeAllAnimations()
+                caretFrame = .null
+                compositionUnderline.clear()
+                return
+            }
+            let clamped = TextEditing.clamp(vimCursor, in: doc.right.lines)
+            headPos = rowPosition(clamped)
+        } else {
+            guard let sel = selection, mode != .sideBySide || sel.pane == .right else {
+                caretLayer.isHidden = true
+                caretLayer.removeAllAnimations()
+                caretFrame = .null
+                compositionUnderline.clear()
+                return
+            }
+            headPos = sel.head
+        }
+
+        guard let src = source(pane: .right, row: headPos.row), src.side == .right else {
+            caretLayer.isHidden = true
+            caretLayer.removeAllAnimations()
+            caretFrame = .null
+            compositionUnderline.clear()
+            return
+        }
+
         let lh = codeFont.lineHeight
-        let x = textInset + CTLineGetOffsetForStringIndex(ctLine(.right, src.line), sel.head.column, nil)
-        let frame = CGRect(x: pixelRound(x - 1), y: CGFloat(sel.head.row) * lh, width: 2, height: lh)
-        if frame != caretFrame || caretLayer.isHidden {
+        let lineLayout = ctLine(.right, src.line)
+        let x0 = textInset + CTLineGetOffsetForStringIndex(lineLayout, headPos.column, nil)
+
+        let frame: CGRect
+        let color: CGColor
+        let cornerRadius: CGFloat
+        let shouldBlink: Bool
+
+        if vimModeEnabled {
+            let lineNS = doc.right.lines[src.line] as NSString
+            let nextCol = headPos.column < lineNS.length
+                ? TextEditing.characterBoundary(in: lineNS, from: headPos.column, forward: true)
+                : headPos.column
+            let x1 = nextCol > headPos.column
+                ? textInset + CTLineGetOffsetForStringIndex(lineLayout, nextCol, nil)
+                : x0 + codeFont.charWidth
+            let charWidth = max(codeFont.charWidth, x1 - x0)
+
+            switch vimEngine.mode {
+            case .insert:
+                // guicursor=i:ver1 -> crisp 1.5pt vertical bar
+                frame = CGRect(x: pixelRound(x0 - 0.75), y: CGFloat(headPos.row) * lh, width: 1.5, height: lh)
+                color = theme.text
+                cornerRadius = 0
+                shouldBlink = true
+            case .normal where vimEngine.isReplaceCharPending:
+                // guicursor=r:hor50 -> half-height underline block
+                frame = CGRect(x: pixelRound(x0), y: pixelRound(CGFloat(headPos.row) * lh + lh * 0.5),
+                               width: pixelRound(charWidth), height: pixelRound(lh * 0.5))
+                color = theme.text.copy(alpha: 0.65) ?? theme.text
+                cornerRadius = 1
+                shouldBlink = false
+            case .normal:
+                // Normal mode: translucent block cursor
+                frame = CGRect(x: pixelRound(x0), y: CGFloat(headPos.row) * lh,
+                               width: pixelRound(charWidth), height: lh)
+                color = theme.text.copy(alpha: 0.42) ?? theme.text
+                cornerRadius = 1
+                shouldBlink = false
+            case .visual, .visualLine:
+                // guicursor=v:hor10 -> underline caret indicator alongside selection highlight
+                let h = max(2, (lh * 0.14).rounded())
+                frame = CGRect(x: pixelRound(x0), y: CGFloat(headPos.row) * lh + lh - h,
+                               width: pixelRound(charWidth), height: h)
+                color = theme.text
+                cornerRadius = 0
+                shouldBlink = false
+            case .commandLine:
+                frame = CGRect(x: pixelRound(x0), y: CGFloat(headPos.row) * lh,
+                               width: pixelRound(charWidth), height: lh)
+                color = theme.text.copy(alpha: 0.25) ?? theme.text
+                cornerRadius = 1
+                shouldBlink = false
+            }
+        } else {
+            frame = CGRect(x: pixelRound(x0 - 1), y: CGFloat(headPos.row) * lh, width: 2, height: lh)
+            color = theme.text
+            cornerRadius = 0
+            shouldBlink = true
+        }
+
+        let needsAnimationReset = frame != caretFrame || caretLayer.isHidden || (shouldBlink != (caretLayer.animation(forKey: "blink") != nil))
+        caretLayer.cornerRadius = cornerRadius
+        caretLayer.backgroundColor = color
+        if needsAnimationReset {
             caretFrame = frame
             caretLayer.frame = frame
             caretLayer.isHidden = false
-            // Solid while it moves, blinking once it rests.
             caretLayer.removeAllAnimations()
-            let blink = CAKeyframeAnimation(keyPath: "opacity")
-            blink.calculationMode = .discrete
-            blink.values = [1, 0]
-            blink.keyTimes = [0, 0.5]
-            blink.duration = 1.06
-            blink.repeatCount = .infinity
-            blink.beginTime = CACurrentMediaTime() + 0.55
-            blink.fillMode = .backwards
-            caretLayer.add(blink, forKey: "blink")
+            if shouldBlink {
+                // Solid while it moves, blinking once it rests.
+                let blink = CAKeyframeAnimation(keyPath: "opacity")
+                blink.calculationMode = .discrete
+                blink.values = [1, 0]
+                blink.keyTimes = [0, 0.5]
+                blink.duration = 1.06
+                blink.repeatCount = .infinity
+                blink.beginTime = CACurrentMediaTime() + 0.55
+                blink.fillMode = .backwards
+                caretLayer.add(blink, forKey: "blink")
+            }
         }
-        caretLayer.backgroundColor = theme.text
 
         // What an input method is still composing is underlined in place.
-        if let marked = editor.marked {
+        if let marked = editor?.marked {
             let row = editRow(forLine: marked.row)
             var rects: [CGRect] = []
             appendRects([marked.range], side: .right, line: marked.row, row: row, to: &rects)
@@ -1504,13 +1676,25 @@ final class CodeCanvasView: NSView {
 
     /// Scrolls just enough to bring the caret into view, with a little room around it.
     func revealCaret() {
-        guard let container, let sel = selection, editor != nil, mode != .sideBySide || sel.pane == .right else { return }
+        guard let container, let doc = document, !doc.right.lines.isEmpty else { return }
+        guard editor != nil || vimModeEnabled else { return }
+        let headRow: Int
+        let line: TextPosition
+        if vimModeEnabled {
+            if mode == .sideBySide, let sel = selection, sel.pane != .right { return }
+            line = TextEditing.clamp(vimCursor, in: doc.right.lines)
+            headRow = editRow(forLine: line.row)
+        } else {
+            guard let sel = selection, mode != .sideBySide || sel.pane == .right else { return }
+            headRow = sel.head.row
+            line = linePosition(sel.head)
+        }
         let lh = codeFont.lineHeight
         let margin = codeFont.charWidth * 4
         let width = textRect(.right).width
         for _ in 0..<4 {
             let scroll = resolveScroll()
-            let y = CGFloat(sel.head.row) * lh - scroll.right
+            let y = CGFloat(headRow) * lh - scroll.right
             var dy: CGFloat = 0
             if y < lh * 0.5 {
                 dy = y - lh * 0.5
@@ -1518,7 +1702,6 @@ final class CodeCanvasView: NSView {
                 dy = y + lh * 1.5 - bounds.height
             }
             var dx: CGFloat = 0
-            let line = linePosition(sel.head)
             let x = textInset + xOffset(line: line.row, column: line.column) - scroll.x
             if x < margin, scroll.x > 0 {
                 dx = max(-scroll.x, x - margin)
@@ -1941,7 +2124,7 @@ final class CodeCanvasView: NSView {
     /// Three buttons on each conflict's `<<<<<<<` line, at the right edge of the text that can be edited.
     private func updateConflictButtons(_ doc: DiffDocument, _ scroll: Scroll) {
         conflictHits.removeAll(keepingCapacity: true)
-        guard !conflicts.isEmpty, mode != .single || doc.isPlainFile else {
+        guard !conflicts.isEmpty, mode != .single || doc.isPlainFile || Self.isAddedOnlyDocument(doc) else {
             conflictLayers.forEach { $0.isHidden = true }
             return
         }
@@ -2391,6 +2574,9 @@ final class CodeCanvasView: NSView {
         }
         let side = pane(at: point)
         guard let pos = position(at: point, pane: side) else { selection = nil; return }
+        if vimModeEnabled, vimEngine.mode.isVisual || vimEngine.mode.isCommandLine {
+            vimEngine.resetToNormal(switchInputSource: false)
+        }
         switch event.clickCount {
         case 2:
             let range = wordRange(in: rowText(pane: side, row: pos.row), at: pos.column)
@@ -2407,6 +2593,7 @@ final class CodeCanvasView: NSView {
             }
             dragSelecting = true
         }
+        if vimModeEnabled { reportVimStateIfNeeded() }
     }
 
     func handleMouseDragged(_ event: NSEvent) {
@@ -2452,8 +2639,8 @@ final class CodeCanvasView: NSView {
             return
         }
         guard let current = selection else { return }
-        if editor != nil, mode != .sideBySide || current.pane == .right {
-            // In the text that can be edited an empty selection is the caret. In the unified view a click on a
+        if (editor != nil || vimModeEnabled), mode != .sideBySide || current.pane == .right {
+            // In editable text or Vim mode an empty selection is the caret. In the unified view a click on a
             // removed line (which is not in the file any more) lands on the line that follows it.
             if mode == .unified, current.isEmpty {
                 let caret = rowPosition(linePosition(current.head))
@@ -2585,6 +2772,22 @@ final class CodeCanvasView: NSView {
     // MARK: Keyboard
 
     override func keyDown(with event: NSEvent) {
+        if vimModeEnabled, let doc = document, case .text = doc.content, !doc.right.lines.isEmpty {
+            // Never hijack ⌘-modified shortcuts — let AppKit menus / GoLand shortcuts handle them.
+            if !event.modifierFlags.contains(.command) {
+                if vimEngine.mode.isInsert {
+                    // In Insert mode, only Esc / ⌃[ / ⌃c (when not composing IME) exit to Normal.
+                    if editor?.marked == nil, let key = VimKey.from(event: event),
+                       key.kind == .escape || (key.control && (key.kind == .character("[") || key.kind == .character("c"))) {
+                        if handleVimKey(key) { return }
+                    }
+                    // All other Insert keys go straight through NSTextInputClient / IME untouched.
+                    if editor != nil, handleEditingKey(event) { return }
+                } else {
+                    if let key = VimKey.from(event: event), handleVimKey(key) { return }
+                }
+            }
+        }
         if editor != nil, handleEditingKey(event) { return }
         guard let container else { super.keyDown(with: event); return }
         let lh = codeFont.lineHeight

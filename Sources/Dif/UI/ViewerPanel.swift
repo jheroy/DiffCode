@@ -27,7 +27,7 @@ struct ViewerPanel: View {
                 ConflictBar(project: project, path: request.path)
             }
             if viewer.findVisible { FindBar() }
-            if let doc = viewer.document, case .text = doc.content, !doc.isPlainFile {
+            if let doc = viewer.document, case .text = doc.content, !doc.isPlainFile, !CodeCanvasView.isAddedOnlyDocument(doc) {
                 PaneTitles(left: doc.leftTitle, right: doc.rightTitle, unified: store.settings.unified)
             }
             ZStack {
@@ -37,6 +37,9 @@ struct ViewerPanel: View {
                 if let hover = viewer.annotationHover {
                     AnnotationCard(hover: hover, lineHeight: (store.settings.fontSize * 1.5).rounded())
                 }
+            }
+            if viewer.vimModeEnabled && viewer.isTextDocument {
+                VimStatusBar(viewer: viewer)
             }
         }
         .background(Color.difWindow)
@@ -191,6 +194,10 @@ private struct ViewerHeader: View {
                         .foregroundStyle(Color.difText3)
                         .help(L("Time to load, diff and highlight this file", "加载、比较并高亮这个文件所用的时间"))
                 }
+                if viewer.isTextDocument {
+                    IconButton(symbol: "arrow.left", help: L("Previous file (⇧⌘[)", "上一个文件 (⇧⌘[)")) { store.stepFile(-1) }
+                    IconButton(symbol: "arrow.right", help: L("Next file (⇧⌘])", "下一个文件 (⇧⌘])")) { store.stepFile(1) }
+                }
                 if viewer.isTextDocument, viewer.document?.isPlainFile == false {
                     IconButton(symbol: "arrow.up", help: L("Previous Difference (⇧F7)", "上一处差异 (⇧F7)")) { viewer.stepDifference(-1) }
                     IconButton(symbol: "arrow.down", help: L("Next Difference (F7)", "下一处差异 (F7)")) { viewer.stepDifference(1) }
@@ -204,6 +211,8 @@ private struct ViewerHeader: View {
                     IconButton(symbol: "space", help: L("Ignore Whitespace (⌥⌘W)", "忽略空白差异 (⌥⌘W)"), isActive: store.settings.ignoreWhitespace) {
                         viewer.toggleWhitespace()
                     }
+                    Divider().frame(height: 14)
+                } else if viewer.isTextDocument {
                     Divider().frame(height: 14)
                 }
                 if viewer.isTextDocument {
@@ -568,4 +577,63 @@ private struct Checkerboard: NSViewRepresentable {
 
     func makeNSView(context: Context) -> PatternView { PatternView(frame: .zero) }
     func updateNSView(_ view: PatternView, context: Context) {}
+}
+
+/// Compact Vim status footer bar: mode pill, active `:` command line, pending key buffer, and Ln/Col indicator.
+private struct VimStatusBar: View {
+    let viewer: ViewerModel
+
+    private var pillColor: Color {
+        switch viewer.vimMode {
+        case .normal: return Color.difAccent
+        case .insert: return Color.difAdded
+        case .visual, .visualLine: return Color.purple
+        case .commandLine: return Color.orange
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(viewer.vimMode.label)
+                .font(.system(size: 10 * UI.scale, weight: .bold, design: .monospaced))
+                .foregroundStyle(Color.white)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1.5)
+                .background(RoundedRectangle(cornerRadius: 3.5, style: .continuous).fill(pillColor))
+                .fixedSize()
+
+            if case .commandLine(let prefix, let buffer) = viewer.vimMode {
+                HStack(spacing: 0) {
+                    Text(prefix + buffer)
+                        .font(.code(11.5))
+                        .foregroundStyle(Color.difText)
+                    Rectangle()
+                        .fill(Color.difText.opacity(0.75))
+                        .frame(width: 6, height: UI.s(12))
+                }
+                .lineLimit(1)
+            }
+
+            Spacer(minLength: 8)
+
+            if !viewer.vimPendingKeys.isEmpty {
+                Text(viewer.vimPendingKeys)
+                    .font(.code(11))
+                    .foregroundStyle(Color.difText2)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(RoundedRectangle(cornerRadius: 3, style: .continuous).fill(Color.difText.opacity(0.08)))
+                    .fixedSize()
+            }
+
+            Text("Ln \(viewer.vimCursorLine), Col \(viewer.vimCursorColumn)")
+                .font(.system(size: 10.5 * UI.scale, weight: .regular, design: .monospaced))
+                .foregroundStyle(Color.difText3)
+                .fixedSize()
+        }
+        .padding(.horizontal, 10)
+        .frame(height: UI.s(22))
+        .background(Color.difPanel)
+        .overlay(alignment: .top) { Rectangle().fill(Color.difHairline).frame(height: 1) }
+    }
 }

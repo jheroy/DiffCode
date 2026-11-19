@@ -108,6 +108,7 @@ final class AppStore {
         viewer.onFileWritten = { [weak self] root in self?.projects.first { $0.url == root }?.refresh() }
         viewer.onOpenAnnotation = { [weak self] entry in self?.openAnnotation(entry) }
         viewer.onGoToDefinition = { [weak self] line, col in self?.smartLSPNavigate(line: line, character: col) }
+        viewer.onVimAction = { [weak self] action, line, col in self?.handleVimAction(action, line: line, column: col) }
         quickOpen.store = self
         finder.store = self
         terminals.store = self
@@ -929,6 +930,75 @@ final class AppStore {
 
     func focusViewer() {
         viewer.focusCanvas()
+    }
+
+    // MARK: Vim
+
+    var vimModeEnabled: Bool {
+        get { viewer.vimModeEnabled }
+        set { viewer.vimModeEnabled = newValue }
+    }
+
+    func expandSelection() {
+        viewer.expandSelection()
+    }
+
+    func shrinkSelection() {
+        viewer.shrinkSelection()
+    }
+
+    func handleVimAction(_ action: VimAction, line: Int, column: Int) {
+        switch action {
+        case .goToDefinition:
+            smartLSPNavigate(line: line, character: column)
+        case .findReferences:
+            findAllReferences(atLine: line, utf16Column: column)
+        case .goToFile:
+            showQuickOpen(.files)
+        case .searchEverywhere:
+            showQuickOpen(.all)
+        case .findAction:
+            showQuickOpen(.actions)
+        case .gitPull:
+            pull()
+        case .gitPush:
+            push()
+        case .toggleGitGraph:
+            toggleGitGraph()
+        case .toggleMaximizeViewer:
+            toggleMaximizeViewer()
+        case .locateInTree:
+            locateInTree()
+        case .toggleFileTree:
+            toggleFileTree()
+        case .navigateBack:
+            navigateBack()
+        case .navigateForward:
+            navigateForward()
+        case .focusLeftPane:
+            if listVisible {
+                focusList()
+            } else if sidebarVisible {
+                focusTree()
+            } else {
+                focusList()
+            }
+        case .focusRightPane:
+            focusViewer()
+        case .quit:
+            if popup != nil {
+                dismissPopup()
+            } else if viewer.findVisible {
+                viewer.hideFind()
+            } else if externalRequest != nil {
+                exitExternalFileMode()
+                syncViewer()
+            } else {
+                viewer.onExit?()
+            }
+        default:
+            break
+        }
     }
 
     // MARK: Popups
