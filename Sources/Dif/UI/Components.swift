@@ -35,6 +35,48 @@ struct WindowDragArea: NSViewRepresentable {
     func updateNSView(_ view: DragView, context: Context) {}
 }
 
+/// Field editor for `SearchField` that notifies immediately when IME composition
+/// marks, unmarks, or inserts text — including `unmarkText()` commits that do not
+/// trigger `controlTextDidChange`.
+final class SearchFieldEditor: NSTextView {
+    var onMarkedTextChanged: (() -> Void)?
+
+    override func unmarkText() {
+        super.unmarkText()
+        onMarkedTextChanged?()
+    }
+
+    override func insertText(_ string: Any, replacementRange: NSRange) {
+        super.insertText(string, replacementRange: replacementRange)
+        onMarkedTextChanged?()
+    }
+
+    override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+        onMarkedTextChanged?()
+    }
+}
+
+/// Custom cell supplying a dedicated `SearchFieldEditor` per `SearchField`.
+private final class SearchFieldCell: NSTextFieldCell {
+    let editor: SearchFieldEditor = {
+        let view = SearchFieldEditor()
+        view.isFieldEditor = true
+        view.isRichText = false
+        view.allowsUndo = true
+        view.isAutomaticQuoteSubstitutionEnabled = false
+        view.isAutomaticDashSubstitutionEnabled = false
+        view.isAutomaticTextReplacementEnabled = false
+        view.isAutomaticSpellingCorrectionEnabled = false
+        view.isContinuousSpellCheckingEnabled = false
+        return view
+    }()
+
+    override func fieldEditor(for controlView: NSView) -> NSTextView? {
+        editor
+    }
+}
+
 /// A single-line text field that reports arrow keys, Return and Escape, so a result list
 /// can be driven from the keyboard while the field keeps focus.
 struct SearchField: NSViewRepresentable {
@@ -47,32 +89,119 @@ struct SearchField: NSViewRepresentable {
     var onCancel: () -> Void = {}
     var onTab: ((Bool) -> Void)?
 
+    @MainActor
     final class Coordinator: NSObject, NSTextFieldDelegate {
         var parent: SearchField
         var lastToken = Int.min
+        /// Last text value synced between the AppKit field and the SwiftUI binding.
+        /// Used to distinguish genuine programmatic changes from stale SwiftUI re-renders.
+        var lastSyncedText: String?
+        private weak var observedField: NSTextField?
+        private weak var observedEditor: NSTextView?
 
         init(_ parent: SearchField) { self.parent = parent }
 
+        deinit {
+            NotificationCenter.default.removeObserver(self)
+        }
+
+        private func observeEditor(_ editor: NSTextView?, for field: NSTextField) {
+            observedField = field
+            guard editor !== observedEditor else { return }
+            if let previous = observedEditor {
+                NotificationCenter.default.removeObserver(self, name: NSTextView.didChangeSelectionNotification, object: previous)
+            }
+            observedEditor = editor
+            if let editor {
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(editorSelectionDidChange(_:)),
+                    name: NSTextView.didChangeSelectionNotification,
+                    object: editor
+                )
+            }
+        }
+
+        private func stopObservingEditor() {
+            if let previous = observedEditor {
+                NotificationCenter.default.removeObserver(self, name: NSTextView.didChangeSelectionNotification, object: previous)
+            }
+            observedEditor = nil
+            observedField = nil
+        }
+
+        /// Pushes the field's live text into `parent.text` when no IME composition is active.
+        @discardableResult
+        func syncFromField(_ field: NSTextField) -> Bool {
+            // Letters an input method is still composing (pinyin before a candidate is picked) are not the text yet.
+            if SearchField.isComposing(field) { return false }
+            let value = SearchField.liveText(field)
+            lastSyncedText = value
+            if parent.text != value {
+                parent.text = value
+                return true
+            }
+            return false
+        }
+
+        @objc private func editorSelectionDidChange(_ notification: Notification) {
+            guard let editor = notification.object as? NSTextView,
+                  editor === observedEditor,
+                  let field = observedField,
+                  field.currentEditor() === editor else { return }
+            syncFromField(field)
+        }
+
+        func controlTextDidBeginEditing(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            let editor = (notification.userInfo?["NSFieldEditor"] as? NSTextView) ?? (field.currentEditor() as? NSTextView)
+            observeEditor(editor, for: field)
+        }
+
         func controlTextDidChange(_ notification: Notification) {
             guard let field = notification.object as? NSTextField else { return }
-            // Letters an input method is still composing (pinyin before a candidate is picked) are not the text yet.
-            if SearchField.isComposing(field) { return }
-            if parent.text != field.stringValue { parent.text = field.stringValue }
+            if let editor = field.currentEditor() as? NSTextView {
+                observeEditor(editor, for: field)
+            }
+            syncFromField(field)
+        }
+
+        func controlTextDidEndEditing(_ notification: Notification) {
+            if let field = notification.object as? NSTextField {
+                syncFromField(field)
+            }
+            stopObservingEditor()
         }
 
         func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+            let syncBeforeAction = {
+                if let field = control as? NSTextField { self.syncFromField(field) }
+            }
             switch selector {
-            case #selector(NSResponder.moveUp(_:)): parent.onMove(-1)
-            case #selector(NSResponder.moveDown(_:)): parent.onMove(1)
-            case #selector(NSResponder.scrollPageUp(_:)), #selector(NSResponder.pageUp(_:)): parent.onMove(-10)
-            case #selector(NSResponder.scrollPageDown(_:)), #selector(NSResponder.pageDown(_:)): parent.onMove(10)
-            case #selector(NSResponder.insertNewline(_:)): parent.onSubmit()
-            case #selector(NSResponder.cancelOperation(_:)): parent.onCancel()
+            case #selector(NSResponder.moveUp(_:)):
+                syncBeforeAction()
+                parent.onMove(-1)
+            case #selector(NSResponder.moveDown(_:)):
+                syncBeforeAction()
+                parent.onMove(1)
+            case #selector(NSResponder.scrollPageUp(_:)), #selector(NSResponder.pageUp(_:)):
+                syncBeforeAction()
+                parent.onMove(-10)
+            case #selector(NSResponder.scrollPageDown(_:)), #selector(NSResponder.pageDown(_:)):
+                syncBeforeAction()
+                parent.onMove(10)
+            case #selector(NSResponder.insertNewline(_:)):
+                syncBeforeAction()
+                parent.onSubmit()
+            case #selector(NSResponder.cancelOperation(_:)):
+                parent.onCancel()
             case #selector(NSResponder.insertTab(_:)):
                 guard let onTab = parent.onTab else { return false }
+                syncBeforeAction()
                 onTab(false)
             case #selector(NSResponder.insertBacktab(_:)):
                 guard let onTab = parent.onTab else { return false }
+                syncBeforeAction()
                 onTab(true)
             default: return false
             }
@@ -82,20 +211,34 @@ struct SearchField: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
-    func makeNSView(context: Context) -> NSTextField {
+    static func makeConfiguredTextField(placeholder: String, font: NSFont, coordinator: Coordinator) -> NSTextField {
         let field = NSTextField()
+        let defaultTextColor = field.textColor
+        let cell = SearchFieldCell()
+        cell.usesSingleLineMode = true
+        cell.wraps = false
+        cell.isScrollable = true
+        cell.lineBreakMode = .byTruncatingTail
+        cell.editor.onMarkedTextChanged = { [weak coordinator, weak field] in
+            guard let coordinator, let field else { return }
+            coordinator.syncFromField(field)
+        }
+        field.cell = cell
+        field.textColor = defaultTextColor
+        field.isEditable = true
+        field.isSelectable = true
         field.isBordered = false
         field.drawsBackground = false
         field.focusRingType = .none
         field.font = font
         field.placeholderString = placeholder
-        field.delegate = context.coordinator
-        field.cell?.usesSingleLineMode = true
-        field.cell?.wraps = false
-        field.cell?.isScrollable = true
-        field.lineBreakMode = .byTruncatingTail
+        field.delegate = coordinator
         field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         return field
+    }
+
+    func makeNSView(context: Context) -> NSTextField {
+        Self.makeConfiguredTextField(placeholder: placeholder, font: font, coordinator: context.coordinator)
     }
 
     /// Whether an input method is composing in the field: its value then holds letters that are not the text yet.
@@ -103,12 +246,38 @@ struct SearchField: NSViewRepresentable {
         (field.currentEditor() as? NSTextView)?.hasMarkedText() ?? false
     }
 
-    func updateNSView(_ field: NSTextField, context: Context) {
-        context.coordinator.parent = self
+    /// The live text shown in the field, reading directly from the active field editor when focused.
+    static func liveText(_ field: NSTextField) -> String {
+        (field.currentEditor() as? NSTextView)?.string ?? field.stringValue
+    }
+
+    /// Applies `text` from SwiftUI into `field` without clobbering active IME composition or
+    /// in-flight user edits, while still honoring genuine programmatic resets.
+    static func applyBindingText(_ text: String, to field: NSTextField, coordinator: Coordinator) {
         // Never while composing: setting the value then ended the composition and left its letters in the field
         // (typing 你 started a search, and its results redrew the field halfway through the next word's pinyin).
+        guard !isComposing(field) else { return }
+        let isEditing = field.currentEditor() != nil
+        let programmaticChange = coordinator.lastSyncedText != text
+        if (!isEditing || programmaticChange) && liveText(field) != text {
+            field.stringValue = text
+            coordinator.lastSyncedText = text
+        } else if coordinator.lastSyncedText == nil {
+            coordinator.lastSyncedText = text
+        }
+    }
+
+    func updateNSView(_ field: NSTextField, context: Context) {
+        context.coordinator.parent = self
+        if let cell = field.cell as? SearchFieldCell {
+            cell.editor.onMarkedTextChanged = { [weak coordinator = context.coordinator, weak field] in
+                guard let coordinator, let field else { return }
+                coordinator.syncFromField(field)
+            }
+        }
+        Self.applyBindingText(text, to: field, coordinator: context.coordinator)
         if !Self.isComposing(field) {
-            if field.stringValue != text { field.stringValue = text }
+            if field.placeholderString != placeholder { field.placeholderString = placeholder }
             if field.font != font { field.font = font }
         }
         if context.coordinator.lastToken != focusToken {
