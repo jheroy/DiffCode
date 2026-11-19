@@ -254,7 +254,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self else { return event }
             switch event.type {
             case .flagsChanged:
-                self.store.viewer.container?.canvas.handleFlagsChanged(event)
+                if self.store.popup == nil {
+                    self.store.viewer.container?.canvas.handleFlagsChanged(event)
+                } else {
+                    self.store.viewer.container?.canvas.clearLSPHover()
+                }
                 let flags = event.modifierFlags.intersection([.shift, .control, .option, .command])
                 let isShift = event.keyCode == 56 || event.keyCode == 60
                 if isShift, flags == .shift {

@@ -161,7 +161,6 @@ private final class Pane {
     /// Pales the bands of lines that stay out of the commit.
     let excluded: RectGroup
     let marks: [RectGroup]
-    let bars: [RectGroup]
     let words: [RectGroup]
     let hits: RectGroup
     let currentHit: RectGroup
@@ -180,7 +179,6 @@ private final class Pane {
         lines = (0..<3).map { _ in RectGroup(host: band, z: 0) }
         excluded = RectGroup(host: band, z: 0.5)
         marks = (0..<3).map { _ in RectGroup(host: band, z: 1) }
-        bars = (0..<2).map { _ in RectGroup(host: band, z: 6) }
         words = (0..<3).map { _ in RectGroup(host: text, z: 0) }
         hits = RectGroup(host: text, z: 1)
         currentHit = RectGroup(host: text, z: 2)
@@ -212,7 +210,7 @@ private final class Pane {
     }
 
     func clearDecor() {
-        (lines + marks + bars + words + [excluded, hits, currentHit, selection]).forEach { $0.clear() }
+        (lines + marks + words + [excluded, hits, currentHit, selection]).forEach { $0.clear() }
         focus.isHidden = true
         decorRows = 0..<0
     }
@@ -380,7 +378,6 @@ final class CodeCanvasView: NSView {
     private let panes = [Pane(side: .left), Pane(side: .right)]
     private let connector = StillLayer()
     private var ribbons: [StillShapeLayer] = []
-    private let ribbonOutline = StillShapeLayer()
     private let ruler = StillLayer()
     private let rulerThumb = StillLayer()
     private var rulerMarks: [StillShapeLayer] = []
@@ -452,9 +449,6 @@ final class CodeCanvasView: NSView {
             connector.addSublayer(ribbon)
             ribbons.append(ribbon)
         }
-        ribbonOutline.fillColor = nil
-        ribbonOutline.lineWidth = 1
-        connector.addSublayer(ribbonOutline)
         root.addSublayer(connector)
 
         ruler.anchorPoint = .zero
@@ -652,7 +646,10 @@ final class CodeCanvasView: NSView {
         }
     }
 
-    @objc private func keyWindowChanged() { invalidate(.selection) }
+    @objc private func keyWindowChanged() {
+        clearLSPHover()
+        invalidate(.selection)
+    }
 
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
@@ -1414,6 +1411,7 @@ final class CodeCanvasView: NSView {
     /// tiles below when lines came or went, and the overlays.
     private func textDidChange(_ outcomes: [EditorSession.Outcome], gutterDigitsBefore: Int) {
         guard let doc = document, !outcomes.isEmpty else { return }
+        clearLSPHover()
         let right = panes[1]
         var firstShifted = Int.max
         var rows = IndexSet()
@@ -1473,6 +1471,7 @@ final class CodeCanvasView: NSView {
     /// New hunks for the text on screen (the real diff, back from git): the line with the caret, or the
     /// top line, stays where it is on screen while the two sides line up again around it.
     func hunksDidChange(_ change: () -> Void) {
+        clearLSPHover()
         guard let doc = document else { change(); return }
         let lh = codeFont.lineHeight
         let caret = editSelection
@@ -1539,13 +1538,11 @@ final class CodeCanvasView: NSView {
         let bandWidth = pane.band.bounds.width
         var lines = [[CGRect]](repeating: [], count: 3)
         var marks = lines, words = lines
-        var bars: [[CGRect]] = [[], []]
         var excluded: [CGRect] = []
         let ticks = commitTicks
         var lineColors = Self.kinds.map { theme.line($0) }
         let markColors = Self.kinds.map { theme.mark($0) }
         var wordColors = Self.kinds.map { theme.word($0) }
-        var barColors = [theme.accent, Self.removedMark]
 
         switch mode {
         case .sideBySide:
@@ -1566,10 +1563,6 @@ final class CodeCanvasView: NSView {
                         let y = CGFloat(a) * lh, height = CGFloat(b - a) * lh
                         lines[k].append(CGRect(x: 0, y: y, width: bandWidth, height: height))
                         if let ticks { appendExcluded(ticks, side: side, lines: a..<b, row: a, width: bandWidth, to: &excluded) }
-                        if focusedHunk == index {
-                            bars[0].append(CGRect(x: side == .left ? bandWidth - 2.5 : 0, y: y, width: 2.5, height: height))
-                            barColors[0] = theme.mark(hunk.kind)
-                        }
                         let inline = side == .left ? hunk.leftInline : hunk.rightInline
                         // `inline` may be empty or shorter than the hunk.
                         var line = a
@@ -1589,7 +1582,6 @@ final class CodeCanvasView: NSView {
         case .unified:
             lineColors = [theme.added, theme.removedLine, theme.removedLine]
             wordColors = [theme.addedWord, theme.removedWord, theme.removedWord]
-            barColors[0] = theme.addedMark
             let data = doc.unifiedRows
             let end = min(rows.upperBound, data.count)
             var row = rows.lowerBound
@@ -1605,9 +1597,6 @@ final class CodeCanvasView: NSView {
                     let side: Side = first.kind == .added ? .right : .left
                     let firstLine = Int(side == .left ? first.left : first.right)
                     appendExcluded(ticks, side: side, lines: firstLine..<(firstLine + next - row), row: row, width: bandWidth, to: &excluded)
-                }
-                if let focused = focusedHunk, Int(first.hunk) == focused {
-                    bars[group].append(CGRect(x: 0, y: rect.minY, width: 2.5, height: rect.height))
                 }
                 if first.hunk >= 0, Int(first.hunk) < doc.hunks.count {
                     let hunk = doc.hunks[Int(first.hunk)]
@@ -1667,7 +1656,6 @@ final class CodeCanvasView: NSView {
             pane.marks[k].set(marks[k], color: markColors[k])
             pane.words[k].set(words[k], color: wordColors[k], radius: 2.5)
         }
-        for k in 0..<2 { pane.bars[k].set(bars[k], color: barColors[k]) }
         pane.excluded.set(excluded, color: theme.background.copy(alpha: 0.62) ?? theme.background)
         pane.hits.set(hits, color: theme.searchMatch, radius: 2.5)
         pane.currentHit.set(current, color: theme.searchCurrent, radius: 2.5)
@@ -1730,8 +1718,6 @@ final class CodeCanvasView: NSView {
         var index = min(firstHunk(doc, side: .left, endingAtOrAfter: firstLeft),
                         firstHunk(doc, side: .right, endingAtOrAfter: firstRight))
         let fills = [CGMutablePath(), CGMutablePath(), CGMutablePath()]
-        var outline: CGPath?
-        var outlineColor: CGColor?
         while index < doc.hunks.count {
             let hunk = doc.hunks[index]
             var l0 = CGFloat(hunk.leftStart) * lh - scroll.left
@@ -1751,16 +1737,6 @@ final class CodeCanvasView: NSView {
                 path.addCurve(to: CGPoint(x: 0, y: l1), control1: CGPoint(x: x1 - bend, y: r1), control2: CGPoint(x: bend, y: l1))
                 path.closeSubpath()
                 fills[kindIndex(hunk.kind)].addPath(path)
-                if focusedHunk == index {
-                    // Only the two curved edges: a closed outline reads as a box on one-line changes.
-                    let edges = CGMutablePath()
-                    edges.move(to: CGPoint(x: 0, y: l0))
-                    edges.addCurve(to: CGPoint(x: x1, y: r0), control1: CGPoint(x: bend, y: l0), control2: CGPoint(x: x1 - bend, y: r0))
-                    edges.move(to: CGPoint(x: x1, y: r1))
-                    edges.addCurve(to: CGPoint(x: 0, y: l1), control1: CGPoint(x: x1 - bend, y: r1), control2: CGPoint(x: bend, y: l1))
-                    outline = edges
-                    outlineColor = theme.mark(hunk.kind)
-                }
             }
             index += 1
         }
@@ -1770,9 +1746,6 @@ final class CodeCanvasView: NSView {
             ribbons[k].fillColor = theme.line(Self.kinds[k])
             ribbons[k].path = fills[k].isEmpty ? nil : fills[k]
         }
-        ribbonOutline.contentsScale = scale
-        ribbonOutline.strokeColor = outlineColor
-        ribbonOutline.path = outline
     }
 
     // MARK: Revert buttons
@@ -2184,7 +2157,7 @@ final class CodeCanvasView: NSView {
         }
     }
 
-    private func clearLSPHover() {
+    func clearLSPHover() {
         guard lspHover != nil else { return }
         setLSPHover(nil)
     }

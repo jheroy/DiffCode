@@ -541,6 +541,14 @@ enum GoWorkspaceResolver {
         }
         let canonicalFile = LSPURI.canonicalFileURL(fileURL)
         let canonicalRepo = repoRoot.map { LSPURI.canonicalFileURL($0) }
+        // When an external file (e.g. $GOROOT or ~/go/pkg/mod) is opened with an explicit Go module `repoRoot`,
+        // stay on that origin module root so `gopls` is reused instead of spawning a second server.
+        if let canonicalRepo, !LSPURI.isPath(canonicalFile, inside: canonicalRepo) {
+            let repoGoMod = canonicalRepo.appendingPathComponent("go.mod").path
+            if FileManager.default.fileExists(atPath: repoGoMod) {
+                return canonicalRepo
+            }
+        }
         let boundary = canonicalRepo.flatMap { LSPURI.isPath(canonicalFile, inside: $0) ? $0 : nil }
         if let goModDir = nearestDirectory(containing: "go.mod", from: directoryURL(for: canonicalFile), stoppingAt: boundary) {
             return goModDir

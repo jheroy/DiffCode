@@ -439,7 +439,9 @@ final class Project: Identifiable {
             self.hasMoreCommits = page.count >= limit
             self.isLoadingLog = false
             if reset, self.selectedCommit == nil {
-                self.selectedCommitID = self.commits.first?.id
+                let firstID = self.commits.first?.id
+                self.selectedCommitID = firstID
+                self.selectedCommitIDs = firstID.map { [$0] } ?? []
             } else if reset {
                 let known = Set(self.commits.map(\.id))
                 self.selectedCommitIDs = self.selectedCommitIDs.intersection(known)

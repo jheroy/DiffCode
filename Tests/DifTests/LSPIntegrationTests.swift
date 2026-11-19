@@ -520,4 +520,249 @@ final class LSPIntegrationTests: XCTestCase {
         XCTAssertFalse(commitDiff.isLiveFile)
         XCTAssertTrue(external.isLiveFile)
     }
+
+    // MARK: - 6. Concurrency & Ordering Regression Tests
+
+    private func makeMockLSPServer(in dir: URL, initDelaySeconds: Double, logFile: URL) throws -> LSPResolvedServer {
+        let script = dir.appendingPathComponent("mock-lsp.py")
+        let source = """
+        #!/usr/bin/env python3
+        import json, os, sys, time
+
+        LOG_PATH = \(String(reflecting: logFile.path))
+        INIT_DELAY = \(initDelaySeconds)
+
+        def log(entry):
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(entry + "\\n")
+                f.flush()
+
+        def read_msg():
+            headers = {}
+            while True:
+                line = sys.stdin.buffer.readline()
+                if not line:
+                    return None
+                if line in (b"\\r\\n", b"\\n"):
+                    break
+                k, _, v = line.decode("utf-8", "replace").partition(":")
+                headers[k.strip().lower()] = v.strip()
+            n = int(headers.get("content-length", "0"))
+            if n <= 0:
+                return None
+            body = sys.stdin.buffer.read(n)
+            return json.loads(body.decode("utf-8"))
+
+        def send_msg(obj):
+            raw = json.dumps(obj).encode("utf-8")
+            sys.stdout.buffer.write(f"Content-Length: {len(raw)}\\r\\n\\r\\n".encode("ascii") + raw)
+            sys.stdout.buffer.flush()
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            method = msg.get("method")
+            msg_id = msg.get("id")
+            params = msg.get("params") or {}
+            if method == "initialize":
+                if INIT_DELAY > 0:
+                    time.sleep(INIT_DELAY)
+                send_msg({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "capabilities": {
+                            "textDocumentSync": 1,
+                            "definitionProvider": True,
+                            "semanticTokensProvider": {
+                                "legend": {
+                                    "tokenTypes": ["function", "variable", "parameter"],
+                                    "tokenModifiers": []
+                                },
+                                "full": True
+                            }
+                        }
+                    }
+                })
+            elif method == "textDocument/didOpen":
+                uri = params.get("textDocument", {}).get("uri", "")
+                log(f"didOpen:{uri}")
+            elif method == "textDocument/didClose":
+                uri = params.get("textDocument", {}).get("uri", "")
+                log(f"didClose:{uri}")
+            elif method == "textDocument/semanticTokens/full":
+                # Emit one token on line 0, col 5, len 4, type 0 (function)
+                send_msg({"jsonrpc": "2.0", "id": msg_id, "result": {"data": [0, 5, 4, 0, 0]}})
+            elif method == "shutdown":
+                send_msg({"jsonrpc": "2.0", "id": msg_id, "result": None})
+            elif method == "exit":
+                break
+        """
+        try writeFile(script, contents: source)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        return LSPResolvedServer(
+            descriptor: LSPServerRegistry.go,
+            executablePath: "/usr/bin/python3",
+            arguments: [script.path],
+            environment: AppEnvironment.childEnvironment
+        )
+    }
+
+    func testLSPManagerColdStartConcurrentOpenAndCancellation() async throws {
+        let dir = try makeTempDir(prefix: "dif-lsp-coldstart")
+        let repo = dir.appendingPathComponent("repo", isDirectory: true)
+        let logFile = dir.appendingPathComponent("events.log")
+        let file1 = repo.appendingPathComponent("a.go")
+        let file2 = repo.appendingPathComponent("b.go")
+        try writeFile(repo.appendingPathComponent("go.mod"), contents: "module example.com/repo\ngo 1.22\n")
+        try writeFile(file1, contents: "package repo\nfunc Alpha() {}\n")
+        try writeFile(file2, contents: "package repo\nfunc Beta() {}\n")
+
+        let server = try makeMockLSPServer(in: dir, initDelaySeconds: 0.15, logFile: logFile)
+        let manager = LSPManager(isEnabled: true, serverOverrides: [LSPServerRegistry.go.id: server])
+        defer { Task { await manager.shutdownAll() } }
+
+        // Start cold initialization with file1, then join with file2 and cancel file1 mid-initialize.
+        let task1 = Task {
+            await manager.didOpen(fileURL: file1, text: "package repo\nfunc Alpha() {}\n", language: .go, repoRoot: repo)
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        let task2 = Task {
+            await manager.didOpen(fileURL: file2, text: "package repo\nfunc Beta() {}\n", language: .go, repoRoot: repo)
+        }
+        try await Task.sleep(for: .milliseconds(15))
+        task1.cancel()
+
+        _ = await task1.value
+        let session2 = await task2.value
+
+        XCTAssertNotNil(session2, "file2 must receive an active session even when file1 started initialization and was cancelled")
+        let count = await manager.runningServerCount()
+        XCTAssertEqual(count, 1)
+        let open1 = await manager.openSession(forURI: LSPURI.uri(from: file1))
+        let open2 = await manager.openSession(forURI: LSPURI.uri(from: file2))
+        XCTAssertNil(open1, "Cancelled file1 open must not register a stale session")
+        XCTAssertNotNil(open2, "file2 must remain registered in servers[key].openDocuments")
+
+        let tokens2 = await manager.semanticTokens(fileURL: file2)
+        XCTAssertEqual(tokens2?[0]?.first?.kind, .function)
+
+        await manager.shutdownAll()
+    }
+
+    func testLSPManagerShutdownDuringColdStartDoesNotLeakServer() async throws {
+        let dir = try makeTempDir(prefix: "dif-lsp-shutdown-race")
+        let repo = dir.appendingPathComponent("repo", isDirectory: true)
+        let logFile = dir.appendingPathComponent("events.log")
+        let file1 = repo.appendingPathComponent("a.go")
+        try writeFile(repo.appendingPathComponent("go.mod"), contents: "module example.com/repo\ngo 1.22\n")
+        try writeFile(file1, contents: "package repo\n")
+
+        let server = try makeMockLSPServer(in: dir, initDelaySeconds: 0.15, logFile: logFile)
+        let manager = LSPManager(isEnabled: true, serverOverrides: [LSPServerRegistry.go.id: server])
+
+        let openTask = Task {
+            await manager.didOpen(fileURL: file1, text: "package repo\n", language: .go, repoRoot: repo)
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        await manager.shutdownAll()
+        _ = await openTask.value
+
+        let count = await manager.runningServerCount()
+        XCTAssertEqual(count, 0, "Server completing initialize during shutdownAll must not leak into servers")
+        let session = await manager.openSession(forURI: LSPURI.uri(from: file1))
+        XCTAssertNil(session)
+    }
+
+    @MainActor
+    func testViewerLSPRapidSwitchBackSerializesCloseBeforeReopen() async throws {
+        let dir = try makeTempDir(prefix: "dif-lsp-rapid-switch")
+        let repo = dir.appendingPathComponent("repo", isDirectory: true)
+        let logFile = dir.appendingPathComponent("events.log")
+        let fileA = repo.appendingPathComponent("a.go")
+        let fileB = repo.appendingPathComponent("b.go")
+        try writeFile(repo.appendingPathComponent("go.mod"), contents: "module example.com/repo\ngo 1.22\n")
+        try writeFile(fileA, contents: "func work() {}\n")
+        try writeFile(fileB, contents: "func peer() {}\n")
+
+        let server = try makeMockLSPServer(in: dir, initDelaySeconds: 0.0, logFile: logFile)
+        let manager = LSPManager(isEnabled: true, serverOverrides: [LSPServerRegistry.go.id: server])
+
+        let viewer = ViewerModel()
+        viewer.settings = Settings.shared
+        viewer.lspManager = manager
+
+        let reqA = DiffRequest(root: repo, path: "a.go", oldPath: nil, kind: nil, source: .file)
+        let reqB = DiffRequest(root: repo, path: "b.go", oldPath: nil, kind: nil, source: .file)
+        let docA1 = await DiffLoader.load(reqA)
+        let docB = await DiffLoader.load(reqB)
+        let docA2 = await DiffLoader.load(reqA)
+
+        // Open A and wait for server startup & initial open
+        viewer.request = reqA
+        viewer.document = docA1
+        viewer.syncLSPForCurrentDocument()
+        await viewer.lspTask?.value
+
+        // Rapidly switch A -> B -> A without awaiting in between (simulates jump + immediate ⌘[)
+        viewer.request = reqB
+        viewer.document = docB
+        viewer.syncLSPForCurrentDocument()
+
+        viewer.request = reqA
+        viewer.document = docA2
+        viewer.syncLSPForCurrentDocument()
+        await viewer.lspTask?.value
+
+        let uriA = LSPURI.uri(from: fileA)
+        let sessionA = await manager.openSession(forURI: uriA)
+        XCTAssertNotNil(sessionA, "a.go must remain open after rapid A -> B -> A switch")
+        XCTAssertTrue(docA2.right.spans(at: 0).contains(SyntaxSpan(start: 5, length: 4, kind: .function)),
+                      "Semantic tokens must still be applied to a.go after rapid switch back")
+
+        let events = (try? String(contentsOf: logFile, encoding: .utf8))?
+            .split(separator: "\n").map(String.init) ?? []
+        let aEvents = events.filter { $0.hasSuffix(uriA) }
+        XCTAssertEqual(aEvents.last, "didOpen:\(uriA)", "Final lifecycle event for a.go must be didOpen, got: \(aEvents)")
+
+        await manager.shutdownAll()
+    }
+
+    func testSingleModuleGoExternalTargetReusesOriginWorkspaceRoot() throws {
+        let dir = try makeTempDir(prefix: "dif-single-mod-ext")
+        let repo = dir.appendingPathComponent("myapp", isDirectory: true)
+        let gorootSrc = dir.appendingPathComponent("goroot/src", isDirectory: true)
+        let mainFile = repo.appendingPathComponent("main.go")
+        let stdlibFile = gorootSrc.appendingPathComponent("fmt/print.go")
+
+        try writeFile(repo.appendingPathComponent("go.mod"), contents: "module example.com/myapp\ngo 1.22\n")
+        try writeFile(mainFile, contents: "package main\n")
+        // Real $GOROOT/src has its own go.mod
+        try writeFile(gorootSrc.appendingPathComponent("go.mod"), contents: "module std\ngo 1.22\n")
+        try writeFile(stdlibFile, contents: "package fmt\n")
+
+        let ref = LSPTargetResolver.ProjectRef(id: UUID(), rootURL: repo)
+        let loc = LSPLocation(
+            uri: LSPURI.uri(from: stdlibFile),
+            range: LSPRange(start: LSPPosition(line: 0, character: 0), end: LSPPosition(line: 0, character: 7))
+        )
+
+        let target = LSPTargetResolver.resolve(
+            location: loc,
+            originFileURL: mainFile,
+            originRepoRoot: repo,
+            activeProject: ref,
+            openProjects: [ref]
+        )
+        guard case .externalReadOnly(_, _, let workspaceRoot, _, _, _) = target else {
+            return XCTFail("Expected externalReadOnly target")
+        }
+        XCTAssertEqual(workspaceRoot, repo, "Single-module Go repo must keep origin workspaceRoot for $GOROOT/pkg/mod")
+        XCTAssertEqual(
+            GoWorkspaceResolver.workspaceRoot(for: stdlibFile, repoRoot: workspaceRoot),
+            repo,
+            "GoWorkspaceResolver must stay on origin module root so gopls is reused"
+        )
+    }
 }

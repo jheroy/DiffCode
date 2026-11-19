@@ -271,6 +271,7 @@ actor LSPTransport {
 
     private var nextID: Int = 1
     private var pending: [Int: CheckedContinuation<JSONValue, any Error>] = [:]
+    private var awaitingRegistration: Set<Int> = []
     private var cancelledIDs: Set<Int> = []
     private var isStarted = false
     private var isShutDown = false
@@ -430,9 +431,12 @@ actor LSPTransport {
         }
         defer { timeoutTask?.cancel() }
 
+        awaitingRegistration.insert(id)
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<JSONValue, any Error>) in
+                self.awaitingRegistration.remove(id)
                 if !self.isStarted || self.isShutDown {
+                    self.cancelledIDs.remove(id)
                     continuation.resume(throwing: LSPTransportError.closed)
                     return
                 }
@@ -626,7 +630,7 @@ actor LSPTransport {
             if sendCancel, !isShutDown {
                 try? await notify(method: "$/cancelRequest", params: .object(["id": .int(id)]))
             }
-        } else if sendCancel {
+        } else if sendCancel, awaitingRegistration.contains(id) {
             cancelledIDs.insert(id)
         }
     }
@@ -634,6 +638,7 @@ actor LSPTransport {
     private func failAllPending(with error: any Error) {
         let outstanding = pending
         pending.removeAll()
+        awaitingRegistration.removeAll()
         cancelledIDs.removeAll()
         for (_, continuation) in outstanding {
             continuation.resume(throwing: error)

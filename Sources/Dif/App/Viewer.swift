@@ -79,6 +79,7 @@ final class ViewerModel: CodeCanvasDelegate {
     @ObservationIgnored var onOpenAnnotation: ((LineAnnotations.Entry) -> Void)?
 
     // LSP (see ViewerLSP.swift).
+    @ObservationIgnored var lspManager: LSPManager = .shared
     @ObservationIgnored var lspDocument: ActiveLSPDocument?
     @ObservationIgnored var lspGeneration: UInt64 = 0
     @ObservationIgnored var lspTask: Task<Void, Never>?

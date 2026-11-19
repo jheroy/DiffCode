@@ -197,8 +197,12 @@ enum LSPTargetResolver {
                 repoRoot: nil
             )
         }
-        // Keep the active go.work root when jumping into stdlib/pkg cache so chained jumps reuse the running server.
-        let workspaceRoot = goWork?.rootURL ?? containingRepo
+        // Keep the active go.work root or origin module workspace root when jumping into external files
+        // ($GOROOT, ~/go/pkg/mod) so chained jumps reuse the already-running language server.
+        let originWorkspaceRoot: URL? = originFileURL.map {
+            GoWorkspaceResolver.workspaceRoot(for: $0, repoRoot: originRepoRoot)
+        } ?? originRepoRoot.map { LSPURI.canonicalFileURL($0) }
+        let workspaceRoot = goWork?.rootURL ?? originWorkspaceRoot ?? containingRepo
         let display = displayPath(for: targetURL, containingRepo: containingRepo)
         return .externalReadOnly(
             fileURL: targetURL,

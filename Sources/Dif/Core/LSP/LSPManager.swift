@@ -27,8 +27,13 @@ actor LSPManager {
     private let idleTimeout: Duration
     private let serverOverrides: [String: LSPResolvedServer]
 
+    private struct PendingStart {
+        let id: UUID
+        let task: Task<ServerInstance?, Never>
+    }
+
     private var servers: [ServerKey: ServerInstance] = [:]
-    private var starting: [ServerKey: Task<ServerInstance?, Never>] = [:]
+    private var starting: [ServerKey: PendingStart] = [:]
     private var unavailableServerIDs: Set<String> = []
     private var documentToServer: [String: ServerKey] = [:]
     private var reaperTask: Task<Void, Never>?
@@ -130,8 +135,10 @@ actor LSPManager {
         guard let descriptor else { return }
 
         let workspace = LSPWorkspaceResolver.resolve(fileURL: fileURL, descriptor: descriptor, repoRoot: workspaceRoot)
+        guard !Task.isCancelled else { return }
         guard let server = await ensureServer(descriptor: descriptor, workspace: workspace) else { return }
         let key = server.key
+        guard !Task.isCancelled, isEffectivelyEnabled, servers[key] != nil else { return }
 
         // If already open on the same server, send didChange (or close+reopen if language changed)
         // because LSP servers such as gopls reject duplicate didOpen notifications.
@@ -350,8 +357,8 @@ actor LSPManager {
 
         let inFlight = starting
         starting.removeAll()
-        for (_, task) in inFlight {
-            task.cancel()
+        for (_, pending) in inFlight {
+            pending.task.cancel()
         }
 
         let active = servers
@@ -362,6 +369,11 @@ actor LSPManager {
             for (_, instance) in active {
                 group.addTask {
                     await instance.transport.shutdown()
+                }
+            }
+            for (_, pending) in inFlight {
+                group.addTask {
+                    _ = await pending.task.value
                 }
             }
         }
@@ -386,30 +398,42 @@ actor LSPManager {
         }
 
         if let pendingStart = starting[key] {
-            return await pendingStart.value
+            return await pendingStart.task.value
         }
 
         if serverOverrides[descriptor.id] == nil && unavailableServerIDs.contains(descriptor.id) {
             return nil
         }
 
+        let startID = UUID()
         let startTask = Task<ServerInstance?, Never> { [weak self] in
             guard let self else { return nil }
-            return await self.launchAndInitializeServer(key: key, descriptor: descriptor, workspace: workspace)
+            let instance = await self.launchAndInitializeServer(key: key, descriptor: descriptor, workspace: workspace)
+            return await self.finishServerStart(key: key, startID: startID, instance: instance)
         }
-        starting[key] = startTask
-        let result = await startTask.value
-        starting.removeValue(forKey: key)
+        starting[key] = PendingStart(id: startID, task: startTask)
+        return await startTask.value
+    }
 
-        if let instance = result {
-            guard isEffectivelyEnabled else {
-                await instance.transport.shutdown()
-                return nil
-            }
-            servers[key] = instance
-            ensureReaperRunning()
+    /// Atomically publishes a newly initialized server into `servers[key]` before any waiter resumes,
+    /// or tears it down if `shutdownAll()` / disablement superseded this startup.
+    private func finishServerStart(
+        key: ServerKey,
+        startID: UUID,
+        instance: ServerInstance?
+    ) async -> ServerInstance? {
+        let stillCurrent = starting[key]?.id == startID
+        if stillCurrent {
+            starting.removeValue(forKey: key)
         }
-        return result
+        guard let instance else { return nil }
+        guard stillCurrent, !Task.isCancelled, isEffectivelyEnabled else {
+            await instance.transport.shutdown()
+            return nil
+        }
+        servers[key] = instance
+        ensureReaperRunning()
+        return instance
     }
 
     private func launchAndInitializeServer(
@@ -450,9 +474,15 @@ actor LSPManager {
             }
         )
 
+        guard !Task.isCancelled else { return nil }
         do {
             try await transport.start()
         } catch {
+            return nil
+        }
+
+        guard !Task.isCancelled else {
+            await transport.shutdown()
             return nil
         }
 
@@ -463,6 +493,10 @@ actor LSPManager {
                 params: initParams,
                 timeout: .seconds(15)
             )
+            guard !Task.isCancelled else {
+                await transport.shutdown()
+                return nil
+            }
             let capabilities = LSPServerCapabilities.parse(from: initResult)
             try await transport.notify(method: "initialized", params: .object([:]))
             return ServerInstance(
