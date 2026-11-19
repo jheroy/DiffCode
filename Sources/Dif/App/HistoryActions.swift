@@ -316,17 +316,18 @@ extension AppStore {
         return menu
     }
 
-    /// A file's right-click menu in a commit's file list.
-    func commitFileMenu(_ change: FileChange, in commit: Commit, project: Project) -> NSMenu {
+    /// A file's right-click menu in a commit's or commit range's file list.
+    func commitFileMenu(_ change: FileChange, in commits: [Commit], project: Project) -> NSMenu {
         let menu = NSMenu()
-        let request = project.request(for: change, in: commit, ignoreWhitespace: settings.ignoreWhitespace)
-        let history = ClosureMenuItem(L("Show History", "查看历史")) { [weak self] in
-            guard let self, let filter = self.historyFilter(for: request, lines: nil, in: project) else { return }
-            self.showHistory(filter, in: project)
+        if let request = project.request(for: change, in: commits, ignoreWhitespace: settings.ignoreWhitespace) {
+            let history = ClosureMenuItem(L("Show History", "查看历史")) { [weak self] in
+                guard let self, let filter = self.historyFilter(for: request, lines: nil, in: project) else { return }
+                self.showHistory(filter, in: project)
+            }
+            history.isEnabled = historyFilter(for: request, lines: nil, in: project) != nil
+            menu.addItem(history)
+            menu.addItem(.separator())
         }
-        history.isEnabled = historyFilter(for: request, lines: nil, in: project) != nil
-        menu.addItem(history)
-        menu.addItem(.separator())
         menu.addItem(ClosureMenuItem(L("Copy Path", "复制路径")) { [weak self] in self?.copyText(change.path) })
         return menu
     }

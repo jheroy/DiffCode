@@ -788,7 +788,10 @@ struct LogPanel: View {
                                  project.selectedCommitID = id
                                  store.pickedInLog(project, commitChanged: true)
                              }),
-                             multiSelection: $project.selectedCommitIDs,
+                             multiSelection: Binding(get: { project.selectedCommitIDs }, set: { ids in
+                                 project.selectedCommitIDs = ids
+                                 store.pickedInLog(project, commitChanged: true)
+                             }),
                              focusToken: store.listFocusToken, rowHeight: 44,
                              onKey: { event, _ in
                                  if event.keyCode == 124 || event.keyCode == 36 { filesFocusToken += 1; return true }
@@ -804,7 +807,7 @@ struct LogPanel: View {
                     .frame(height: filesHeight)
             }
         }
-        .onChange(of: project.selectedCommitID) { _, _ in store.commitSelectionChanged(project) }
+        .onChange(of: project.commitSelectionIDs) { _, _ in store.commitSelectionChanged(project) }
         .onChange(of: project.selectedCommitFileID) { _, _ in store.commitFileSelectionChanged(project) }
         .onAppear {
             // A load already running (one asked for by the Git graph) is not replaced by a plain one.
@@ -893,7 +896,7 @@ struct RefChip: View {
     }
 }
 
-/// The selected commit's message and changed files.
+/// The selected commit's (or commit range's) summary and changed files.
 private struct CommitDetail: View {
     @Bindable var project: Project
     var focusToken: Int
@@ -902,8 +905,45 @@ private struct CommitDetail: View {
     var body: some View {
         let rows = ChangeTree.rows(changes: project.commitFiles, flat: store.settings.flatList,
                                    collapsed: project.commitCollapsed, filter: "", splitUnversioned: false)
+        let selectedCommits = project.selectedCommits
         VStack(spacing: 0) {
-            if let commit = project.selectedCommit {
+            if selectedCommits.count > 1, let newest = selectedCommits.first, let oldest = selectedCommits.last {
+                let fileCount = project.commitFiles.count
+                let added = project.commitFiles.reduce(0) { $0 + ($1.additions ?? 0) }
+                let deleted = project.commitFiles.reduce(0) { $0 + ($1.deletions ?? 0) }
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 6) {
+                        Text(L("\(selectedCommits.count) commits · \(fileCount == 1 ? "1 file" : "\(fileCount) files")",
+                               "已选 \(selectedCommits.count) 个提交 · \(fileCount) 个文件"))
+                            .font(.ui(size: 12, weight: .medium))
+                            .foregroundStyle(Color.difText)
+                            .lineLimit(1)
+                        Spacer(minLength: 4)
+                        StatBadge(additions: added, deletions: deleted)
+                    }
+                    HStack(spacing: 6) {
+                        Text("\(oldest.shortHash)..\(newest.shortHash)")
+                            .font(.code(10.5))
+                        Spacer()
+                        Button {
+                            let range = "\(oldest.parents.first ?? Git.emptyTree)..\(newest.hash)"
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(range, forType: .string)
+                            store.showToast(L("Copied \(oldest.shortHash)..\(newest.shortHash)",
+                                              "已复制 \(oldest.shortHash)..\(newest.shortHash)"))
+                        } label: {
+                            Image(systemName: "doc.on.doc").font(.ui(size: 9))
+                        }
+                        .buttonStyle(.plain)
+                        .help(L("Copy commit range", "复制提交范围"))
+                    }
+                    .font(.ui(size: 11))
+                    .foregroundStyle(Color.difText3)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                Rectangle().fill(Color.difHairline).frame(height: 1)
+            } else if let commit = selectedCommits.first {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(project.commitBody.isEmpty ? commit.subject : project.commitBody)
                         .font(.ui(size: 12))
@@ -963,8 +1003,10 @@ private struct CommitDetail: View {
                              if row.file != nil { store.focusViewer() } else { toggle(row) }
                          },
                          menu: { row in
-                             guard let file = row.file, let commit = project.selectedCommit else { return nil }
-                             return store.commitFileMenu(file, in: commit, project: project)
+                             guard let file = row.file else { return nil }
+                             let commits = project.selectedCommits
+                             guard !commits.isEmpty else { return nil }
+                             return store.commitFileMenu(file, in: commits, project: project)
                          }) { row, _, _ in
                 ChangeRowView(row: row, showDirectory: store.settings.flatList) { toggle(row) }
             }

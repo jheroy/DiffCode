@@ -187,6 +187,18 @@ extension Git {
               let data = try? await run(["log", "-1", "--format=\(logFormat)", "--decorate=full", rev, "--"], in: dir) else { return nil }
         return parseLog(data).first
     }
+
+    /// Files touched across `commits` (ordered newest first): for one commit, against its first parent; for two or
+    /// more, the cumulative diff from the oldest commit's first parent (or the empty tree for a root commit) to the newest.
+    static func commitFiles(_ commits: [Commit], in dir: URL) async throws -> [FileChange] {
+        guard let newest = commits.first else { return [] }
+        if commits.count == 1 {
+            return try await commitFiles(newest, in: dir)
+        }
+        let oldest = commits[commits.count - 1]
+        let base = oldest.parents.first ?? emptyTree
+        return try await compareFiles(base: base, head: newest.hash, in: dir)
+    }
 }
 
 // MARK: - Comparing with another commit

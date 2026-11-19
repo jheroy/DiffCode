@@ -137,7 +137,7 @@ final class Project: Identifiable {
 
     // Log
     var commits: [Commit] = []
-    /// Every selected commit (⌘-click), for comparing two. Includes `selectedCommitID`.
+    /// Every selected commit (⌘-click, ⇧-click, ⌘A). Includes `selectedCommitID` when one is active.
     var selectedCommitIDs: Set<String> = []
     var logQuery = ""
     var logAllBranches = false
@@ -145,9 +145,20 @@ final class Project: Identifiable {
     var logRef: String?
     var hasMoreCommits = true
     var isLoadingLog = false
-    var selectedCommitID: String?
+    var selectedCommitID: String? {
+        didSet {
+            if let id = selectedCommitID {
+                if !selectedCommitIDs.contains(id) {
+                    selectedCommitIDs = [id]
+                }
+            } else if !selectedCommitIDs.isEmpty {
+                selectedCommitIDs = []
+            }
+        }
+    }
     var commitFiles: [FileChange] = []
     var commitBody = ""
+    var isLoadingCommit = false
     var selectedCommitFileID: String?
     var commitCollapsed: Set<String> = []
 
@@ -173,6 +184,7 @@ final class Project: Identifiable {
     @ObservationIgnored private var lastRefresh = Date.distantPast
     @ObservationIgnored private var logTask: Task<Void, Never>?
     @ObservationIgnored private var commitTask: Task<Void, Never>?
+    @ObservationIgnored private var commitLoadGeneration = 0
     @ObservationIgnored private var compareTask: Task<Void, Never>?
     @ObservationIgnored private var fileIndex: [String]?
     @ObservationIgnored private var fileIndexStale = true
@@ -353,9 +365,31 @@ final class Project: Identifiable {
                     source: .commit(hash: commit.hash, parent: commit.parents.first), ignoreWhitespace: ignoreWhitespace)
     }
 
+    /// Diff request for `change` across `commits` (ordered newest first): for one commit, against its first parent;
+    /// for several, from the oldest commit's first parent (nil for a root commit) to the newest commit.
+    func request(for change: FileChange, in commits: [Commit], ignoreWhitespace: Bool) -> DiffRequest? {
+        guard let newest = commits.first, let oldest = commits.last else { return nil }
+        return DiffRequest(root: url, path: change.path, oldPath: change.oldPath, kind: change.kind,
+                           source: .commit(hash: newest.hash, parent: oldest.parents.first), ignoreWhitespace: ignoreWhitespace)
+    }
+
     var selectedCommit: Commit? {
         guard let id = selectedCommitID else { return nil }
         return commits.first { $0.id == id }
+    }
+
+    /// Selected commits in list order (newest first).
+    var selectedCommits: [Commit] {
+        if !selectedCommitIDs.isEmpty {
+            let ordered = commits.filter { selectedCommitIDs.contains($0.id) }
+            if !ordered.isEmpty { return ordered }
+        }
+        return selectedCommit.map { [$0] } ?? []
+    }
+
+    /// Ordered hashes of the active commit selection, for observing single and multi-selection changes together.
+    var commitSelectionIDs: [String] {
+        selectedCommits.map(\.id)
     }
 
     // MARK: Log
@@ -406,34 +440,50 @@ final class Project: Identifiable {
             self.isLoadingLog = false
             if reset, self.selectedCommit == nil {
                 self.selectedCommitID = self.commits.first?.id
+            } else if reset {
+                let known = Set(self.commits.map(\.id))
+                self.selectedCommitIDs = self.selectedCommitIDs.intersection(known)
+                if self.selectedCommitIDs.isEmpty, let id = self.selectedCommitID {
+                    self.selectedCommitIDs = [id]
+                }
             }
             completion?()
         }
     }
 
-    /// Loads the file list of the selected commit. `completion` runs once the list is in place.
+    /// Loads the file list of the selected commit or commit range. `completion` runs once the list is in place.
     func loadSelectedCommit(completion: @escaping () -> Void) {
         commitTask?.cancel()
-        guard let commit = selectedCommit else {
+        commitLoadGeneration += 1
+        let generation = commitLoadGeneration
+        let selected = selectedCommits
+        guard let primary = selected.first else {
+            isLoadingCommit = false
             commitFiles = []
             commitBody = ""
             selectedCommitFileID = nil
             completion()
             return
         }
+        let selectionIDs = selected.map(\.id)
+        isLoadingCommit = true
         commitTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            async let filesResult = Git.commitFiles(commit, in: self.url)
-            async let bodyResult = Git.commitBody(commit.hash, in: self.url)
+            async let filesResult = Git.commitFiles(selected, in: self.url)
+            async let bodyResult: String = selected.count == 1 ? Git.commitBody(primary.hash, in: self.url) : ""
             let files = (try? await filesResult) ?? []
             let body = await bodyResult
-            if Task.isCancelled || self.selectedCommitID != commit.id { return }
+            if Task.isCancelled || self.commitLoadGeneration != generation || self.commitSelectionIDs != selectionIDs { return }
+            self.isLoadingCommit = false
             self.commitFiles = files
             self.commitBody = body
             // A file's history shows that file in each commit, under whatever name it had there.
             if let history = self.history {
-                let path = self.historyPaths[commit.hash] ?? history.path
-                if let file = files.first(where: { $0.path == path }) ?? files.first(where: { $0.oldPath == path || $0.path == history.path }) {
+                let candidates: [String] = selected.count == 1
+                    ? [self.historyPaths[primary.hash] ?? history.path, history.path]
+                    : selected.compactMap { self.historyPaths[$0.hash] } + [history.path]
+                if let file = files.first(where: { candidates.contains($0.path) })
+                    ?? files.first(where: { f in f.oldPath.map { candidates.contains($0) } ?? false }) {
                     self.selectedCommitFileID = ChangeRow.fileID(file.path)
                     completion()
                     return

@@ -557,15 +557,17 @@ final class AppStore {
             }
         case .log:
             if project.commits.isEmpty, !project.isLoadingLog { project.loadLog(reset: true) }
-            guard let commit = project.selectedCommit, let id = project.selectedCommitFileID,
-                  let change = project.commitFiles.first(where: { ChangeRow.fileID($0.path) == id }) else {
+            let commits = project.selectedCommits
+            guard !commits.isEmpty, let id = project.selectedCommitFileID,
+                  let change = project.commitFiles.first(where: { ChangeRow.fileID($0.path) == id }),
+                  let request = project.request(for: change, in: commits, ignoreWhitespace: settings.ignoreWhitespace) else {
                 // Keep showing the previous commit's diff while the next one loads.
                 var showingCommit = false
                 if let current = viewer.request, current.root == project.url, case .commit = current.source { showingCommit = true }
-                if !showingCommit || project.selectedCommit == nil { viewer.clear() }
+                if !showingCommit || commits.isEmpty || (!project.isLoadingCommit && project.commitFiles.isEmpty) { viewer.clear() }
                 return
             }
-            viewer.open(project.request(for: change, in: commit, ignoreWhitespace: settings.ignoreWhitespace))
+            viewer.open(request)
         }
     }
 

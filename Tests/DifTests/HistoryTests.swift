@@ -322,3 +322,218 @@ final class HistoryRepositoryTests: XCTestCase {
         XCTAssertEqual(changes.map(\.deletions), [0, 0, 0])
     }
 }
+
+/// Multi-commit selection in the Log: combined changed files, cumulative diffs, and Store/Project state.
+final class MultiCommitSelectionTests: XCTestCase {
+    private var root: URL!
+
+    override func setUp() async throws {
+        root = FileManager.default.temporaryDirectory.appendingPathComponent("dif-multi-commit-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try git("init", "-q", "-b", "main")
+        // c1 (root): a.txt, keep.txt
+        try write("a.txt", "one\n")
+        try write("keep.txt", "k1\n")
+        try git("add", "-A")
+        try commit("c1 root", date: "2026-01-01T10:00:00")
+        // c2: modify a.txt, add b.txt, add temp.txt
+        try write("a.txt", "one\ntwo\n")
+        try write("b.txt", "b1\n")
+        try write("temp.txt", "t1\n")
+        try git("add", "-A")
+        try commit("c2 add and modify", date: "2026-01-02T10:00:00")
+        // c3: rename b.txt -> b2.txt with edit, modify keep.txt
+        try git("mv", "b.txt", "b2.txt")
+        try write("b2.txt", "b1\nb2\n")
+        try write("keep.txt", "k1\nk2\n")
+        try git("add", "-A")
+        try commit("c3 rename and modify", date: "2026-01-03T10:00:00")
+        // c4: delete temp.txt, add c.txt, modify a.txt
+        try git("rm", "-q", "temp.txt")
+        try write("c.txt", "c1\n")
+        try write("a.txt", "one\ntwo\nthree\n")
+        try git("add", "-A")
+        try commit("c4 delete add modify", date: "2026-01-04T10:00:00")
+        // c5: modify c.txt
+        try write("c.txt", "c1\nc2\n")
+        try git("add", "-A")
+        try commit("c5 modify c", date: "2026-01-05T10:00:00")
+    }
+
+    override func tearDown() async throws {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private func write(_ path: String, _ text: String) throws {
+        try Data(text.utf8).write(to: root.appendingPathComponent(path))
+    }
+
+    private func commit(_ message: String, date: String) throws {
+        try git("commit", "-q", "-m", message, "--date=\(date)")
+    }
+
+    private func git(_ arguments: String...) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: Git.executable)
+        process.arguments = ["-c", "user.name=Alice", "-c", "user.email=alice@example.com", "-c", "commit.gpgsign=false"] + arguments
+        process.currentDirectoryURL = root
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0, "git \(arguments.joined(separator: " "))")
+    }
+
+    func testMultiCommitFileListCombinesAddedModifiedRenamedAndDeletedFiles() async throws {
+        let commits = try await Git.log(in: root, skip: 0, limit: 20, query: "", allBranches: false)
+        // Newest first: [c5, c4, c3, c2, c1]
+        XCTAssertEqual(commits.map(\.subject), ["c5 modify c", "c4 delete add modify", "c3 rename and modify", "c2 add and modify", "c1 root"])
+        let c5 = commits[0], c4 = commits[1], c3 = commits[2], c2 = commits[3], c1 = commits[4]
+
+        // Single commit delegates cleanly to single-commit behavior.
+        let single = try await Git.commitFiles([c3], in: root)
+        let singleDirect = try await Git.commitFiles(c3, in: root)
+        XCTAssertEqual(single, singleDirect)
+
+        // [c4, c3]: base is c2, head is c4 -> a.txt (M), b2.txt (R b.txt -> b2.txt), c.txt (A), keep.txt (M), temp.txt (D).
+        let span34 = try await Git.commitFiles([c4, c3], in: root)
+        XCTAssertEqual(span34.map(\.path), ["a.txt", "b2.txt", "c.txt", "keep.txt", "temp.txt"])
+        XCTAssertEqual(span34.map(\.kind), [.modified, .renamed, .added, .modified, .deleted])
+        XCTAssertEqual(span34.first { $0.path == "b2.txt" }?.oldPath, "b.txt")
+
+        // [c4, c3, c2]: base is c1, head is c4 -> temp.txt was added in c2 and deleted in c4 so it cancels out.
+        let span234 = try await Git.commitFiles([c4, c3, c2], in: root)
+        XCTAssertEqual(span234.map(\.path), ["a.txt", "b2.txt", "c.txt", "keep.txt"])
+        XCTAssertEqual(span234.map(\.kind), [.modified, .added, .added, .modified])
+
+        // Root commit as oldest: [c2, c1] -> base is empty tree, every file at c2 is added.
+        let rootSpan = try await Git.commitFiles([c2, c1], in: root)
+        XCTAssertEqual(rootSpan.map(\.path), ["a.txt", "b.txt", "keep.txt", "temp.txt"])
+        XCTAssertEqual(rootSpan.map(\.kind), [.added, .added, .added, .added])
+
+        // Non-empty single commit at end still unaffected.
+        let c5Files = try await Git.commitFiles([c5], in: root)
+        XCTAssertEqual(c5Files.map(\.path), ["c.txt"])
+    }
+
+    @MainActor
+    func testMultiCommitFileDiffCoversCumulativeChangesAndEdgeCases() async throws {
+        let commits = try await Git.log(in: root, skip: 0, limit: 20, query: "", allBranches: false)
+        let c4 = commits[1], c3 = commits[2], c2 = commits[3], c1 = commits[4]
+        let project = Project(url: root)
+        project.commits = commits
+
+        let span34 = try await Git.commitFiles([c4, c3], in: root)
+
+        // Modified file across [c4, c3]: c2 ("one\ntwo\n") -> c4 ("one\ntwo\nthree\n")
+        let modChange = try XCTUnwrap(span34.first { $0.path == "a.txt" })
+        let modReq = try XCTUnwrap(project.request(for: modChange, in: [c4, c3], ignoreWhitespace: false))
+        XCTAssertEqual(modReq.source, .commit(hash: c4.hash, parent: c2.hash))
+        let modDoc = await DiffLoader.load(modReq)
+        XCTAssertEqual(modDoc.left.lines, ["one", "two"])
+        XCTAssertEqual(modDoc.right.lines, ["one", "two", "three"])
+        XCTAssertEqual(modDoc.leftTitle, c2.shortHash)
+        XCTAssertEqual(modDoc.rightTitle, c4.shortHash)
+
+        // Renamed + modified file across [c4, c3]: b.txt at c2 -> b2.txt at c4
+        let renChange = try XCTUnwrap(span34.first { $0.path == "b2.txt" })
+        let renReq = try XCTUnwrap(project.request(for: renChange, in: [c4, c3], ignoreWhitespace: false))
+        let renDoc = await DiffLoader.load(renReq)
+        XCTAssertEqual(renDoc.left.lines, ["b1"])
+        XCTAssertEqual(renDoc.right.lines, ["b1", "b2"])
+
+        // Added file across [c4, c3]: left empty, right at c4
+        let addChange = try XCTUnwrap(span34.first { $0.path == "c.txt" })
+        let addReq = try XCTUnwrap(project.request(for: addChange, in: [c4, c3], ignoreWhitespace: false))
+        let addDoc = await DiffLoader.load(addReq)
+        XCTAssertEqual(addDoc.left.lines, [])
+        XCTAssertEqual(addDoc.right.lines, ["c1"])
+
+        // Deleted file across [c4, c3]: left at c2, right empty
+        let delChange = try XCTUnwrap(span34.first { $0.path == "temp.txt" })
+        let delReq = try XCTUnwrap(project.request(for: delChange, in: [c4, c3], ignoreWhitespace: false))
+        let delDoc = await DiffLoader.load(delReq)
+        XCTAssertEqual(delDoc.left.lines, ["t1"])
+        XCTAssertEqual(delDoc.right.lines, [])
+
+        // Root commit as oldest [c2, c1]: parent is nil, left empty with Empty title, right at c2
+        let rootSpan = try await Git.commitFiles([c2, c1], in: root)
+        let rootMod = try XCTUnwrap(rootSpan.first { $0.path == "a.txt" })
+        let rootReq = try XCTUnwrap(project.request(for: rootMod, in: [c2, c1], ignoreWhitespace: false))
+        XCTAssertEqual(rootReq.source, .commit(hash: c2.hash, parent: nil))
+        let rootDoc = await DiffLoader.load(rootReq)
+        XCTAssertEqual(rootDoc.left.lines, [])
+        XCTAssertEqual(rootDoc.right.lines, ["one", "two"])
+        XCTAssertEqual(rootDoc.leftTitle, L("Empty", "空"))
+        XCTAssertEqual(rootDoc.rightTitle, c2.shortHash)
+    }
+
+    @MainActor
+    func testProjectAndStoreUpdateCommitFilesAndViewerForMultiSelection() async throws {
+        let commits = try await Git.log(in: root, skip: 0, limit: 20, query: "", allBranches: false)
+        let c5 = commits[0], c4 = commits[1], c3 = commits[2], c2 = commits[3]
+
+        let store = AppStore.shared
+        let prevProjects = store.projects
+        let prevSelectedProjectID = store.selectedProjectID
+        let prevRequest = store.viewer.request
+        defer {
+            store.projects = prevProjects
+            store.selectedProjectID = prevSelectedProjectID
+            if let prevRequest {
+                store.viewer.open(prevRequest)
+            } else {
+                store.viewer.clear()
+            }
+        }
+
+        let project = Project(url: root)
+        project.commits = commits
+        project.tab = .log
+        store.projects = [project]
+        store.selectedProjectID = project.id
+
+        // Start with single commit c4 and pick a.txt.
+        project.selectedCommitID = c4.id
+        await loadCommitAndWait(project, store: store)
+        XCTAssertEqual(project.commitFiles.map(\.path), ["a.txt", "c.txt", "temp.txt"])
+        project.selectedCommitFileID = ChangeRow.fileID("a.txt")
+
+        // Extend to multi-selection [c4, c3]: a.txt remains present, so selection is preserved and viewer points to c2..c4.
+        project.selectedCommitID = c3.id
+        project.selectedCommitIDs = [c4.id, c3.id]
+        XCTAssertEqual(project.selectedCommits.map(\.id), [c4.id, c3.id])
+        await loadCommitAndWait(project, store: store)
+        XCTAssertEqual(project.commitFiles.map(\.path), ["a.txt", "b2.txt", "c.txt", "keep.txt", "temp.txt"])
+        XCTAssertEqual(project.selectedCommitFileID, ChangeRow.fileID("a.txt"))
+        XCTAssertEqual(store.viewer.request?.path, "a.txt")
+        XCTAssertEqual(store.viewer.request?.source, .commit(hash: c4.hash, parent: c2.hash))
+
+        // Switch to single commit c5 (only touches c.txt): stale a.txt selection falls back to c.txt.
+        project.selectedCommitID = c5.id
+        XCTAssertEqual(project.selectedCommitIDs, [c5.id])
+        await loadCommitAndWait(project, store: store)
+        XCTAssertEqual(project.commitFiles.map(\.path), ["c.txt"])
+        XCTAssertEqual(project.selectedCommitFileID, ChangeRow.fileID("c.txt"))
+        XCTAssertEqual(store.viewer.request?.source, .commit(hash: c5.hash, parent: c4.hash))
+
+        // Rapid selection change: start [c4, c3], immediately override with [c5] before first finishes.
+        project.selectedCommitID = c3.id
+        project.selectedCommitIDs = [c4.id, c3.id]
+        store.commitSelectionChanged(project)
+        project.selectedCommitID = c5.id
+        await loadCommitAndWait(project, store: store)
+        XCTAssertEqual(project.commitFiles.map(\.path), ["c.txt"])
+        XCTAssertEqual(store.viewer.request?.source, .commit(hash: c5.hash, parent: c4.hash))
+    }
+
+    @MainActor
+    private func loadCommitAndWait(_ project: Project, store: AppStore) async {
+        await withCheckedContinuation { continuation in
+            project.loadSelectedCommit {
+                store.syncViewer()
+                continuation.resume()
+            }
+        }
+    }
+}
