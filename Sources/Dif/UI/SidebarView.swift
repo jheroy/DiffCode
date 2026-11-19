@@ -237,6 +237,9 @@ private struct ProjectRow: View {
                 BranchLabel(project: project)
             }
             Spacer(minLength: 4)
+            if hovering, !project.needsAccess, !store.gitMissing {
+                RowRemoteActions(project: project)
+            }
             if store.terminals.hasSessions(project) {
                 // A terminal is open here; orange once it rings for attention (an agent waiting on you).
                 let waiting = store.terminals.needsAttention(project)
@@ -273,6 +276,11 @@ private struct ProjectRow: View {
                                              "折叠起来的项目里有 \(changes - project.changes.count) 处改动")
               : (project.worktreeOf != nil ? L("Work tree", "工作树") + " · " + project.url.path : project.url.path))
         .contextMenu {
+            if !project.needsAccess, !store.gitMissing {
+                Button(L("New Branch…", "新建分支…")) { store.newBranch(in: project) }
+                Button(L("New Worktree…", "新建工作树…")) { store.presentNewWorktree(for: project) }
+                Divider()
+            }
             Button(L("Reveal in Finder", "在 Finder 中显示")) { NSWorkspace.shared.activateFileViewerSelecting([project.url]) }
             Button(L("Copy Path", "复制路径")) {
                 NSPasteboard.general.clearContents()
@@ -289,10 +297,85 @@ private struct ProjectRow: View {
                 Button(L("Move Down", "下移")) { store.move(project, by: 1) }.disabled(!store.canMove(project, by: 1))
                 Divider()
             }
+            if project.worktreeOf != nil, !project.needsAccess, !store.gitMissing {
+                Button(L("Delete Worktree…", "删除工作树（移除磁盘目录）…"), role: .destructive) {
+                    store.confirmDeleteWorktree(project)
+                }
+            }
             if !project.isDerived {
                 Button(L("Remove from \(appName)", "从 \(appName) 中移除"), role: .destructive) { store.remove(project) }
             }
         }
+    }
+}
+
+/// Compact Pull / Push buttons shown on hover in a project or work tree sidebar row.
+private struct RowRemoteActions: View {
+    let project: Project
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        HStack(spacing: 2) {
+            if let activity = project.activity {
+                ProgressView()
+                    .controlSize(.mini)
+                    .scaleEffect(0.65)
+                    .frame(width: UI.s(18), height: UI.s(18))
+                    .help(activity)
+            } else {
+                RowActionButton(symbol: "arrow.down", help: pullHelp, highlighted: project.status.behind > 0) {
+                    store.pull(in: project)
+                }
+                RowActionButton(symbol: "arrow.up", help: pushHelp, highlighted: project.status.ahead > 0) {
+                    store.push(in: project)
+                }
+            }
+        }
+    }
+
+    private var pullHelp: String {
+        let behind = project.status.behind
+        if let upstream = project.status.upstream {
+            return behind > 0
+                ? L("Pull \(behind) \(behind == 1 ? "commit" : "commits") from \(upstream)", "从 \(upstream) 拉取 \(behind) 个提交")
+                : L("Pull from \(upstream)", "从 \(upstream) 拉取")
+        }
+        return behind > 0 ? L("Pull (\(behind) behind)", "拉取（落后 \(behind) 个提交）") : L("Pull", "拉取")
+    }
+
+    private var pushHelp: String {
+        let ahead = project.status.ahead
+        if let upstream = project.status.upstream {
+            return ahead > 0
+                ? L("Push \(ahead) \(ahead == 1 ? "commit" : "commits") to \(upstream)", "推送 \(ahead) 个提交到 \(upstream)")
+                : L("Push to \(upstream)", "推送到 \(upstream)")
+        }
+        return ahead > 0 ? L("Push (\(ahead) ahead)", "推送（领先 \(ahead) 个提交）") : L("Push", "推送")
+    }
+}
+
+private struct RowActionButton: View {
+    var symbol: String
+    var help: String
+    var highlighted = false
+    var action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.ui(size: 10.5, weight: .semibold))
+                .foregroundStyle(highlighted ? Color.difAccent : (hovering ? Color.difText : Color.difText2))
+                .frame(width: UI.s(20), height: UI.s(20))
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(hovering ? Color.difText.opacity(0.12) : Color.clear)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help(help)
     }
 }
 
