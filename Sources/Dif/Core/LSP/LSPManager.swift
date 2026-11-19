@@ -141,11 +141,13 @@ actor LSPManager {
         guard !Task.isCancelled, isEffectivelyEnabled, servers[key] != nil else { return }
 
         // If already open on the same server, send didChange (or close+reopen if language changed)
-        // because LSP servers such as gopls reject duplicate didOpen notifications.
+        // because LSP servers such as gopls reject duplicate didOpen notifications and ignore
+        // didChange notifications whose version is <= the last seen version.
         if let existingKey = documentToServer[normalizedURI], existingKey == key,
            let existing = servers[key]?.openDocuments[normalizedURI] {
             if existing.languageID == languageId {
-                await didChange(uri: normalizedURI, version: version, text: text)
+                let monotonicVersion = max(version, existing.version + 1)
+                await didChange(uri: normalizedURI, version: monotonicVersion, text: text)
                 return
             } else {
                 await didClose(uri: normalizedURI)
@@ -196,18 +198,45 @@ actor LSPManager {
     }
 
     /// Sends a full-document `textDocument/didChange` notification for an open document.
-    func didChange(uri: String, version: Int, text: String) async {
+    /// If the document is not currently open (e.g. server restarted or an earlier `didOpen` was skipped),
+    /// automatically opens it with `text` instead of dropping the update.
+    func didChange(
+        uri: String,
+        version: Int,
+        text: String,
+        languageId: String? = nil,
+        workspaceRoot: URL? = nil
+    ) async {
         guard isEffectivelyEnabled else { return }
         let normalizedURI = LSPURI.normalize(uri)
         guard let key = documentToServer[normalizedURI],
-              let server = servers[key] else { return }
+              let server = servers[key] else {
+            if let fileURL = LSPURI.fileURL(from: normalizedURI) {
+                let resolvedLangID = languageId ?? LSPServerRegistry.languageID(for: fileURL, language: nil)
+                await didOpen(
+                    uri: normalizedURI,
+                    languageId: resolvedLangID,
+                    version: max(1, version),
+                    text: text,
+                    workspaceRoot: workspaceRoot
+                )
+            }
+            return
+        }
 
         guard server.capabilities.textDocumentSync != .none else { return }
+
+        let effectiveVersion: Int
+        if let existing = server.openDocuments[normalizedURI] {
+            effectiveVersion = max(version, existing.version + 1)
+        } else {
+            effectiveVersion = max(1, version)
+        }
 
         let params: JSONValue = .object([
             "textDocument": .object([
                 "uri": .string(normalizedURI),
-                "version": .int(version),
+                "version": .int(effectiveVersion),
             ]),
             "contentChanges": .array([
                 .object(["text": .string(text)]),
@@ -216,7 +245,7 @@ actor LSPManager {
 
         do {
             try await server.transport.notify(method: "textDocument/didChange", params: params)
-            servers[key]?.openDocuments[normalizedURI]?.version = version
+            servers[key]?.openDocuments[normalizedURI]?.version = effectiveVersion
             servers[key]?.lastActivity = .now
         } catch {
             // Ignore write failure on dying transport.
@@ -224,16 +253,38 @@ actor LSPManager {
     }
 
     /// Convenience `fileURL` overload for `didChange`.
-    func didChange(fileURL: URL, version: Int, text: String) async {
-        await didChange(uri: LSPURI.uri(from: fileURL), version: version, text: text)
+    func didChange(
+        fileURL: URL,
+        version: Int,
+        text: String,
+        language: LanguageSpec? = nil,
+        repoRoot: URL? = nil
+    ) async {
+        let langID = language.map { LSPServerRegistry.languageID(for: fileURL, language: $0) }
+        await didChange(
+            uri: LSPURI.uri(from: fileURL),
+            version: version,
+            text: text,
+            languageId: langID,
+            workspaceRoot: repoRoot
+        )
     }
 
-    /// Sends a `textDocument/didSave` notification for an open document.
-    func didSave(uri: String, text: String? = nil) async {
+    /// Sends a `textDocument/didSave` notification for an open document, auto-reopening it first if needed.
+    func didSave(
+        uri: String,
+        text: String? = nil,
+        language: LanguageSpec? = nil,
+        workspaceRoot: URL? = nil
+    ) async {
         guard isEffectivelyEnabled else { return }
         let normalizedURI = LSPURI.normalize(uri)
-        guard let key = documentToServer[normalizedURI],
-              let server = servers[key] else { return }
+        guard let (key, server) = await ensureDocumentOpen(
+            normalizedURI: normalizedURI,
+            text: text,
+            language: language,
+            workspaceRoot: workspaceRoot
+        ) else { return }
 
         var payload: [String: JSONValue] = [
             "textDocument": .object(["uri": .string(normalizedURI)]),
@@ -251,8 +302,13 @@ actor LSPManager {
     }
 
     /// Convenience `fileURL` overload for `didSave`.
-    func didSave(fileURL: URL, text: String? = nil) async {
-        await didSave(uri: LSPURI.uri(from: fileURL), text: text)
+    func didSave(
+        fileURL: URL,
+        text: String? = nil,
+        language: LanguageSpec? = nil,
+        repoRoot: URL? = nil
+    ) async {
+        await didSave(uri: LSPURI.uri(from: fileURL), text: text, language: language, workspaceRoot: repoRoot)
     }
 
     /// Sends `textDocument/didClose` and removes document tracking.
@@ -312,12 +368,63 @@ actor LSPManager {
         await semanticTokens(uri: LSPURI.uri(from: fileURL))
     }
 
-    /// Resolves `textDocument/definition` at a 0-based `(line, character)` UTF-16 position.
-    func definition(uri: String, line: Int, character: Int) async -> [LSPLocation] {
-        guard isEffectivelyEnabled else { return [] }
-        let normalizedURI = LSPURI.normalize(uri)
+    /// Ensures `normalizedURI` has an open document session on a running LSP server, auto-reopening it
+    /// from `text` or disk if the server restarted, was idle-reaped, or an earlier `didOpen` never ran.
+    private func ensureDocumentOpen(
+        normalizedURI: String,
+        text: String?,
+        language: LanguageSpec?,
+        workspaceRoot: URL?
+    ) async -> (key: ServerKey, server: ServerInstance)? {
+        if let key = documentToServer[normalizedURI],
+           let server = servers[key] {
+            if await server.transport.isRunning {
+                return (key, server)
+            } else {
+                evictServer(key: key)
+            }
+        }
+        guard let fileURL = LSPURI.fileURL(from: normalizedURI) else { return nil }
+        let resolvedText: String
+        if let text {
+            resolvedText = text
+        } else if let data = try? Data(contentsOf: fileURL) {
+            resolvedText = TextCodec.decode(data)
+        } else {
+            return nil
+        }
+        let langID = LSPServerRegistry.languageID(for: fileURL, language: language)
+        await didOpen(
+            uri: normalizedURI,
+            languageId: langID,
+            version: 1,
+            text: resolvedText,
+            workspaceRoot: workspaceRoot
+        )
         guard let key = documentToServer[normalizedURI],
               let server = servers[key] else {
+            return nil
+        }
+        return (key, server)
+    }
+
+    /// Resolves `textDocument/definition` at a 0-based `(line, character)` UTF-16 position.
+    func definition(
+        uri: String,
+        line: Int,
+        character: Int,
+        text: String? = nil,
+        language: LanguageSpec? = nil,
+        workspaceRoot: URL? = nil
+    ) async -> [LSPLocation] {
+        guard isEffectivelyEnabled else { return [] }
+        let normalizedURI = LSPURI.normalize(uri)
+        guard let (key, server) = await ensureDocumentOpen(
+            normalizedURI: normalizedURI,
+            text: text,
+            language: language,
+            workspaceRoot: workspaceRoot
+        ) else {
             return []
         }
 
@@ -344,8 +451,22 @@ actor LSPManager {
     }
 
     /// Convenience `fileURL` overload for `definition`.
-    func definition(fileURL: URL, line: Int, character: Int) async -> [LSPLocation] {
-        await definition(uri: LSPURI.uri(from: fileURL), line: line, character: character)
+    func definition(
+        fileURL: URL,
+        line: Int,
+        character: Int,
+        text: String? = nil,
+        language: LanguageSpec? = nil,
+        repoRoot: URL? = nil
+    ) async -> [LSPLocation] {
+        await definition(
+            uri: LSPURI.uri(from: fileURL),
+            line: line,
+            character: character,
+            text: text,
+            language: language,
+            workspaceRoot: repoRoot
+        )
     }
 
     /// Resolves `textDocument/references` at a 0-based `(line, character)` UTF-16 position.
@@ -353,12 +474,19 @@ actor LSPManager {
         uri: String,
         line: Int,
         character: Int,
-        includeDeclaration: Bool = true
+        includeDeclaration: Bool = true,
+        text: String? = nil,
+        language: LanguageSpec? = nil,
+        workspaceRoot: URL? = nil
     ) async -> [LSPLocation] {
         guard isEffectivelyEnabled else { return [] }
         let normalizedURI = LSPURI.normalize(uri)
-        guard let key = documentToServer[normalizedURI],
-              let server = servers[key] else {
+        guard let (key, server) = await ensureDocumentOpen(
+            normalizedURI: normalizedURI,
+            text: text,
+            language: language,
+            workspaceRoot: workspaceRoot
+        ) else {
             return []
         }
 
@@ -393,13 +521,19 @@ actor LSPManager {
         fileURL: URL,
         line: Int,
         character: Int,
-        includeDeclaration: Bool = true
+        includeDeclaration: Bool = true,
+        text: String? = nil,
+        language: LanguageSpec? = nil,
+        repoRoot: URL? = nil
     ) async -> [LSPLocation] {
         await references(
             uri: LSPURI.uri(from: fileURL),
             line: line,
             character: character,
-            includeDeclaration: includeDeclaration
+            includeDeclaration: includeDeclaration,
+            text: text,
+            language: language,
+            workspaceRoot: repoRoot
         )
     }
 

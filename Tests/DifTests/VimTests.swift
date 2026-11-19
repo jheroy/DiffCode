@@ -790,4 +790,283 @@ final class VimTests: XCTestCase {
         XCTAssertEqual(canvas.selection?.head.row, 1)
         XCTAssertEqual(reported.last?.1, 1)
     }
+
+    // MARK: 8. Vim Jump-List (<C-o> / <C-i>) Regression Tests
+
+    func testVimEngineJumpMotionsEmitJumpOriginWhileStepMotionsDoNot() {
+        let code = """
+        package main
+
+        func first() {
+            alpha := 1
+            beta := 2
+            gamma := 3
+        }
+
+        func second() {
+            if (true) {
+                delta := 4
+            }
+        }
+
+        func third() {
+            omega := 5
+        }
+        """
+        let h = VimHarness(code, cursor: p(0, 0))
+
+        // Step-by-step motions must NOT emit jumpOrigin: hjkl, w/b/e, 0/^/$, f/F/t/T
+        for key in ["j", "j", "l", "w", "b", "e", "$", "0", "^", "f(", "k", "h"] {
+            var lastResult = VimResult.ignored
+            for ch in key {
+                lastResult = h.send(VimKey(String(ch)))
+            }
+            XCTAssertNil(lastResult.jumpOrigin, "Step motion '\(key)' must not push onto jump list")
+        }
+
+        // G pushes origin
+        h.cursor = p(1, 0)
+        let gEnd = h.send(VimKey("G"))
+        XCTAssertEqual(gEnd.jumpOrigin, p(1, 0))
+        XCTAssertEqual(h.cursor.row, 16)
+
+        // gg pushes origin
+        let gFirst = h.send(VimKey("g"))
+        XCTAssertNil(gFirst.jumpOrigin)
+        let ggRes = h.send(VimKey("g"))
+        XCTAssertEqual(ggRes.jumpOrigin, p(16, 0))
+        XCTAssertEqual(h.cursor.row, 0)
+
+        // <N>G pushes origin
+        h.send(VimKey("1"))
+        h.send(VimKey("0"))
+        let tenG = h.send(VimKey("G"))
+        XCTAssertEqual(tenG.jumpOrigin, p(0, 0))
+        XCTAssertEqual(h.cursor.row, 9)
+
+        // [[ and ]] push origin
+        h.send(VimKey("]"))
+        let nextFn = h.send(VimKey("]"))
+        XCTAssertEqual(nextFn.jumpOrigin?.row, 9)
+        XCTAssertEqual(h.cursor.row, 14)
+
+        h.send(VimKey("["))
+        let prevFn = h.send(VimKey("["))
+        XCTAssertEqual(prevFn.jumpOrigin?.row, 14)
+        XCTAssertEqual(h.cursor.row, 8)
+
+        // % across lines pushes origin
+        h.cursor = p(2, 13) // '{' on `func first() {`
+        let matchRes = h.send(VimKey("%"))
+        XCTAssertEqual(matchRes.jumpOrigin, p(2, 13))
+        XCTAssertEqual(h.cursor.row, 6) // '}'
+
+        // { and } across lines push origin
+        h.cursor = p(4, 4) // inside `func first()`
+        let openBrace = h.send(VimKey("{"))
+        XCTAssertEqual(openBrace.jumpOrigin, p(4, 4))
+        XCTAssertEqual(h.cursor.row, 2)
+
+        // :<N> pushes origin
+        h.cursor = p(2, 5)
+        h.type(":15")
+        let cmdRes = h.send(.enter)
+        XCTAssertEqual(cmdRes.jumpOrigin, p(2, 5))
+        XCTAssertEqual(h.cursor.row, 14)
+
+        // <C-u> / <C-d> push origin
+        let halfUp = h.send(.ctrl("u"))
+        XCTAssertEqual(halfUp.jumpOrigin?.row, 14)
+        XCTAssertLessThan(h.cursor.row, 14)
+    }
+
+    @MainActor
+    func testWithinFileVimJumpListWalksBackAndForwardWithoutLosingEdits() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dif-vim-jumplist-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let fileA = dir.appendingPathComponent("sample.go")
+        let content = (1...60).map { i in
+            if i == 10 { return "func alpha() { targetWord() }" }
+            if i == 35 { return "func beta()  { targetWord() }" }
+            if i == 55 { return "func gamma() { return }" }
+            return "// line \(i)"
+        }.joined(separator: "\n") + "\n"
+        try content.write(to: fileA, atomically: true, encoding: .utf8)
+
+        let store = AppStore.shared
+        let prevReq = store.viewer.request
+        let prevDoc = store.viewer.document
+        let prevContainer = store.viewer.container
+        let prevHistory = store.jumpHistory
+        let prevExternal = store.externalRequest
+        let prevProjects = store.projects
+        let prevSelectedID = store.selectedProjectID
+        defer {
+            store.viewer.loadTask?.cancel()
+            store.viewer.clear()
+            store.viewer.request = prevReq
+            store.viewer.document = prevDoc
+            store.viewer.container = prevContainer
+            store.jumpHistory = prevHistory
+            store.externalRequest = prevExternal
+            store.projects = prevProjects
+            store.selectedProjectID = prevSelectedID
+        }
+
+        let project = Project(url: dir)
+        store.projects = [project]
+        store.selectedProjectID = project.id
+        store.jumpHistory.clear()
+
+        let container = CodeScrollContainer(frame: NSRect(x: 0, y: 0, width: 800, height: 400))
+        container.layoutSubtreeIfNeeded()
+        store.viewer.attach(container)
+        store.viewer.vimModeEnabled = true
+
+        store.openFile(in: project, path: "sample.go", line: 10, column: 15)
+        await store.viewer.loadTask?.value
+        let loadedDoc = try XCTUnwrap(store.viewer.document)
+        XCTAssertEqual(container.canvas.activeCaretPosition(), p(9, 15))
+
+        // Step motions (j/l/w) must NOT push onto jumpHistory
+        XCTAssertTrue(container.canvas.handleVimKey(VimKey("l")))
+        XCTAssertTrue(container.canvas.handleVimKey(VimKey("h")))
+        XCTAssertFalse(store.jumpHistory.canGoBack)
+
+        // `*` on `targetWord` at line 10 col 15 -> jumps to line 35 col 15 and records line 10 col 15
+        XCTAssertTrue(container.canvas.handleVimKey(VimKey("*")))
+        XCTAssertEqual(container.canvas.activeCaretPosition(), p(34, 15))
+        XCTAssertEqual(store.jumpHistory.backStack.count, 1)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.line, 10)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.column, 15)
+
+        // `G` jumps to last line (60) and records line 35 col 15
+        XCTAssertTrue(container.canvas.handleVimKey(VimKey("G")))
+        XCTAssertEqual(container.canvas.activeCaretPosition()?.row, 59)
+        XCTAssertEqual(store.jumpHistory.backStack.count, 2)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.line, 35)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.column, 15)
+
+        // `<C-o>` returns to line 35 col 15 in-place (same DiffDocument instance, no reload!)
+        XCTAssertTrue(container.canvas.handleVimKey(.ctrl("o")))
+        XCTAssertTrue(store.viewer.document === loadedDoc, "Same-file <C-o> must not reload document from disk")
+        XCTAssertEqual(container.canvas.activeCaretPosition(), p(34, 15))
+        XCTAssertTrue(store.jumpHistory.canGoForward)
+
+        // `<C-o>` again returns to line 10 col 15
+        XCTAssertTrue(container.canvas.handleVimKey(.ctrl("o")))
+        XCTAssertTrue(store.viewer.document === loadedDoc)
+        XCTAssertEqual(container.canvas.activeCaretPosition(), p(9, 15))
+        XCTAssertFalse(store.jumpHistory.canGoBack)
+        XCTAssertEqual(store.jumpHistory.forwardStack.count, 2)
+
+        // `<C-i>` walks forward to line 35 col 15 without corrupting forwardStack
+        XCTAssertTrue(container.canvas.handleVimKey(.ctrl("i")))
+        XCTAssertEqual(container.canvas.activeCaretPosition(), p(34, 15))
+        XCTAssertEqual(store.jumpHistory.forwardStack.count, 1)
+
+        // `<C-i>` walks forward to line 60
+        XCTAssertTrue(container.canvas.handleVimKey(.ctrl("i")))
+        XCTAssertEqual(container.canvas.activeCaretPosition()?.row, 59)
+        XCTAssertFalse(store.jumpHistory.canGoForward)
+    }
+
+    @MainActor
+    func testCrossFileAndWithinFileJumpHistoryRoundTrip() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dif-cross-file-jumplist-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let fileA = dir.appendingPathComponent("fileA.go")
+        let fileB = dir.appendingPathComponent("fileB.go")
+        let linesA = (1...30).map { "    // fileA line \($0)" }.joined(separator: "\n") + "\n"
+        let linesB = (1...120).map { "    // fileB line \($0)" }.joined(separator: "\n") + "\n"
+        try linesA.write(to: fileA, atomically: true, encoding: .utf8)
+        try linesB.write(to: fileB, atomically: true, encoding: .utf8)
+
+        let canonicalA = LSPURI.canonicalFileURL(fileA)
+        let canonicalB = LSPURI.canonicalFileURL(fileB)
+
+        let store = AppStore.shared
+        let prevReq = store.viewer.request
+        let prevDoc = store.viewer.document
+        let prevContainer = store.viewer.container
+        let prevHistory = store.jumpHistory
+        let prevExternal = store.externalRequest
+        let prevProjects = store.projects
+        let prevSelectedID = store.selectedProjectID
+        defer {
+            store.viewer.loadTask?.cancel()
+            store.viewer.clear()
+            store.viewer.request = prevReq
+            store.viewer.document = prevDoc
+            store.viewer.container = prevContainer
+            store.jumpHistory = prevHistory
+            store.externalRequest = prevExternal
+            store.projects = prevProjects
+            store.selectedProjectID = prevSelectedID
+        }
+
+        let project = Project(url: dir)
+        store.projects = [project]
+        store.selectedProjectID = project.id
+        store.jumpHistory.clear()
+
+        let container = CodeScrollContainer(frame: NSRect(x: 0, y: 0, width: 800, height: 400))
+        container.layoutSubtreeIfNeeded()
+        store.viewer.attach(container)
+        store.viewer.vimModeEnabled = true
+
+        // 1. Open fileA at line 10, col 7
+        store.openFile(in: project, path: "fileA.go", line: 10, column: 7)
+        await store.viewer.loadTask?.value
+        XCTAssertEqual(store.viewer.request.map { LSPURI.canonicalFileURL($0.fileURL) }, canonicalA)
+        XCTAssertEqual(container.canvas.activeCaretPosition(), p(9, 7))
+
+        // 2. Switch to fileB at line 42 (simulating Quick Open / Find in Files / sidebar click)
+        store.openFile(in: project, path: "fileB.go", line: 42, column: 4)
+        await store.viewer.loadTask?.value
+        XCTAssertEqual(store.viewer.request.map { LSPURI.canonicalFileURL($0.fileURL) }, canonicalB)
+        XCTAssertEqual(container.canvas.activeCaretPosition(), p(41, 4))
+        XCTAssertEqual(store.jumpHistory.backStack.count, 1)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.fileURL, canonicalA)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.line, 10)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.column, 7)
+
+        // 3. In fileB, jump to line 120 via `G`
+        XCTAssertTrue(container.canvas.handleVimKey(VimKey("G")))
+        XCTAssertEqual(container.canvas.activeCaretPosition()?.row, 119)
+        XCTAssertEqual(store.jumpHistory.backStack.count, 2)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.fileURL, canonicalB)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.line, 42)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.column, 4)
+
+        // 4. `<C-o>` returns to fileB:42 col 4
+        XCTAssertTrue(container.canvas.handleVimKey(.ctrl("o")))
+        XCTAssertEqual(store.viewer.request.map { LSPURI.canonicalFileURL($0.fileURL) }, canonicalB)
+        XCTAssertEqual(container.canvas.activeCaretPosition(), p(41, 4))
+
+        // 5. `<C-o>` returns to fileA:10 col 7
+        XCTAssertTrue(container.canvas.handleVimKey(.ctrl("o")))
+        await store.viewer.loadTask?.value
+        XCTAssertEqual(store.viewer.request.map { LSPURI.canonicalFileURL($0.fileURL) }, canonicalA)
+        XCTAssertEqual(container.canvas.activeCaretPosition(), p(9, 7))
+        XCTAssertEqual(store.jumpHistory.forwardStack.count, 2)
+
+        // 6. `<C-i>` goes forward to fileB:42 col 4
+        XCTAssertTrue(container.canvas.handleVimKey(.ctrl("i")))
+        await store.viewer.loadTask?.value
+        XCTAssertEqual(store.viewer.request.map { LSPURI.canonicalFileURL($0.fileURL) }, canonicalB)
+        XCTAssertEqual(container.canvas.activeCaretPosition(), p(41, 4))
+
+        // 7. `<C-i>` goes forward to fileB:120
+        XCTAssertTrue(container.canvas.handleVimKey(.ctrl("i")))
+        XCTAssertEqual(store.viewer.request.map { LSPURI.canonicalFileURL($0.fileURL) }, canonicalB)
+        XCTAssertEqual(container.canvas.activeCaretPosition()?.row, 119)
+        XCTAssertFalse(store.jumpHistory.canGoForward)
+    }
 }

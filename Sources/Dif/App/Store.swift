@@ -67,9 +67,12 @@ final class AppStore {
     var commitFocusToken = 0
     @ObservationIgnored var commitFocusRequestedAt: CFTimeInterval = 0
 
-    // LSP navigation (see LSPNavigation.swift).
-    /// Back (`⌘[`) / Forward (`⌘]`) stack for definition jumps.
+    // LSP & Vim jump-list navigation (see LSPNavigation.swift).
+    /// Unified Vim/IDE Back (`<C-o>` / `⌘[`) / Forward (`<C-i>` / `⌘]`) jump history stack.
     var jumpHistory = JumpHistory()
+    /// True while replaying a jump via `navigateBack` / `navigateForward` (or `navigateToLSPLocation`)
+    /// so intermediate file switches never push duplicate origins or wipe the forward stack.
+    @ObservationIgnored var isNavigatingJumpHistory = false
     /// Active external read-only file request (sibling `go.work` repo, `$GOROOT`, `pkg/mod`…), cleared on normal navigation.
     var externalRequest: DiffRequest?
     @ObservationIgnored var definitionTask: Task<Void, Never>?
@@ -109,6 +112,10 @@ final class AppStore {
         viewer.onOpenAnnotation = { [weak self] entry in self?.openAnnotation(entry) }
         viewer.onGoToDefinition = { [weak self] line, col in self?.smartLSPNavigate(line: line, character: col) }
         viewer.onVimAction = { [weak self] action, line, col in self?.handleVimAction(action, line: line, column: col) }
+        viewer.onRecordJump = { [weak self] line, col in self?.recordJumpOrigin(line0Based: line, column: col) }
+        viewer.onWillSwitchFile = { [weak self] previousRequest, line, col in
+            self?.recordJumpOrigin(from: previousRequest, line0Based: line, column: col)
+        }
         quickOpen.store = self
         finder.store = self
         terminals.store = self
@@ -774,24 +781,24 @@ final class AppStore {
         return index >= 0 && index < files.count ? files[index] : nil
     }
 
-    /// Opens a file by path (from a search): as a diff when it has local changes, otherwise as a plain file.
-    func openFile(in project: Project, path: String, line: Int?) {
+    /// Opens a file by path (from a search or jump): as a diff when it has local changes, otherwise as a plain file.
+    func openFile(in project: Project, path: String, line: Int?, column: Int? = nil) {
         if selectedProjectID != project.id {
             selectedProjectID = project.id
             persistProjects()
         }
-        browse(path, in: project, line: line)
+        browse(path, in: project, line: line, column: column)
         follow(path, in: project)
     }
 
-    private func browse(_ path: String, in project: Project, line: Int?) {
+    private func browse(_ path: String, in project: Project, line: Int?, column: Int? = nil) {
         exitExternalFileMode()
         noteRecent(project, path)
         project.browsedPath = path
         viewer.setBaseStamp(project.status.headOID)
         markInChanges(path, in: project)
         let sameFile = viewer.request?.path == path && viewer.request?.root == project.url
-        viewer.open(worktreeRequest(for: path, in: project), line: line, preserveScroll: sameFile && line == nil)
+        viewer.open(worktreeRequest(for: path, in: project), line: line, column: column, preserveScroll: sameFile && line == nil)
     }
 
     func noteRecent(_ project: Project, _ path: String) {

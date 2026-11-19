@@ -1161,4 +1161,336 @@ final class LSPIntegrationTests: XCTestCase {
 
         await manager.shutdownAll()
     }
+
+    // MARK: - 5. LSP Lifecycle & Self-Healing Regression Tests
+
+    @MainActor
+    func testNotifySavedAndFlushDuringInFlightDidOpenNeverOrphansDocument() async throws {
+        let originalEdition = AppEnvironment.edition
+        AppEnvironment.edition = .direct
+        defer { AppEnvironment.edition = originalEdition }
+
+        let dir = try makeTempDir(prefix: "dif-lsp-cancel-open")
+        let repo = dir.appendingPathComponent("repo", isDirectory: true)
+        let fileA = repo.appendingPathComponent("main.go")
+        let fileB = repo.appendingPathComponent("target.go")
+        try writeFile(repo.appendingPathComponent("go.mod"), contents: "module example.com/repo\ngo 1.22\n")
+        try writeFile(fileA, contents: "package repo\nfunc main() { Target() }\n")
+        try writeFile(fileB, contents: "package repo\nfunc Target() {}\n")
+
+        let targetURI = LSPURI.uri(from: fileB)
+        let script = dir.appendingPathComponent("strict-open-lsp.py")
+        let source = """
+        #!/usr/bin/env python3
+        import json, sys, time
+
+        open_docs = {}
+
+        def read_msg():
+            headers = {}
+            while True:
+                line = sys.stdin.buffer.readline()
+                if not line:
+                    return None
+                if line in (b"\\r\\n", b"\\n"):
+                    break
+                k, _, v = line.decode("utf-8", "replace").partition(":")
+                headers[k.strip().lower()] = v.strip()
+            n = int(headers.get("content-length", "0"))
+            return json.loads(sys.stdin.buffer.read(n).decode("utf-8")) if n > 0 else None
+
+        def send_msg(obj):
+            raw = json.dumps(obj).encode("utf-8")
+            sys.stdout.buffer.write(f"Content-Length: {len(raw)}\\r\\n\\r\\n".encode("ascii") + raw)
+            sys.stdout.buffer.flush()
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            method = msg.get("method")
+            msg_id = msg.get("id")
+            params = msg.get("params") or {}
+            if method == "initialize":
+                time.sleep(0.08)
+                send_msg({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "capabilities": {
+                            "textDocumentSync": 1,
+                            "definitionProvider": True,
+                        }
+                    },
+                })
+            elif method == "textDocument/didOpen":
+                td = params.get("textDocument", {})
+                open_docs[td.get("uri", "")] = td.get("version", 1)
+            elif method == "textDocument/didChange":
+                td = params.get("textDocument", {})
+                uri = td.get("uri", "")
+                if uri in open_docs:
+                    open_docs[uri] = td.get("version", open_docs[uri])
+            elif method == "textDocument/didClose":
+                uri = params.get("textDocument", {}).get("uri", "")
+                open_docs.pop(uri, None)
+            elif method == "textDocument/definition":
+                uri = params.get("textDocument", {}).get("uri", "")
+                # Only resolve when the server actually received didOpen for this file (like gopls).
+                if uri in open_docs:
+                    send_msg({
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": [{
+                            "uri": "\(targetURI)",
+                            "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 11}},
+                        }],
+                    })
+                else:
+                    send_msg({"jsonrpc": "2.0", "id": msg_id, "result": []})
+            elif method == "shutdown":
+                send_msg({"jsonrpc": "2.0", "id": msg_id, "result": None})
+            elif method == "exit":
+                break
+        """
+        try writeFile(script, contents: source)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let server = LSPResolvedServer(
+            descriptor: LSPServerRegistry.go,
+            executablePath: "/usr/bin/python3",
+            arguments: [script.path],
+            environment: AppEnvironment.childEnvironment
+        )
+        let manager = LSPManager(isEnabled: true, serverOverrides: [LSPServerRegistry.go.id: server])
+        defer { Task { await manager.shutdownAll() } }
+
+        let viewer = ViewerModel()
+        viewer.settings = Settings.shared
+        viewer.lspManager = manager
+
+        let reqA = DiffRequest(root: repo, path: "main.go", oldPath: nil, kind: nil, source: .file)
+        let docA = await DiffLoader.load(reqA)
+        viewer.request = reqA
+        viewer.document = docA
+
+        // Start syncLSPForCurrentDocument (cold server start takes ~80ms) and immediately fire save + flush
+        // while didOpen is still in-flight! Previously this cancelled didOpen and permanently wedged fileA.
+        viewer.syncLSPForCurrentDocument()
+        viewer.scheduleLSPChange()
+        viewer.notifyLSPSaved()
+        viewer.scheduleLSPChange()
+        await viewer.flushLSPChangeIfNeeded()
+        await viewer.lspTask?.value
+
+        let uriA = LSPURI.uri(from: fileA)
+        let session = await manager.openSession(forURI: uriA)
+        XCTAssertNotNil(session, "notifyLSPSaved / flushLSPChangeIfNeeded during in-flight didOpen must never orphan the document")
+
+        let defs = await manager.definition(fileURL: fileA, line: 1, character: 15, language: .go, repoRoot: repo)
+        XCTAssertEqual(defs.count, 1)
+        XCTAssertEqual(defs.first?.fileURL.map { LSPURI.canonicalFileURL($0) }, fileB)
+
+        await manager.shutdownAll()
+    }
+
+    func testReopeningSameFileSendsStrictlyMonotonicDidChangeVersions() async throws {
+        let dir = try makeTempDir(prefix: "dif-lsp-monotonic-ver")
+        let repo = dir.appendingPathComponent("repo", isDirectory: true)
+        let fileA = repo.appendingPathComponent("main.go")
+        let logFile = dir.appendingPathComponent("versions.log")
+        try writeFile(repo.appendingPathComponent("go.mod"), contents: "module example.com/repo\ngo 1.22\n")
+        try writeFile(fileA, contents: "package repo\nfunc A() {}\n")
+
+        let script = dir.appendingPathComponent("version-log-lsp.py")
+        let source = """
+        #!/usr/bin/env python3
+        import json, sys
+
+        LOG_PATH = \(String(reflecting: logFile.path))
+
+        def log(line):
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\\n")
+
+        def read_msg():
+            headers = {}
+            while True:
+                line = sys.stdin.buffer.readline()
+                if not line:
+                    return None
+                if line in (b"\\r\\n", b"\\n"):
+                    break
+                k, _, v = line.decode("utf-8", "replace").partition(":")
+                headers[k.strip().lower()] = v.strip()
+            n = int(headers.get("content-length", "0"))
+            return json.loads(sys.stdin.buffer.read(n).decode("utf-8")) if n > 0 else None
+
+        def send_msg(obj):
+            raw = json.dumps(obj).encode("utf-8")
+            sys.stdout.buffer.write(f"Content-Length: {len(raw)}\\r\\n\\r\\n".encode("ascii") + raw)
+            sys.stdout.buffer.flush()
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            method = msg.get("method")
+            msg_id = msg.get("id")
+            params = msg.get("params") or {}
+            if method == "initialize":
+                send_msg({"jsonrpc": "2.0", "id": msg_id, "result": {"capabilities": {"textDocumentSync": 1}}})
+            elif method in ("textDocument/didOpen", "textDocument/didChange"):
+                td = params.get("textDocument", {})
+                log(f"{method}:{td.get('version')}")
+            elif method == "shutdown":
+                send_msg({"jsonrpc": "2.0", "id": msg_id, "result": None})
+            elif method == "exit":
+                break
+        """
+        try writeFile(script, contents: source)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let server = LSPResolvedServer(
+            descriptor: LSPServerRegistry.go,
+            executablePath: "/usr/bin/python3",
+            arguments: [script.path],
+            environment: AppEnvironment.childEnvironment
+        )
+        let manager = LSPManager(isEnabled: true, serverOverrides: [LSPServerRegistry.go.id: server])
+        defer { Task { await manager.shutdownAll() } }
+
+        // Initial open v1 -> edit v5 -> reopen same file with reset version=1 -> stale didChange version=2
+        _ = await manager.didOpen(fileURL: fileA, text: "package repo\nfunc A() {}\n", version: 1, language: .go, repoRoot: repo)
+        await manager.didChange(fileURL: fileA, version: 5, text: "package repo\nfunc B() {}\n", language: .go, repoRoot: repo)
+        _ = await manager.didOpen(fileURL: fileA, text: "package repo\nfunc C() {}\n", version: 1, language: .go, repoRoot: repo)
+        await manager.didChange(fileURL: fileA, version: 2, text: "package repo\nfunc D() {}\n", language: .go, repoRoot: repo)
+
+        let session = await manager.openSession(forURI: LSPURI.uri(from: fileA))
+        XCTAssertEqual(session?.version, 7)
+
+        await manager.shutdownAll()
+
+        let entries = try String(contentsOf: logFile, encoding: .utf8)
+            .split(separator: "\n")
+            .map(String.init)
+        XCTAssertEqual(entries, [
+            "textDocument/didOpen:1",
+            "textDocument/didChange:5",
+            "textDocument/didChange:6",
+            "textDocument/didChange:7",
+        ])
+    }
+
+    @MainActor
+    func testEnsureLSPDocumentSyncedSelfHealsAfterServerRestartOrClose() async throws {
+        let originalEdition = AppEnvironment.edition
+        AppEnvironment.edition = .direct
+        defer { AppEnvironment.edition = originalEdition }
+
+        let dir = try makeTempDir(prefix: "dif-lsp-self-heal")
+        let repo = dir.appendingPathComponent("repo", isDirectory: true)
+        let fileA = repo.appendingPathComponent("main.go")
+        let fileB = repo.appendingPathComponent("helper.go")
+        try writeFile(repo.appendingPathComponent("go.mod"), contents: "module example.com/repo\ngo 1.22\n")
+        try writeFile(fileA, contents: "package repo\nfunc main() { Helper() }\n")
+        try writeFile(fileB, contents: "package repo\nfunc Helper() {}\n")
+
+        let helperURI = LSPURI.uri(from: fileB)
+        let script = dir.appendingPathComponent("heal-lsp.py")
+        let source = """
+        #!/usr/bin/env python3
+        import json, sys
+
+        open_docs = set()
+
+        def read_msg():
+            headers = {}
+            while True:
+                line = sys.stdin.buffer.readline()
+                if not line:
+                    return None
+                if line in (b"\\r\\n", b"\\n"):
+                    break
+                k, _, v = line.decode("utf-8", "replace").partition(":")
+                headers[k.strip().lower()] = v.strip()
+            n = int(headers.get("content-length", "0"))
+            return json.loads(sys.stdin.buffer.read(n).decode("utf-8")) if n > 0 else None
+
+        def send_msg(obj):
+            raw = json.dumps(obj).encode("utf-8")
+            sys.stdout.buffer.write(f"Content-Length: {len(raw)}\\r\\n\\r\\n".encode("ascii") + raw)
+            sys.stdout.buffer.flush()
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            method = msg.get("method")
+            msg_id = msg.get("id")
+            params = msg.get("params") or {}
+            if method == "initialize":
+                send_msg({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {"capabilities": {"textDocumentSync": 1, "definitionProvider": True}},
+                })
+            elif method == "textDocument/didOpen":
+                open_docs.add(params.get("textDocument", {}).get("uri", ""))
+            elif method == "textDocument/didClose":
+                open_docs.discard(params.get("textDocument", {}).get("uri", ""))
+            elif method == "textDocument/definition":
+                uri = params.get("textDocument", {}).get("uri", "")
+                res = [{
+                    "uri": "\(helperURI)",
+                    "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 11}},
+                }] if uri in open_docs else []
+                send_msg({"jsonrpc": "2.0", "id": msg_id, "result": res})
+            elif method == "shutdown":
+                send_msg({"jsonrpc": "2.0", "id": msg_id, "result": None})
+            elif method == "exit":
+                break
+        """
+        try writeFile(script, contents: source)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let server = LSPResolvedServer(
+            descriptor: LSPServerRegistry.go,
+            executablePath: "/usr/bin/python3",
+            arguments: [script.path],
+            environment: AppEnvironment.childEnvironment
+        )
+        let manager = LSPManager(isEnabled: true, serverOverrides: [LSPServerRegistry.go.id: server])
+        defer { Task { await manager.shutdownAll() } }
+
+        let viewer = ViewerModel()
+        viewer.settings = Settings.shared
+        viewer.lspManager = manager
+
+        let reqA = DiffRequest(root: repo, path: "main.go", oldPath: nil, kind: nil, source: .file)
+        let docA = await DiffLoader.load(reqA)
+        viewer.request = reqA
+        viewer.document = docA
+        viewer.syncLSPForCurrentDocument()
+        await viewer.lspTask?.value
+
+        // Simulate idle-reap / server restart wiping LSPManager state while ViewerModel still holds fileA.
+        await manager.shutdownAll()
+        let closedSession = await manager.openSession(forURI: LSPURI.uri(from: fileA))
+        XCTAssertNil(closedSession)
+
+        // ensureLSPDocumentSynced must re-open fileA transparently.
+        let synced = await viewer.ensureLSPDocumentSynced()
+        XCTAssertNotNil(synced)
+        let healedSession = await manager.openSession(forURI: LSPURI.uri(from: fileA))
+        XCTAssertNotNil(healedSession)
+
+        // Direct definition query after didClose also self-heals via LSPManager.ensureDocumentOpen.
+        await manager.didClose(fileURL: fileA)
+        let defs = await manager.definition(fileURL: fileA, line: 1, character: 15, language: .go, repoRoot: repo)
+        XCTAssertEqual(defs.count, 1)
+        XCTAssertEqual(defs.first?.fileURL.map { LSPURI.canonicalFileURL($0) }, fileB)
+
+        await manager.shutdownAll()
+    }
 }

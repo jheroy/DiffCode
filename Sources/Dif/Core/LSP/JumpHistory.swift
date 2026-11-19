@@ -42,20 +42,32 @@ struct JumpHistory: Equatable, Sendable {
 
     /// Pops the previous location from the back stack and records `current` on the forward stack.
     mutating func back(from current: JumpLocation?) -> JumpLocation? {
-        guard let target = backStack.popLast() else { return nil }
-        if let current {
-            appendDeduped(Self.canonicalize(current), to: &forwardStack)
+        let normalizedCurrent = current.map(Self.canonicalize)
+        while let target = backStack.popLast() {
+            if let normalizedCurrent, Self.isSameSpot(target, normalizedCurrent) {
+                continue
+            }
+            if let normalizedCurrent {
+                appendDeduped(normalizedCurrent, to: &forwardStack)
+            }
+            return target
         }
-        return target
+        return nil
     }
 
     /// Pops the next location from the forward stack and records `current` on the back stack.
     mutating func forward(from current: JumpLocation?) -> JumpLocation? {
-        guard let target = forwardStack.popLast() else { return nil }
-        if let current {
-            appendDeduped(Self.canonicalize(current), to: &backStack)
+        let normalizedCurrent = current.map(Self.canonicalize)
+        while let target = forwardStack.popLast() {
+            if let normalizedCurrent, Self.isSameSpot(target, normalizedCurrent) {
+                continue
+            }
+            if let normalizedCurrent {
+                appendDeduped(normalizedCurrent, to: &backStack)
+            }
+            return target
         }
-        return target
+        return nil
     }
 
     mutating func clear() {

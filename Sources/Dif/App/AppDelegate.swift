@@ -292,7 +292,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             case .otherMouseDown:
                 self.shiftDownAt = nil
                 self.lastShiftTap = nil
-                if AppEnvironment.hasLSP, self.store.popup == nil {
+                if self.store.popup == nil {
                     if event.buttonNumber == 3 {
                         self.store.navigateBack()
                         return nil
@@ -335,7 +335,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         // Navigate Back / Forward secondary: ⌥⌘← / ⌥⌘→.
-        if AppEnvironment.hasLSP, store.popup == nil, mods == [.option, .command] {
+        if store.popup == nil, mods == [.option, .command] {
             if event.keyCode == 123 {
                 store.navigateBack()
                 return true
@@ -346,13 +346,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
 
-        // Navigate Back via ⌃O when not in a text field, terminal, or Vim-handled canvas.
-        if AppEnvironment.hasLSP, store.popup == nil, store.terminals.focusedID == nil,
-           mods == .control, chars == "o",
+        // Navigate Back / Forward via ⌃O / ⌃I when not in a text field, terminal, or Vim-handled canvas.
+        if store.popup == nil, store.terminals.focusedID == nil,
+           mods == .control,
            !(store.window?.firstResponder is NSTextView),
            !(store.settings.vimMode && store.window?.firstResponder === store.viewer.container?.canvas) {
-            store.navigateBack()
-            return true
+            if chars == "o" {
+                store.navigateBack()
+                return true
+            }
+            if chars == "i" {
+                store.navigateForward()
+                return true
+            }
         }
 
         // Next / Previous Diff via ⌘↓ / ⌘↑ when viewer is active (not in a popup, terminal, text field, or list).
