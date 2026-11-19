@@ -185,6 +185,7 @@ final class Project: Identifiable {
     @ObservationIgnored private var logTask: Task<Void, Never>?
     @ObservationIgnored private var commitTask: Task<Void, Never>?
     @ObservationIgnored private var commitLoadGeneration = 0
+    @ObservationIgnored private var loadedCommitSelectionIDs: Set<String> = []
     @ObservationIgnored private var compareTask: Task<Void, Never>?
     @ObservationIgnored private var fileIndex: [String]?
     @ObservationIgnored private var fileIndexStale = true
@@ -464,6 +465,8 @@ final class Project: Identifiable {
             commitFiles = []
             commitBody = ""
             selectedCommitFileID = nil
+            commitCollapsed.removeAll()
+            loadedCommitSelectionIDs = []
             completion()
             return
         }
@@ -479,6 +482,14 @@ final class Project: Identifiable {
             self.isLoadingCommit = false
             self.commitFiles = files
             self.commitBody = body
+            // Reset collapsed folders when switching to an unrelated commit selection; otherwise prune stale IDs.
+            let newSelectionSet = Set(selectionIDs)
+            if self.loadedCommitSelectionIDs.isDisjoint(with: newSelectionSet) {
+                self.commitCollapsed.removeAll()
+            } else {
+                self.commitCollapsed.formIntersection(Self.commitFolderIDs(for: files))
+            }
+            self.loadedCommitSelectionIDs = newSelectionSet
             // A file's history shows that file in each commit, under whatever name it had there.
             if let history = self.history {
                 let candidates: [String] = selected.count == 1
@@ -496,6 +507,27 @@ final class Project: Identifiable {
                 .first.map { ChangeRow.fileID($0.path) }
             completion()
         }
+    }
+
+    /// Directory row IDs for `files` when grouped by directory (`splitUnversioned: false`).
+    nonisolated static func commitFolderIDs(for files: [FileChange]) -> Set<String> {
+        let rows = ChangeTree.rows(changes: files, flat: false, collapsed: [], filter: "", splitUnversioned: false)
+        return Set(rows.compactMap { row -> String? in
+            if case .directory = row.kind { return row.id }
+            return nil
+        })
+    }
+
+    var commitFolderIDs: Set<String> {
+        Self.commitFolderIDs(for: commitFiles)
+    }
+
+    func collapseAllCommitFolders() {
+        commitCollapsed = commitFolderIDs
+    }
+
+    func expandAllCommitFolders() {
+        commitCollapsed.removeAll()
     }
 
     // MARK: Comparison

@@ -537,3 +537,149 @@ final class MultiCommitSelectionTests: XCTestCase {
         }
     }
 }
+
+/// Directory-tree grouping, collapse/expand, and flat-list switching for commit file lists.
+final class HistoryFileTreeTests: XCTestCase {
+    private let nestedFiles = [
+        FileChange(path: "a/b/c.go", oldPath: nil, kind: .modified),
+        FileChange(path: "a/d.go", oldPath: nil, kind: .added),
+        FileChange(path: "root.go", oldPath: nil, kind: .deleted),
+    ]
+
+    func testCommitFilesProduceDirectoryTreeWhenGroupedAndOnlyFilesWhenFlat() {
+        let treeRows = ChangeTree.rows(changes: nestedFiles, flat: false, collapsed: [], filter: "", splitUnversioned: false)
+        XCTAssertEqual(treeRows.map(\.id), [
+            "d:c:a",
+            "d:c:a/b",
+            ChangeRow.fileID("a/b/c.go"),
+            ChangeRow.fileID("a/d.go"),
+            ChangeRow.fileID("root.go"),
+        ])
+        XCTAssertEqual(treeRows.map(\.depth), [0, 1, 2, 1, 0])
+        if case .directory(let name, let count) = treeRows[0].kind {
+            XCTAssertEqual(name, "a")
+            XCTAssertEqual(count, 2)
+        } else {
+            XCTFail("Expected directory row for a")
+        }
+
+        let flatRows = ChangeTree.rows(changes: nestedFiles, flat: true, collapsed: [], filter: "", splitUnversioned: false)
+        XCTAssertEqual(flatRows.compactMap(\.file).map(\.path), ["a/b/c.go", "a/d.go", "root.go"])
+        XCTAssertFalse(flatRows.contains { $0.file == nil })
+    }
+
+    func testCollapsingDirectoryHidesDescendantsAndExpandingRestoresThem() {
+        let collapsedSubdir = ChangeTree.rows(changes: nestedFiles, flat: false, collapsed: ["d:c:a/b"], filter: "", splitUnversioned: false)
+        XCTAssertEqual(collapsedSubdir.map(\.id), [
+            "d:c:a",
+            "d:c:a/b",
+            ChangeRow.fileID("a/d.go"),
+            ChangeRow.fileID("root.go"),
+        ])
+        XCTAssertEqual(collapsedSubdir[1].isExpanded, false)
+
+        let collapsedParent = ChangeTree.rows(changes: nestedFiles, flat: false, collapsed: ["d:c:a"], filter: "", splitUnversioned: false)
+        XCTAssertEqual(collapsedParent.map(\.id), [
+            "d:c:a",
+            ChangeRow.fileID("root.go"),
+        ])
+        XCTAssertEqual(collapsedParent[0].isExpanded, false)
+
+        let restored = ChangeTree.rows(changes: nestedFiles, flat: false, collapsed: [], filter: "", splitUnversioned: false)
+        XCTAssertEqual(restored.compactMap(\.file).map(\.path), ["a/b/c.go", "a/d.go", "root.go"])
+    }
+
+    @MainActor
+    func testCollapseAllAndExpandAllHelpersAcrossNestedDirectories() {
+        let project = Project(url: URL(fileURLWithPath: "/tmp"))
+        project.commitFiles = nestedFiles
+
+        XCTAssertEqual(Project.commitFolderIDs(for: nestedFiles), ["d:c:a", "d:c:a/b"])
+        XCTAssertEqual(project.commitFolderIDs, ["d:c:a", "d:c:a/b"])
+
+        project.collapseAllCommitFolders()
+        XCTAssertEqual(project.commitCollapsed, ["d:c:a", "d:c:a/b"])
+        let collapsedRows = ChangeTree.rows(changes: project.commitFiles, flat: false, collapsed: project.commitCollapsed,
+                                            filter: "", splitUnversioned: false)
+        XCTAssertEqual(collapsedRows.map(\.id), ["d:c:a", ChangeRow.fileID("root.go")])
+
+        project.expandAllCommitFolders()
+        XCTAssertEqual(project.commitCollapsed, [])
+        let expandedRows = ChangeTree.rows(changes: project.commitFiles, flat: false, collapsed: project.commitCollapsed,
+                                           filter: "", splitUnversioned: false)
+        XCTAssertEqual(expandedRows.compactMap(\.file).map(\.path), ["a/b/c.go", "a/d.go", "root.go"])
+    }
+
+    @MainActor
+    func testMultiCommitRealRepoFilesGroupByDirectoryAndResetOrPruneCollapsedState() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("dif-history-tree-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        func git(_ arguments: String...) throws {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: Git.executable)
+            process.arguments = ["-c", "user.name=Alice", "-c", "user.email=alice@example.com", "-c", "commit.gpgsign=false"] + arguments
+            process.currentDirectoryURL = root
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0, "git \(arguments.joined(separator: " "))")
+        }
+
+        func write(_ path: String, _ text: String) throws {
+            let fileURL = root.appendingPathComponent(path)
+            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data(text.utf8).write(to: fileURL)
+        }
+
+        try git("init", "-q", "-b", "main")
+        try write("root.go", "package main\n")
+        try git("add", "-A")
+        try git("commit", "-q", "-m", "c1 init")
+
+        try write("a/d.go", "package a\n")
+        try git("add", "-A")
+        try git("commit", "-q", "-m", "c2 add a/d.go")
+
+        try write("a/b/c.go", "package b\n")
+        try git("add", "-A")
+        try git("commit", "-q", "-m", "c3 add a/b/c.go")
+
+        let commits = try await Git.log(in: root, skip: 0, limit: 10, query: "", allBranches: false)
+        XCTAssertEqual(commits.count, 3)
+        let c3 = commits[0], c2 = commits[1], c1 = commits[2]
+
+        let project = Project(url: root)
+        project.commits = commits
+
+        // Select c3 (single commit with compacted directory a/b).
+        project.selectedCommitID = c3.id
+        await withCheckedContinuation { continuation in
+            project.loadSelectedCommit { continuation.resume() }
+        }
+        XCTAssertEqual(project.commitFolderIDs, ["d:c:a/b"])
+        project.collapseAllCommitFolders()
+        XCTAssertEqual(project.commitCollapsed, ["d:c:a/b"])
+
+        // Extend to overlapping multi-selection [c3, c2]: a/b stays collapsed while new parent a is expanded.
+        project.selectedCommitID = c2.id
+        project.selectedCommitIDs = [c3.id, c2.id]
+        await withCheckedContinuation { continuation in
+            project.loadSelectedCommit { continuation.resume() }
+        }
+        XCTAssertEqual(project.commitFolderIDs, ["d:c:a", "d:c:a/b"])
+        XCTAssertEqual(project.commitCollapsed, ["d:c:a/b"])
+        let multiRows = ChangeTree.rows(changes: project.commitFiles, flat: false, collapsed: project.commitCollapsed,
+                                        filter: "", splitUnversioned: false)
+        XCTAssertEqual(multiRows.map(\.id), ["d:c:a", "d:c:a/b", ChangeRow.fileID("a/d.go")])
+
+        // Switch to unrelated commit c1: stale collapsed state resets cleanly.
+        project.selectedCommitID = c1.id
+        await withCheckedContinuation { continuation in
+            project.loadSelectedCommit { continuation.resume() }
+        }
+        XCTAssertEqual(project.commitCollapsed, [])
+    }
+}

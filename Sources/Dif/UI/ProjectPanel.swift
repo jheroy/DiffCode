@@ -905,6 +905,7 @@ private struct CommitDetail: View {
     var body: some View {
         let rows = ChangeTree.rows(changes: project.commitFiles, flat: store.settings.flatList,
                                    collapsed: project.commitCollapsed, filter: "", splitUnversioned: false)
+        let folderIDs = store.settings.flatList ? [] : project.commitFolderIDs
         let selectedCommits = project.selectedCommits
         VStack(spacing: 0) {
             if selectedCommits.count > 1, let newest = selectedCommits.first, let oldest = selectedCommits.last {
@@ -975,42 +976,120 @@ private struct CommitDetail: View {
                 .padding(.vertical, 8)
                 Rectangle().fill(Color.difHairline).frame(height: 1)
             }
+            if !selectedCommits.isEmpty {
+                filesBar(rows: rows, folderIDs: folderIDs, multiCommit: selectedCommits.count > 1)
+                Rectangle().fill(Color.difHairline).frame(height: 1)
+            }
             KeyboardList(rows: rows,
                          selection: Binding(get: { project.selectedCommitFileID }, set: { id in
                              project.selectedCommitFileID = id
                              store.pickedInLog(project, commitChanged: false)
                          }),
                          focusToken: focusToken + store.logFilesFocusToken,
-                         onKey: { event, row in
-                             switch event.keyCode {
-                             case 123:
-                                 if let row, row.file == nil, row.isExpanded { project.commitCollapsed.insert(row.id) } else { store.focusList() }
-                                 return true
-                             case 124:
-                                 if let row, row.file == nil { project.commitCollapsed.remove(row.id) }
-                                 return true
-                             case 36, 76:
-                                 if let row, row.file == nil { toggle(row) } else { store.focusViewer() }
-                                 return true
-                             case 53:
-                                 store.focusList()
-                                 return true
-                             default:
-                                 return false
-                             }
+                         onKey: { event, row in handleKey(event, row, rows) },
+                         onClick: { row in
+                             if row.file == nil { toggle(row) }
                          },
                          onDoubleClick: { row in
-                             if row.file != nil { store.focusViewer() } else { toggle(row) }
+                             if row.file != nil { store.focusViewer() }
                          },
-                         menu: { row in
-                             guard let file = row.file else { return nil }
-                             let commits = project.selectedCommits
-                             guard !commits.isEmpty else { return nil }
-                             return store.commitFileMenu(file, in: commits, project: project)
-                         }) { row, _, _ in
+                         menu: { row in rowMenu(row) }) { row, _, _ in
                 ChangeRowView(row: row, showDirectory: store.settings.flatList) { toggle(row) }
             }
         }
+    }
+
+    private func filesBar(rows: [ChangeRow], folderIDs: Set<String>, multiCommit: Bool) -> some View {
+        let fileCount = project.commitFiles.count
+        let hasExpandedFolder = rows.contains { $0.file == nil && $0.isExpanded }
+        return HStack(spacing: 4) {
+            if multiCommit {
+                Text(store.settings.flatList ? L("Flat list", "平铺列表") : L("Directory tree", "目录树"))
+                    .font(.ui(size: 11, weight: .medium))
+                    .foregroundStyle(Color.difText3)
+                    .lineLimit(1)
+            } else {
+                Text(fileCount == 1 ? L("1 file", "1 个文件") : L("\(fileCount) files", "\(fileCount) 个文件"))
+                    .font(.ui(size: 11, weight: .medium))
+                    .foregroundStyle(Color.difText3)
+                    .lineLimit(1)
+                if fileCount > 0 {
+                    let added = project.commitFiles.reduce(0) { $0 + ($1.additions ?? 0) }
+                    let deleted = project.commitFiles.reduce(0) { $0 + ($1.deletions ?? 0) }
+                    StatBadge(additions: added, deletions: deleted, size: 10.5)
+                }
+            }
+            Spacer(minLength: 4)
+            if !store.settings.flatList, !folderIDs.isEmpty {
+                IconButton(symbol: hasExpandedFolder ? "rectangle.compress.vertical" : "rectangle.expand.vertical",
+                           help: hasExpandedFolder ? L("Collapse all folders", "折叠全部目录") : L("Expand all folders", "展开全部目录"),
+                           size: 11) {
+                    if hasExpandedFolder {
+                        project.collapseAllCommitFolders()
+                    } else {
+                        project.expandAllCommitFolders()
+                    }
+                }
+            }
+            IconButton(symbol: store.settings.flatList ? "list.bullet" : "list.bullet.indent",
+                       help: store.settings.flatList ? L("Group by directory", "按目录分组") : L("Flat list", "平铺列表"),
+                       size: 11.5) {
+                store.settings.flatList.toggle()
+                store.settings.save()
+            }
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 8)
+        .padding(.vertical, 2)
+    }
+
+    private func handleKey(_ event: NSEvent, _ row: ChangeRow?, _ rows: [ChangeRow]) -> Bool {
+        switch event.keyCode {
+        case 123: // ← collapse, move to parent row, or return to commit list
+            guard let row else { store.focusList(); return true }
+            if row.file == nil, row.isExpanded {
+                project.commitCollapsed.insert(row.id)
+            } else if let index = rows.firstIndex(where: { $0.id == row.id }),
+                      let parent = rows[..<index].last(where: { $0.depth < row.depth }) {
+                project.selectedCommitFileID = parent.id
+            } else {
+                store.focusList()
+            }
+            return true
+        case 124: // → expand folder, or step into its first child
+            guard let row, row.file == nil else { return true }
+            if !row.isExpanded {
+                project.commitCollapsed.remove(row.id)
+            } else if let index = rows.firstIndex(where: { $0.id == row.id }), index + 1 < rows.count {
+                project.selectedCommitFileID = rows[index + 1].id
+            }
+            return true
+        case 49: // Space toggles folder expand/collapse
+            guard let row, row.file == nil else { return false }
+            toggle(row)
+            return true
+        case 36, 76: // ↩
+            if let row, row.file == nil { toggle(row) } else { store.focusViewer() }
+            return true
+        case 53: // Esc
+            store.focusList()
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func rowMenu(_ row: ChangeRow) -> NSMenu? {
+        if let file = row.file {
+            let commits = project.selectedCommits
+            guard !commits.isEmpty else { return nil }
+            return store.commitFileMenu(file, in: commits, project: project)
+        }
+        let menu = NSMenu()
+        menu.addItem(ClosureMenuItem(row.isExpanded ? L("Collapse", "折叠") : L("Expand", "展开")) { toggle(row) })
+        menu.addItem(ClosureMenuItem(L("Expand All", "全部展开")) { project.expandAllCommitFolders() })
+        menu.addItem(ClosureMenuItem(L("Collapse All", "全部折叠")) { project.collapseAllCommitFolders() })
+        return menu
     }
 
     private func toggle(_ row: ChangeRow) {
