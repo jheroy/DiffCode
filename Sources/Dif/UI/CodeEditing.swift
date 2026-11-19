@@ -202,10 +202,13 @@ extension CodeCanvasView: @preconcurrency NSTextInputClient {
 
     /// Puts the caret on a line of the right side, e.g. at a change F7 moved to or a line jumped to.
     func placeCaret(line: Int, column: Int = 0) {
-        guard let editor, !lines.isEmpty else { return }
+        guard !lines.isEmpty else { return }
+        guard editor != nil || vimModeEnabled else { return }
         commitComposition()
-        editor.closeGroup()
-        setCaret(TextPosition(row: line, column: column))
+        editor?.closeGroup()
+        let clamped = TextEditing.clamp(TextPosition(row: line, column: column), in: lines)
+        vimCursor = clamped
+        setCaret(clamped)
         goalX = nil
     }
 
@@ -285,6 +288,7 @@ extension CodeCanvasView: @preconcurrency NSTextInputClient {
     /// Typed text, over the selection if there is one.
     private func typeText(_ text: String) {
         guard let sel = editSelection else { return }
+        if vimModeEnabled && vimEngine.mode.isInsert { vimEngine.recordInsertedText(text) }
         let lower = min(sel.anchor, sel.head), upper = max(sel.anchor, sel.head)
         // A closing brace typed into a line of nothing but indentation steps out one level, as in the IDE.
         if lower == upper, text == "}", let unit = editor?.indentUnit {
@@ -300,6 +304,7 @@ extension CodeCanvasView: @preconcurrency NSTextInputClient {
 
     private func deleteSelection(orTo target: (TextPosition) -> TextPosition) {
         guard let sel = editSelection else { return }
+        if vimModeEnabled && vimEngine.mode.isInsert { vimEngine.recordInsertBackspace() }
         if sel.anchor != sel.head {
             replaceText(sel.anchor, sel.head, with: "", kind: .other)
             return
@@ -313,6 +318,7 @@ extension CodeCanvasView: @preconcurrency NSTextInputClient {
     /// brackets the closing one moves to a line of its own.
     private func insertNewline() {
         guard let editor, let sel = editSelection else { return }
+        if vimModeEnabled && vimEngine.mode.isInsert { vimEngine.recordInsertedText("\n") }
         var lower = min(sel.anchor, sel.head)
         var upper = max(sel.anchor, sel.head)
         let line = lines[lower.row] as NSString
@@ -626,6 +632,123 @@ extension CodeCanvasView: @preconcurrency NSTextInputClient {
         let local = convert(window.convertPoint(fromScreen: point), from: nil)
         guard let position = editPosition(at: local) else { return NSNotFound }
         return editor.offset(of: position)
+    }
+
+    // MARK: Vim bridge
+
+    private func makeVimContext() -> VimContext? {
+        guard let doc = document, case .text = doc.content, !doc.right.lines.isEmpty else { return nil }
+        let currentLines = doc.right.lines
+        let cursor = vimEngine.mode.isInsert ? (editSelection?.head ?? vimCursor) : vimCursor
+        return VimContext(
+            lines: currentLines,
+            cursor: TextEditing.clamp(cursor, in: currentLines),
+            isEditable: editor != nil,
+            indentUnit: editor?.indentUnit ?? TextEditing.indentUnit(for: currentLines),
+            commentPrefix: VimEngine.lineCommentPrefix(for: doc.language),
+            visibleLineCount: visibleLineCount
+        )
+    }
+
+    @discardableResult
+    func handleVimKey(_ key: VimKey) -> Bool {
+        guard vimModeEnabled, let context = makeVimContext() else { return false }
+        let result = vimEngine.handleKey(key, context: context)
+        guard result.handled else { return false }
+        applyVimResult(result)
+        return true
+    }
+
+    func vimExpandSelection() {
+        guard let context = makeVimContext() else { return }
+        let result = vimEngine.expandSelection(in: context)
+        applyVimResult(result)
+    }
+
+    func vimShrinkSelection() {
+        guard let context = makeVimContext() else { return }
+        let result = vimEngine.shrinkSelection(in: context)
+        applyVimResult(result)
+    }
+
+    private func applyVimResult(_ result: VimResult) {
+        let nonEmptyEdits = result.edits.filter { $0.from != $0.to || !$0.text.isEmpty }
+        if !nonEmptyEdits.isEmpty, let editor {
+            commitComposition()
+            if editSelection == nil { setCaret(vimCursor) }
+            editor.closeGroup()
+            if nonEmptyEdits.count == 1, let edit = nonEmptyEdits.first {
+                replaceText(edit.from, edit.to, with: edit.text, kind: .other, caret: result.cursor)
+            } else {
+                let before = editSelection ?? (vimCursor, vimCursor)
+                let tuples = nonEmptyEdits.map { ($0.from, $0.to, $0.text) }
+                let targetCaret = result.cursor ?? vimCursor
+                performEdit(anchorLine: nonEmptyEdits.map { min($0.from, $0.to).row }.min() ?? vimCursor.row) {
+                    editor.replace(tuples, selection: before, after: (targetCaret, targetCaret))
+                }
+                setCaret(targetCaret)
+                goalX = nil
+                revealCaret()
+                delegate?.canvasDidEdit(self)
+            }
+        }
+
+        if !lines.isEmpty {
+            isApplyingVimSelection = true
+            defer { isApplyingVimSelection = false }
+
+            if let vr = result.visualRange {
+                let anchor = TextEditing.clamp(vr.anchor, in: lines)
+                let head = TextEditing.clamp(vr.head, in: lines)
+                vimCursor = head
+                if vr.linewise {
+                    let firstRow = min(anchor.row, head.row)
+                    let lastRow = max(anchor.row, head.row)
+                    let startPos = TextPosition(row: firstRow, column: 0)
+                    let endPos = TextPosition(row: lastRow, column: lineLength(lastRow))
+                    selection = TextSelection(pane: .right, anchor: rowPosition(startPos), head: rowPosition(endPos))
+                } else {
+                    let lo = min(anchor, head)
+                    let hi = max(anchor, head)
+                    let hiNS = lines[hi.row] as NSString
+                    let hiEnd = hi.column < hiNS.length
+                        ? TextEditing.characterBoundary(in: hiNS, from: hi.column, forward: true)
+                        : hiNS.length
+                    selection = TextSelection(
+                        pane: .right,
+                        anchor: rowPosition(lo),
+                        head: rowPosition(TextPosition(row: hi.row, column: hiEnd))
+                    )
+                }
+            } else if let newCursor = result.cursor {
+                let clamped = TextEditing.clamp(newCursor, in: lines)
+                vimCursor = clamped
+                let rowPos = rowPosition(clamped)
+                selection = TextSelection(pane: .right, anchor: rowPos, head: rowPos)
+            } else if result.clearVisual {
+                let clamped = TextEditing.clamp(vimCursor, in: lines)
+                vimCursor = clamped
+                let rowPos = rowPosition(clamped)
+                selection = TextSelection(pane: .right, anchor: rowPos, head: rowPos)
+            }
+        }
+
+        if result.cursor != nil || result.visualRange != nil || !result.edits.isEmpty {
+            revealCaret()
+        }
+        refreshRelativeLineNumbersIfNeeded()
+        // Force caret shape update (block <-> bar <-> replace underline) even if cursor stayed put.
+        flushVimVisualState()
+        reportVimStateIfNeeded(force: true)
+
+        for action in result.actions {
+            delegate?.canvas(self, performVimAction: action, line: vimCursor.row, column: vimCursor.column)
+        }
+    }
+
+    private func flushVimVisualState() {
+        // Trigger layer update for cursor shape changes on mode/replace transitions.
+        needsDisplay = true
     }
 }
 

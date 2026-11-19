@@ -143,6 +143,17 @@ extension ViewerModel {
         saveEdits()
     }
 
+    /// Vim `:w`: writes now and gives feedback when read-only.
+    func saveFromVim() {
+        guard editor != nil else {
+            onToast?(readOnlyReason ?? L("Read-only file", "只读文件"))
+            return
+        }
+        if saveEdits() {
+            onToast?(L("Saved", "已保存"))
+        }
+    }
+
     /// Writes the text on screen to the file, if anything in it is not written yet. Returns false when it could
     /// not be written (what happened is shown), true when it was written or there was nothing to write.
     ///

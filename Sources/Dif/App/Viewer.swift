@@ -25,6 +25,24 @@ final class ViewerModel: CodeCanvasDelegate {
     var findIndex = 0
     var findFocusToken = 0
 
+    // Vim mode (decoupled from Settings.swift so Settings.vimMode can drive these after merge).
+    var vimModeEnabled: Bool = true {
+        didSet {
+            guard vimModeEnabled != oldValue else { return }
+            container?.canvas.vimModeEnabled = vimModeEnabled
+        }
+    }
+    var vimRelativeLineNumbers: Bool = false {
+        didSet {
+            guard vimRelativeLineNumbers != oldValue else { return }
+            container?.canvas.vimRelativeLineNumbers = vimRelativeLineNumbers
+        }
+    }
+    var vimMode: VimMode = .normal
+    var vimPendingKeys = ""
+    var vimCursorLine = 1
+    var vimCursorColumn = 1
+
     @ObservationIgnored weak var container: CodeScrollContainer?
     @ObservationIgnored var settings: Settings!
     @ObservationIgnored var onExit: (() -> Void)?
@@ -35,6 +53,8 @@ final class ViewerModel: CodeCanvasDelegate {
     @ObservationIgnored var onToggleCommitHunk: ((Int) -> Void)?
     /// The document on screen was replaced, cleared or edited (its changes are new), or its request changed.
     @ObservationIgnored var onDocumentChanged: (() -> Void)?
+    /// App-level Vim action dispatched from the canvas (`line` is 0-based, `column` is 0-based UTF-16).
+    @ObservationIgnored var onVimAction: ((VimAction, Int, Int) -> Void)?
 
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var pendingLine: Int?
@@ -108,6 +128,8 @@ final class ViewerModel: CodeCanvasDelegate {
         self.container = container
         container.canvas.delegate = self
         container.canvas.codeFont = CodeFont.current(settings)
+        container.canvas.vimModeEnabled = vimModeEnabled
+        container.canvas.vimRelativeLineNumbers = vimRelativeLineNumbers
         container.onUserScroll = { [weak self] in self?.detachedFromFocus = true }
         container.show(document, mode: canvasMode, preserveScroll: false)
         container.canvas.showsRevertButtons = canRevertHunks
@@ -481,23 +503,69 @@ final class ViewerModel: CodeCanvasDelegate {
         if reveal, current >= 0 { revealMatch(list[current]) }
     }
 
-    func stepFind(_ delta: Int) {
+    func stepFind(_ delta: Int, center: Bool = false) {
         guard let canvas = container?.canvas, !canvas.matches.isEmpty else { return }
         let count = canvas.matches.count
         let next = ((canvas.currentMatch + delta) % count + count) % count
         canvas.setCurrentMatch(next)
         findIndex = next + 1
-        revealMatch(canvas.matches[next])
+        let match = canvas.matches[next]
+        revealMatch(match, center: center)
+        if center, match.side == .right {
+            canvas.placeCaret(line: match.line, column: match.range.lowerBound)
+        }
     }
 
-    private func revealMatch(_ match: SearchMatch) {
+    private func revealMatch(_ match: SearchMatch, center: Bool = false) {
         guard let container else { return }
         let row = container.canvas.row(forLine: match.line, side: match.side)
-        let top = container.topRow
-        if row < top + 2 || row > top + container.visibleRowCount - 4 {
-            container.scroll(toRow: row, fraction: 0.4, animated: true)
+        if center {
+            container.scroll(toRow: row, fraction: 0.5, animated: false)
+        } else {
+            let top = container.topRow
+            if row < top + 2 || row > top + container.visibleRowCount - 4 {
+                container.scroll(toRow: row, fraction: 0.4, animated: true)
+            }
         }
         detachedFromFocus = true
+    }
+
+    /// Vim `*` / `#`: search word under cursor and jump to next/previous occurrence centered in viewport.
+    func searchWordUnderCursor(line: Int, column: Int, forward: Bool) {
+        guard let container, let doc = document, case .text = doc.content,
+              line >= 0, line < doc.right.lines.count else { return }
+        guard let symbol = LSPNavigationHelper.extractSymbol(in: doc.right.lines[line], at: column) else { return }
+        findQuery = symbol.name
+        runFind(reveal: false)
+        let canvas = container.canvas
+        let matches = canvas.matches
+        guard !matches.isEmpty else { return }
+
+        let targetIndex: Int
+        if forward {
+            targetIndex = matches.firstIndex(where: {
+                $0.side == .right && ($0.line > line || ($0.line == line && $0.range.lowerBound > symbol.range.lowerBound))
+            }) ?? 0
+        } else {
+            targetIndex = matches.lastIndex(where: {
+                $0.side == .right && ($0.line < line || ($0.line == line && $0.range.lowerBound < symbol.range.lowerBound))
+            }) ?? (matches.count - 1)
+        }
+        canvas.setCurrentMatch(targetIndex)
+        findIndex = targetIndex + 1
+        let match = matches[targetIndex]
+        if match.side == .right {
+            canvas.placeCaret(line: match.line, column: match.range.lowerBound)
+        }
+        revealMatch(match, center: true)
+    }
+
+    func expandSelection() {
+        container?.canvas.vimExpandSelection()
+    }
+
+    func shrinkSelection() {
+        container?.canvas.vimShrinkSelection()
     }
 
     // MARK: CodeCanvasDelegate
@@ -535,6 +603,53 @@ final class ViewerModel: CodeCanvasDelegate {
 
     func canvas(_ canvas: CodeCanvasView, goToDefinitionAt line: Int, character: Int) {
         onGoToDefinition?(line, character)
+    }
+
+    func canvas(_ canvas: CodeCanvasView, didUpdateVimState state: VimUIState) {
+        if vimMode != state.mode { vimMode = state.mode }
+        if vimPendingKeys != state.pendingKeys { vimPendingKeys = state.pendingKeys }
+        if vimCursorLine != state.cursorLine { vimCursorLine = state.cursorLine }
+        if vimCursorColumn != state.cursorColumn { vimCursorColumn = state.cursorColumn }
+    }
+
+    func canvas(_ canvas: CodeCanvasView, performVimAction action: VimAction, line: Int, column: Int) {
+        switch action {
+        case .openFind:
+            showFind()
+        case .searchWord(let forward):
+            searchWordUnderCursor(line: line, column: column, forward: forward)
+        case .nextSearchMatch(let forward, let center):
+            if canvas.matches.isEmpty, !findQuery.isEmpty { runFind(reveal: false) }
+            stepFind(forward ? 1 : -1, center: center)
+        case .clearSearchHighlights:
+            hideFind()
+        case .save:
+            saveFromVim()
+        case .jumpToLine(let lineNum):
+            reveal(line: lineNum)
+        case .scrollCenter:
+            container?.scroll(toRow: canvas.row(forLine: line, side: .right), fraction: 0.5, animated: false)
+        case .scrollTop:
+            container?.scroll(toRow: canvas.row(forLine: line, side: .right), fraction: 0.0, animated: false)
+        case .scrollBottom:
+            container?.scroll(toRow: canvas.row(forLine: line, side: .right), fraction: 0.92, animated: false)
+        case .scrollHalfPage(let down):
+            let rows = max(1, canvas.visibleLineCount / 2)
+            container?.scrollBy(dx: 0, dy: CGFloat(down ? rows : -rows) * canvas.codeFont.lineHeight)
+        case .scrollFullPage(let down):
+            let rows = max(1, canvas.visibleLineCount - 2)
+            container?.scrollBy(dx: 0, dy: CGFloat(down ? rows : -rows) * canvas.codeFont.lineHeight)
+        case .undo:
+            canvas.undoTyping()
+        case .redo:
+            canvas.redoTyping()
+        case .readOnlyNotice:
+            onToast?(readOnlyReason ?? L("Read-only file", "只读文件"))
+        case .goToDefinition, .findReferences, .goToFile, .searchEverywhere, .findAction,
+             .gitPull, .gitPush, .toggleGitGraph, .toggleMaximizeViewer, .locateInTree,
+             .toggleFileTree, .navigateBack, .navigateForward, .focusLeftPane, .focusRightPane, .quit:
+            onVimAction?(action, line, column)
+        }
     }
 
     func canvasDidMagnify(_ canvas: CodeCanvasView, by delta: CGFloat) {
