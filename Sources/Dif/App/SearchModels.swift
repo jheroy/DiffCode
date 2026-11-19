@@ -258,6 +258,48 @@ final class QuickOpenModel {
     }
 }
 
+// MARK: - Shared Popup File Filter
+
+/// Filename-level toggles shared by Search and References popups.
+struct PopupFileFilter: Equatable, Sendable {
+    enum Scope: String, Sendable {
+        case references
+        case findInPath
+
+        var excludeTestGoKey: String { "popupFilter.\(rawValue).excludeTestGo" }
+        var onlyGoFilesKey: String { "popupFilter.\(rawValue).onlyGoFiles" }
+    }
+
+    var excludeTestGo: Bool = false
+    var onlyGoFiles: Bool = false
+
+    var isActive: Bool { excludeTestGo || onlyGoFiles }
+
+    /// Returns `true` when `path` satisfies the active `excludeTestGo` and `onlyGoFiles` rules.
+    func matches(path: String) -> Bool {
+        let fileName = (path as NSString).lastPathComponent.lowercased()
+        if onlyGoFiles && !fileName.hasSuffix(".go") {
+            return false
+        }
+        if excludeTestGo && fileName.hasSuffix("test.go") {
+            return false
+        }
+        return true
+    }
+
+    static func load(scope: Scope, defaults: UserDefaults = .standard) -> PopupFileFilter {
+        PopupFileFilter(
+            excludeTestGo: defaults.bool(forKey: scope.excludeTestGoKey),
+            onlyGoFiles: defaults.bool(forKey: scope.onlyGoFilesKey)
+        )
+    }
+
+    func save(scope: Scope, defaults: UserDefaults = .standard) {
+        defaults.set(excludeTestGo, forKey: scope.excludeTestGoKey)
+        defaults.set(onlyGoFiles, forKey: scope.onlyGoFilesKey)
+    }
+}
+
 // MARK: - Find in Files
 
 @MainActor
@@ -278,7 +320,22 @@ final class FindInPathModel {
     var query = ""
     var options = GrepOptions()
     var allProjects = false
+    var excludeTestGo: Bool {
+        didSet {
+            if excludeTestGo != oldValue {
+                persistAndRefilter()
+            }
+        }
+    }
+    var onlyGoFiles: Bool {
+        didSet {
+            if onlyGoFiles != oldValue {
+                persistAndRefilter()
+            }
+        }
+    }
     var hits: [Hit] = []
+    private(set) var totalHitCount = 0
     var fileCount = 0
     var selected = 0
     var isSearching = false
@@ -288,15 +345,28 @@ final class FindInPathModel {
     var previewPath = ""
     var errorText: String?
 
+    var fileFilter: PopupFileFilter {
+        PopupFileFilter(excludeTestGo: excludeTestGo, onlyGoFiles: onlyGoFiles)
+    }
+
     @ObservationIgnored weak var store: AppStore?
     @ObservationIgnored weak var previewContainer: CodeScrollContainer?
+    @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private var allHits: [Hit] = []
     @ObservationIgnored private var searchTask: Task<Void, Never>?
     @ObservationIgnored private var previewTask: Task<Void, Never>?
     @ObservationIgnored private var debounce: DispatchWorkItem?
     @ObservationIgnored private var generation = 0
-    /// Files with results in the search under way (projects can share relative paths, hence the project prefix).
+    /// Files with visible results in the search under way (projects can share relative paths, hence the project prefix).
     @ObservationIgnored private var searchFiles: Set<String> = []
     @ObservationIgnored private var previewKey = ""
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        let saved = PopupFileFilter.load(scope: .findInPath, defaults: defaults)
+        self.excludeTestGo = saved.excludeTestGo
+        self.onlyGoFiles = saved.onlyGoFiles
+    }
 
     func prepare(seed: String?) {
         if let seed { query = seed }
@@ -317,7 +387,9 @@ final class FindInPathModel {
         generation += 1
         let token = generation
         let pattern = query
+        allHits = []
         hits = []
+        totalHitCount = 0
         fileCount = 0
         selected = 0
         truncated = false
@@ -342,7 +414,7 @@ final class FindInPathModel {
         searchTask = Task { @MainActor [self] in
             for project in targets {
                 if Task.isCancelled { return }
-                let remaining = Self.limit - hits.count
+                let remaining = Self.limit - allHits.count
                 if remaining <= 0 { break }
                 let projectID = project.id
                 // git grep streams results; each batch hops to the main thread and is appended immediately.
@@ -360,22 +432,69 @@ final class FindInPathModel {
             try? await Task.sleep(nanoseconds: 30_000_000)
             guard generation == token, !Task.isCancelled else { return }
             isSearching = false
-            truncated = hits.count >= Self.limit
+            truncated = allHits.count >= Self.limit
             if hits.isEmpty { setPreview(nil) }
         }
+    }
+
+    /// Populates raw hits directly for unit testing filtering and selection behavior.
+    func setHitsForTesting(_ rawHits: [Hit]) {
+        allHits = rawHits.enumerated().map { idx, hit in
+            Hit(id: idx, projectID: hit.projectID, path: hit.path, line: hit.line, text: hit.text, match: hit.match)
+        }
+        totalHitCount = allHits.count
+        selected = 0
+        rebuildFilteredHits()
     }
 
     /// Adds a batch of results as it arrives.
     private func append(_ batch: [(GrepHit, Range<Int>?)], projectID: UUID) {
         let first = hits.isEmpty
+        let filter = fileFilter
         for (hit, match) in batch {
             let trimmed = Self.trimLeading(hit.text, match: match)
-            hits.append(Hit(id: hits.count, projectID: projectID, path: hit.path, line: hit.line,
-                            text: trimmed.text, match: trimmed.match))
-            searchFiles.insert(projectID.uuidString + hit.path)
+            let item = Hit(id: allHits.count, projectID: projectID, path: hit.path, line: hit.line,
+                           text: trimmed.text, match: trimmed.match)
+            allHits.append(item)
+            if filter.matches(path: item.path) {
+                hits.append(item)
+                searchFiles.insert(projectID.uuidString + item.path)
+            }
         }
+        totalHitCount = allHits.count
         fileCount = searchFiles.count
         if first, !hits.isEmpty { loadPreview() }
+    }
+
+    private func persistAndRefilter() {
+        fileFilter.save(scope: .findInPath, defaults: defaults)
+        rebuildFilteredHits()
+    }
+
+    private func rebuildFilteredHits() {
+        let previousID = (selected >= 0 && selected < hits.count) ? hits[selected].id : nil
+        let filter = fileFilter
+        let filtered = allHits.filter { filter.matches(path: $0.path) }
+        hits = filtered
+
+        var files: Set<String> = []
+        for hit in filtered {
+            files.insert(hit.projectID.uuidString + hit.path)
+        }
+        searchFiles = files
+        fileCount = files.count
+
+        if let previousID, let idx = filtered.firstIndex(where: { $0.id == previousID }) {
+            selected = idx
+        } else {
+            selected = 0
+        }
+
+        if filtered.isEmpty {
+            setPreview(nil)
+        } else {
+            loadPreview()
+        }
     }
 
     /// Finds the match on a result line so it can be emphasised. Runs on the thread reading git's output.
