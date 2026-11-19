@@ -13,6 +13,19 @@ final class Settings {
     static let sidebarRange: ClosedRange<Double> = 200...480
     /// The commit message box, including its button row; dragged by the line above it.
     static let commitBoxRange: ClosedRange<Double> = 96...640
+    /// Default prompt template describing the commit message format for AI generation.
+    nonisolated static let defaultCommitMessageFormat = """
+    ## 提交格式
+    提交的信息格式为：`[EMOJI] [TYPE](topic): [description in {locale}]`。
+    - **Emoji**: 使用 GitMoji（例如 ✨ `feat`, 📖 `docs`, 🐛 `fix`）。
+    - **Type**: 常见的类型包括 `feature`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`。
+    - **Topic**: 
+      - 某个功能名字。
+      - 英文名，通常使用代码中的函数名字（如果只改了一个函数）。
+      - 功能配置的交集名字。
+      - 文件名。
+    - **Description**: 说明文本使用 **中文**，描述具体的改动。
+    """
 
     enum Appearance: String, CaseIterable {
         case system, light, dark
@@ -125,6 +138,15 @@ final class Settings {
     var vimRelativeLineNumbers: Bool
     /// Show the Beyond Compare-style bottom inline line diff bar under the code viewer.
     var showLineDiffBar: Bool
+    /// Customizable commit message format specification used for AI commit generation.
+    var commitMessageFormat: String
+
+    /// The commit message format to send to AI, falling back to `defaultCommitMessageFormat` when empty.
+    var effectiveCommitMessageFormat: String {
+        commitMessageFormat.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? Self.defaultCommitMessageFormat
+            : commitMessageFormat
+    }
 
     @ObservationIgnored private let defaults: UserDefaults
 
@@ -155,6 +177,12 @@ final class Settings {
         vimMode = defaults.object(forKey: "vimMode") as? Bool ?? true
         vimRelativeLineNumbers = defaults.object(forKey: "vimRelativeLineNumbers") as? Bool ?? false
         showLineDiffBar = defaults.object(forKey: "showLineDiffBar") as? Bool ?? true
+        if let savedFormat = defaults.string(forKey: "commitMessageFormat"),
+           !savedFormat.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            commitMessageFormat = savedFormat
+        } else {
+            commitMessageFormat = Self.defaultCommitMessageFormat
+        }
         projectsHeight = (defaults.object(forKey: "projectsHeight") as? Double).map { max(0, $0) }
     }
 
@@ -179,9 +207,20 @@ final class Settings {
         defaults.set(vimMode, forKey: "vimMode")
         defaults.set(vimRelativeLineNumbers, forKey: "vimRelativeLineNumbers")
         defaults.set(showLineDiffBar, forKey: "showLineDiffBar")
+        if commitMessageFormat.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            defaults.removeObject(forKey: "commitMessageFormat")
+        } else {
+            defaults.set(commitMessageFormat, forKey: "commitMessageFormat")
+        }
         defaults.set(projectsHeight, forKey: "projectsHeight")  // nil removes the key
         // Not the language: it is written when chosen, so that quitting never puts back a stale one over a
         // choice made since in System Settings.
+    }
+
+    /// Restores the AI commit message format template to its built-in default and persists it.
+    func resetCommitMessageFormat() {
+        commitMessageFormat = Self.defaultCommitMessageFormat
+        save()
     }
 
     /// Saves a language picked in Settings; it shows from the next launch.

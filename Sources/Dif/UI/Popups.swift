@@ -1160,6 +1160,9 @@ struct SettingsView: View {
     /// Weights genuinely available for the currently selected code font family.
     @State private var availableWeights: [CodeFontWeight] = CodeFontWeight.allCases
     @State private var typographyExpanded = true
+    /// Detected `agy` CLI path for AI commit generation (resolved asynchronously when Settings opens).
+    @State private var agyCLIPath: String?
+    @State private var agyCLIChecked = false
 
     var body: some View {
         @Bindable var settings = store.settings
@@ -1308,6 +1311,9 @@ struct SettingsView: View {
                         .labelsHidden()
                         .frame(width: UI.s(240))
                     }
+                    if !AppEnvironment.isAppStore {
+                        aiCommitSection(settings: settings)
+                    }
                 }
                 .padding(20)
             }
@@ -1320,6 +1326,10 @@ struct SettingsView: View {
         .task {
             // Fonts installed since the last time show too.
             families = await Task.detached(priority: .userInitiated) { MonospaceFonts.installed() }.value
+            if !AppEnvironment.isAppStore {
+                agyCLIPath = await Task.detached(priority: .utility) { AICommitGenerator.resolveCLI() }.value
+                agyCLIChecked = true
+            }
         }
         .onChange(of: settings.codeFontFamily) { _, family in
             availableWeights = MonospaceFonts.availableWeights(for: family)
@@ -1339,6 +1349,75 @@ struct SettingsView: View {
         .onChange(of: settings.vimRelativeLineNumbers) { _, enabled in
             settings.save()
             store.viewer.setVimRelativeLineNumbers(enabled)
+        }
+        .onChange(of: settings.commitMessageFormat) { _, _ in
+            settings.save()
+        }
+    }
+
+    private func aiCommitSection(settings: Settings) -> some View {
+        @Bindable var settings = settings
+        let isDefaultFormat = settings.commitMessageFormat == Settings.defaultCommitMessageFormat
+        let statusText: String = {
+            if !agyCLIChecked { return L("Checking…", "检测中…") }
+            if let path = agyCLIPath { return path }
+            return L("agy not found in PATH", "未在 PATH 中找到 agy")
+        }()
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Text(L("AI Commit", "AI 提交信息"))
+                    .font(.ui(size: 12.5, weight: .medium))
+                    .foregroundStyle(Color.difText)
+                Rectangle()
+                    .fill(Color.difHairline)
+                    .frame(height: 1)
+            }
+            row(L("agy CLI", "agy CLI")) {
+                HStack(spacing: 6) {
+                    if agyCLIChecked {
+                        Circle()
+                            .fill(agyCLIPath != nil ? Color.difAdded : Color.difRemoved)
+                            .frame(width: 6, height: 6)
+                    }
+                    Text(statusText)
+                        .font(.ui(size: 11.5, design: agyCLIPath != nil ? .monospaced : .default))
+                        .foregroundStyle(agyCLIPath != nil ? Color.difText2 : Color.difText3)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .frame(maxWidth: UI.s(260), alignment: .trailing)
+                .help(agyCLIPath ?? L("Install agy CLI and ensure it is in PATH", "请安装 agy CLI 并确保它在 PATH 中"))
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text(L("Commit format", "提交格式"))
+                        .font(.ui(size: 13))
+                        .foregroundStyle(Color.difText2)
+                    Spacer()
+                    Button {
+                        settings.resetCommitMessageFormat()
+                    } label: {
+                        Text(L("Reset Default", "恢复默认"))
+                            .font(.ui(size: 11.5, weight: .medium))
+                            .foregroundStyle(isDefaultFormat ? Color.difText3 : Color.difAccent)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.difChip))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isDefaultFormat)
+                }
+                TextEditor(text: $settings.commitMessageFormat)
+                    .font(.ui(size: 11.5, design: .monospaced))
+                    .scrollContentBackground(.hidden)
+                    .padding(6)
+                    .frame(height: UI.s(140))
+                    .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.difChip))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(Color.difHairline, lineWidth: 1)
+                    )
+            }
         }
     }
 

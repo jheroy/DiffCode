@@ -96,6 +96,9 @@ final class Project: Identifiable {
     @ObservationIgnored var onInclusionChanged: (() -> Void)?
     var commitMessage = ""
     var isCommitting = false
+    /// Whether AI commit message generation (`agy`) is currently running for this project.
+    var isGeneratingCommitMessage = false
+    @ObservationIgnored var commitMessageGenerationTask: Task<Void, Never>?
     /// The last commit made here in this session, while it can still be undone.
     var lastCommit: WorkingTree.CommitResult?
     /// The next commit replaces the last one (Amend), starting from its message.

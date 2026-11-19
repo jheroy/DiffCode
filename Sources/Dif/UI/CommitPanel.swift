@@ -109,6 +109,11 @@ struct CommitPanel: View {
             .padding(.top, 7)
             .padding(.bottom, 10)
         }
+        .onChange(of: project.id) { oldID, _ in
+            if let previous = store.project(oldID), previous.isGeneratingCommitMessage {
+                store.cancelCommitMessageGeneration(in: previous)
+            }
+        }
     }
 
     private func amendSummary(included: Int, partial: Int) -> String {
@@ -147,6 +152,15 @@ struct CommitPanel: View {
                                           : L("Undo the commit just made; its changes come back to the list", "撤销刚才的提交，改动会回到列表里"))
             }
             Spacer(minLength: 4)
+            if !AppEnvironment.isAppStore {
+                AICommitButton(
+                    isGenerating: project.isGeneratingCommitMessage,
+                    isDisabled: !project.isGeneratingCommitMessage && (included == 0 || project.isCommitting),
+                    help: aiCommitHelp(included: included)
+                ) {
+                    store.generateCommitMessage(in: project)
+                }
+            }
             Button { store.commitCurrent() } label: {
                 HStack(spacing: 6) {
                     if project.isCommitting {
@@ -178,6 +192,51 @@ struct CommitPanel: View {
         }
         if project.commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return L("Write a commit message first", "先写提交说明") }
         return L("Commit the ticked files (⌘↩)", "提交勾选的文件 (⌘↩)")
+    }
+
+    private func aiCommitHelp(included: Int) -> String {
+        if project.isGeneratingCommitMessage {
+            return L("Generating commit message with agy… Click to cancel", "正在使用 agy 生成提交信息… 点击取消")
+        }
+        if included == 0 {
+            return L("Tick the files to commit first", "先勾选要提交的文件")
+        }
+        return L("Generate commit message with agy AI", "使用 agy AI 生成提交信息")
+    }
+}
+
+private struct AICommitButton: View {
+    var isGenerating: Bool
+    var isDisabled: Bool
+    var help: String
+    var action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                if isGenerating {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.55)
+                        .frame(width: UI.s(13), height: UI.s(13))
+                } else {
+                    Image(systemName: "sparkles")
+                        .font(.ui(size: 12, weight: .medium))
+                        .foregroundStyle(isDisabled ? Color.difText3.opacity(0.6) : Color.difAccent)
+                }
+            }
+            .frame(width: UI.s(26), height: UI.s(24))
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(isGenerating ? Color.difSelection : (hovering && !isDisabled ? Color.difHover : Color.clear))
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .onHover { hovering = $0 }
+        .help(help)
     }
 }
 

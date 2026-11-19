@@ -218,4 +218,58 @@ extension AppStore {
         guard !targets.isEmpty else { return }
         project.setIncluded(!targets.allSatisfy { project.inclusion($0) == .on }, targets)
     }
+
+    /// Generates a commit message for the project's currently checked changes using the `agy` CLI.
+    /// Calling again while generation is in progress cancels the running request.
+    func generateCommitMessage(in project: Project? = nil) {
+        guard let project = project ?? currentProject else { return }
+        if project.isGeneratingCommitMessage {
+            cancelCommitMessageGeneration(in: project)
+            return
+        }
+        guard !AppEnvironment.isAppStore else {
+            showToast(AICommitError.unavailableInAppStore.localizedDescription)
+            return
+        }
+        guard !project.isCommitting else { return }
+        guard !project.includedChanges.isEmpty else {
+            showToast(AICommitError.noCheckedChanges.localizedDescription)
+            return
+        }
+        // Save any unsaved inline edits so the diff reflects what will actually be committed.
+        guard viewer.saveEdits() else { return }
+
+        let format = settings.effectiveCommitMessageFormat
+        project.isGeneratingCommitMessage = true
+        project.commitMessageGenerationTask = Task { @MainActor [weak self, weak project] in
+            guard let self, let project else { return }
+            defer {
+                project.isGeneratingCommitMessage = false
+                project.commitMessageGenerationTask = nil
+            }
+            do {
+                let payload = try await AICommitGenerator.collectCheckedDiff(for: project)
+                try Task.checkCancellation()
+                let generated = try await AICommitGenerator.generate(from: payload, format: format)
+                try Task.checkCancellation()
+                project.commitMessage = generated
+                if project.id == self.selectedProjectID {
+                    self.focusCommitMessage()
+                }
+                self.showToast(L("Commit message generated", "已生成提交信息"))
+            } catch is CancellationError {
+                // Cancelled by user or project switch; preserve any existing draft silently.
+            } catch {
+                self.showToast(error.localizedDescription)
+            }
+        }
+    }
+
+    /// Cancels any active AI commit message generation for `project`, terminating the underlying `agy` process.
+    func cancelCommitMessageGeneration(in project: Project? = nil) {
+        guard let project = project ?? currentProject else { return }
+        project.commitMessageGenerationTask?.cancel()
+        project.commitMessageGenerationTask = nil
+        project.isGeneratingCommitMessage = false
+    }
 }
