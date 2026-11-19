@@ -174,6 +174,106 @@ final class HistoryTests: XCTestCase {
         XCTAssertEqual(Git.lineCount(of: Data("a\nb".utf8)), 2)
         XCTAssertEqual(Git.lineCount(of: Data()), 0)
     }
+
+    // MARK: Commit detail height
+
+    func testCommitDetailFittedHeightUsesMinHeightForZeroFiles() {
+        let height = CommitDetailLayout.fittedHeight(
+            rowCount: 0,
+            rowHeight: 24,
+            chromeHeight: 72,
+            minHeight: 120,
+            maxHeight: 520
+        )
+        XCTAssertEqual(height, 120)
+    }
+
+    func testCommitDetailFittedHeightFitsFewAndMediumFiles() {
+        let twoFiles = CommitDetailLayout.fittedHeight(
+            rowCount: 2,
+            rowHeight: 24,
+            chromeHeight: 72,
+            listPadding: 10,
+            minHeight: 120,
+            maxHeight: 520
+        )
+        XCTAssertEqual(twoFiles, 72 + 2 * 24 + 10)
+        XCTAssertGreaterThan(twoFiles, 120)
+        XCTAssertLessThan(twoFiles, 520)
+
+        let tenFiles = CommitDetailLayout.fittedHeight(
+            rowCount: 10,
+            rowHeight: 24,
+            chromeHeight: 72,
+            listPadding: 10,
+            minHeight: 120,
+            maxHeight: 520
+        )
+        XCTAssertEqual(tenFiles, 72 + 10 * 24 + 10)
+        XCTAssertGreaterThan(tenFiles, twoFiles)
+        XCTAssertLessThan(tenFiles, 520)
+    }
+
+    func testCommitDetailFittedHeightCapsAtMaxDraggableHeight() {
+        let maxDraggable = CommitDetailLayout.maxHeight(availableHeight: 683, minCommitListHeight: 162)
+        XCTAssertEqual(maxDraggable, 520)
+
+        let manyFiles = CommitDetailLayout.fittedHeight(
+            rowCount: 100,
+            rowHeight: 24,
+            chromeHeight: 72,
+            listPadding: 10,
+            minHeight: 120,
+            maxHeight: maxDraggable
+        )
+        XCTAssertEqual(manyFiles, maxDraggable)
+    }
+
+    func testCommitDetailLayoutHandlesDegenerateWindowsSafely() {
+        let shortMax = CommitDetailLayout.maxHeight(availableHeight: 240, minCommitListHeight: 162)
+        XCTAssertEqual(shortMax, 77)
+        let clampedShort = CommitDetailLayout.fittedHeight(
+            rowCount: 10,
+            rowHeight: 24,
+            chromeHeight: 72,
+            minHeight: 120,
+            maxHeight: shortMax
+        )
+        XCTAssertEqual(clampedShort, 77)
+
+        let tinyMax = CommitDetailLayout.maxHeight(availableHeight: 100, minCommitListHeight: 162)
+        XCTAssertEqual(tinyMax, 0)
+        let clampedZero = CommitDetailLayout.fittedHeight(
+            rowCount: 5,
+            rowHeight: 24,
+            chromeHeight: 72,
+            minHeight: 120,
+            maxHeight: tinyMax
+        )
+        XCTAssertEqual(clampedZero, 0)
+
+        let manualClamped = CommitDetailLayout.clampedHeight(450, minHeight: 120, maxHeight: -10)
+        XCTAssertEqual(manualClamped, 0)
+    }
+
+    func testCommitDetailFittedHeightAdaptsToTreeCollapseAndFlatMode() {
+        let changes = [
+            FileChange(path: "a/b/c.go", oldPath: nil, kind: .modified),
+            FileChange(path: "a/d.go", oldPath: nil, kind: .added),
+            FileChange(path: "root.go", oldPath: nil, kind: .deleted),
+        ]
+        let expandedRows = ChangeTree.rows(changes: changes, flat: false, collapsed: [], filter: "", splitUnversioned: false)
+        let collapsedRows = ChangeTree.rows(changes: changes, flat: false, collapsed: ["d:c:a"], filter: "", splitUnversioned: false)
+        let flatRows = ChangeTree.rows(changes: changes, flat: true, collapsed: [], filter: "", splitUnversioned: false)
+
+        let expandedHeight = CommitDetailLayout.fittedHeight(rowCount: expandedRows.count, rowHeight: 24, chromeHeight: 72, maxHeight: 520)
+        let collapsedHeight = CommitDetailLayout.fittedHeight(rowCount: collapsedRows.count, rowHeight: 24, chromeHeight: 72, maxHeight: 520)
+        let flatHeight = CommitDetailLayout.fittedHeight(rowCount: flatRows.count, rowHeight: 24, chromeHeight: 72, maxHeight: 520)
+
+        XCTAssertEqual(expandedHeight, 72 + 5 * 24 + 10)
+        XCTAssertEqual(collapsedHeight, 72 + 2 * 24 + 10)
+        XCTAssertEqual(flatHeight, 72 + 3 * 24 + 10)
+    }
 }
 
 /// History, blame and comparisons against a real repository built in a temporary directory: a file committed,
