@@ -852,6 +852,7 @@ enum DebugHooks {
         let source: String
         switch request.source {
         case .file: source = "file"
+        case .externalFile(let display, _): source = "external(\(display))"
         case .worktree(let base): source = "worktree(\(base.prefix(7)))"
         case .commit(let hash, let parent): source = "commit(\(hash.prefix(7))<-\(parent?.prefix(7) ?? "root"))"
         }

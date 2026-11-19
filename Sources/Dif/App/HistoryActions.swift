@@ -9,6 +9,7 @@ extension AppStore {
     /// Lists in the Log the commits that changed a file, or some of its lines, and shows the file's diff in the first.
     /// - Parameter hash: a commit to pick instead of the newest (one clicked in the Annotate column).
     func showHistory(_ filter: HistoryFilter, in project: Project, select hash: String? = nil) {
+        exitExternalFileMode()
         if selectedProjectID != project.id {
             selectedProjectID = project.id
         }
@@ -43,6 +44,7 @@ extension AppStore {
 
     /// Back from a file's history to the branch the Log listed before.
     func endHistory() {
+        exitExternalFileMode()
         guard let project = currentProject, project.history != nil else { return }
         project.history = nil
         project.historyPaths = [:]
@@ -102,6 +104,7 @@ extension AppStore {
     func countsInHead(_ request: DiffRequest, side: Side) -> Bool {
         switch request.source {
         case .file: return true
+        case .externalFile: return false
         case .worktree: return side == .right && !request.isAgainstHead
         case .commit: return false
         }
@@ -134,6 +137,8 @@ extension AppStore {
     func historyFilter(for request: DiffRequest, lines: (side: Side, range: ClosedRange<Int>)?, in project: Project) -> HistoryFilter? {
         func oneBased(_ range: ClosedRange<Int>) -> ClosedRange<Int> { (range.lowerBound + 1)...(range.upperBound + 1) }
         switch request.source {
+        case .externalFile:
+            return nil
         case .file, .worktree:
             if isNewSinceHead(request.path, in: project) || (request.kind == .untracked && !project.changes.contains { $0.path == request.path }) {
                 return nil
@@ -203,6 +208,7 @@ extension AppStore {
 
     /// Shows `comparison` in the project's Changes tab, from the top.
     func startComparison(_ comparison: Comparison, in project: Project) {
+        exitExternalFileMode()
         if popup == .gitGraph || popup == .quickOpen { dismissPopup(restoreFocus: false) }
         if selectedProjectID != project.id { select(project) }
         project.comparison = comparison
@@ -227,6 +233,7 @@ extension AppStore {
 
     /// Back to the local changes.
     func endComparison(in project: Project? = nil) {
+        exitExternalFileMode()
         guard let project = project ?? currentProject, project.comparison != nil else { return }
         project.comparison = nil
         project.compareChanges = []
@@ -246,6 +253,7 @@ extension AppStore {
         guard project.id == selectedProjectID, project.tab == .changes, let comparison = project.comparison,
               let id = project.compareSelectedID,
               let change = project.compareChanges.first(where: { ChangeRow.fileID($0.path) == id }) else { return }
+        exitExternalFileMode()
         if project.browsedPath != change.path { project.browsedPath = nil }
         showCompared(change, with: comparison, in: project)
         noteRecent(project, change.path)

@@ -58,6 +58,8 @@ protocol CodeCanvasDelegate: AnyObject {
     func canvas(_ canvas: CodeCanvasView, hoverAnnotation entry: LineAnnotations.Entry?, anchor: CGPoint)
     /// The Annotate label of a line was clicked.
     func canvas(_ canvas: CodeCanvasView, openAnnotation entry: LineAnnotations.Entry)
+    /// ⌘+Click on a symbol in an LSP-enabled pane (`line` is 0-based buffer line, `character` is 0-based UTF-16 offset).
+    func canvas(_ canvas: CodeCanvasView, goToDefinitionAt line: Int, character: Int)
 }
 
 // MARK: - Layers
@@ -269,6 +271,7 @@ final class CodeCanvasView: NSView {
             invalidate(.scroll)
             // A line's details describe the line that was under the pointer, which has just moved away.
             if hoveredAnnotationLine != nil { setHoveredAnnotation(nil) }
+            if lspHover != nil { clearLSPHover() }
         }
     }
 
@@ -409,6 +412,22 @@ final class CodeCanvasView: NSView {
     private var compositionUnderline: RectGroup!
     private var caretFrame: CGRect = .null
 
+    /// An eligible symbol currently underlined under ⌘+Hover on the right/live pane.
+    struct LSPHoverTarget: Equatable {
+        var row: Int
+        var line: Int
+        var column: Int
+        var range: Range<Int>
+    }
+
+    /// True while the right pane shows a live LSP-backed workspace file (never HEAD left pane, commits, or App Store).
+    var isLSPEnabled = false {
+        didSet { if !isLSPEnabled { clearLSPHover() } }
+    }
+    private(set) var lspHover: LSPHoverTarget?
+    private var lspHoverUnderline: RectGroup!
+    private var lastMousePoint: CGPoint?
+
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -454,6 +473,7 @@ final class CodeCanvasView: NSView {
         caretLayer.isHidden = true
         panes[1].text.addSublayer(caretLayer)
         compositionUnderline = RectGroup(host: panes[1].text, z: 7)
+        lspHoverUnderline = RectGroup(host: panes[1].text, z: 7)
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
@@ -489,6 +509,7 @@ final class CodeCanvasView: NSView {
         matches = []
         matchesByLine = [[:], [:]]
         currentMatch = -1
+        clearLSPHover()
         invalidateTextCaches()
         rebuildHunkRows()
         invalidate(.everything)
@@ -500,9 +521,67 @@ final class CodeCanvasView: NSView {
         let caret = editSelection
         requestedMode = mode
         selection = nil
+        clearLSPHover()
         rebuildHunkRows()
         if let caret { selection = TextSelection(pane: .right, anchor: rowPosition(caret.anchor), head: rowPosition(caret.head)) }
         invalidate(.everything)
+    }
+
+    /// Invalidates cached CoreText lines and text tiles for the changed 0-based buffer lines on `side`
+    /// without touching scroll offset, selection, or caret.
+    func invalidateSyntax(side: Side, lines changedLines: IndexSet) {
+        guard let doc = document, case .text = doc.content, !changedLines.isEmpty else { return }
+        for key in Array(lineCacheNew.keys) where (key & 1) == side.rawValue && changedLines.contains(key >> 1) {
+            lineCacheNew.removeValue(forKey: key)
+        }
+        for key in Array(lineCacheOld.keys) where (key & 1) == side.rawValue && changedLines.contains(key >> 1) {
+            lineCacheOld.removeValue(forKey: key)
+        }
+
+        let tileRows = Self.tileRows
+        switch mode {
+        case .sideBySide:
+            let pane = panes[side.rawValue]
+            let tiles = Set(changedLines.map { $0 / tileRows })
+            for (key, tile) in pane.textTiles where tiles.contains(key.index) {
+                tile.removeFromSuperlayer()
+                pane.textTiles.removeValue(forKey: key)
+            }
+            for index in tiles { pane.contentWidths.removeValue(forKey: index) }
+        case .single:
+            guard side == .right else { return }
+            let pane = panes[1]
+            let tiles = Set(changedLines.map { $0 / tileRows })
+            for (key, tile) in pane.textTiles where tiles.contains(key.index) {
+                tile.removeFromSuperlayer()
+                pane.textTiles.removeValue(forKey: key)
+            }
+            for index in tiles { pane.contentWidths.removeValue(forKey: index) }
+        case .unified:
+            let pane = panes[1]
+            let rows = doc.unifiedRows
+            var tiles = Set<Int>()
+            for key in pane.textTiles.keys {
+                let first = key.index * tileRows
+                let last = min(rows.count, first + tileRows)
+                guard first < last else { continue }
+                for r in first..<last {
+                    let row = rows[r]
+                    let line = side == .left ? (row.kind == .removed ? Int(row.left) : -1)
+                                             : (row.kind == .removed ? -1 : Int(row.right))
+                    if line >= 0, changedLines.contains(line) {
+                        tiles.insert(key.index)
+                        break
+                    }
+                }
+            }
+            for (key, tile) in pane.textTiles where tiles.contains(key.index) {
+                tile.removeFromSuperlayer()
+                pane.textTiles.removeValue(forKey: key)
+            }
+            for index in tiles { pane.contentWidths.removeValue(forKey: index) }
+        }
+        invalidate(.scroll)
     }
 
     func setCurrentMatch(_ index: Int) {
@@ -555,6 +634,7 @@ final class CodeCanvasView: NSView {
         guard dark != theme.isDark else { return }
         theme = dark ? .dark : .light
         activeStyles = theme.styles(for: document?.language)
+        if let hover = lspHover { setLSPHover(hover) }
         invalidateTextCaches()
         invalidate(.everything)
     }
@@ -2023,6 +2103,7 @@ final class CodeCanvasView: NSView {
 
     func handleMouseMoved(_ event: NSEvent?) {
         let point = event.map { convert($0.locationInWindow, from: nil) }
+        lastMousePoint = point
         let line = point.flatMap(annotatedLine(at:))
         if line != hoveredAnnotationLine { setHoveredAnnotation(line) }
         let hit = point.flatMap(revertHit(at:))
@@ -2031,17 +2112,174 @@ final class CodeCanvasView: NSView {
         if tick != hoveredTick { hoveredTick = tick }
         let conflict = point.flatMap(conflictHit(at:))
         if conflict?.block != hoveredConflict?.block || conflict?.choice != hoveredConflict?.choice { hoveredConflict = conflict }
-        // The canvas is one big text cursor rectangle; over a button or a commit it should look clickable.
+        let commandOnly = event.map { Self.isCommandOnly($0.modifierFlags) } ?? false
+        let buttonHit = hit != nil || tick != nil || conflict != nil || line != nil
+        if let point, commandOnly, !buttonHit {
+            updateLSPHover(at: point)
+        } else {
+            clearLSPHover()
+        }
+        // The canvas is one big text cursor rectangle; over a button, commit, or ⌘-hovered symbol it should look clickable.
         guard let point else { return }
         if hit != nil || tick != nil || conflict != nil {
             NSCursor.arrow.set()
-        } else if line != nil {
+        } else if line != nil || lspHover != nil {
             NSCursor.pointingHand.set()
         } else if annotationWidth > 0, point.x >= annotationX, point.x < annotationX + annotationWidth {
             NSCursor.arrow.set()
         } else {
             NSCursor.iBeam.set()
         }
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        super.flagsChanged(with: event)
+        handleFlagsChanged(event)
+    }
+
+    /// Updates ⌘+Hover visual feedback immediately when ⌘ is pressed or released while the pointer is stationary.
+    func handleFlagsChanged(_ event: NSEvent) {
+        guard isLSPEnabled, let doc = document, case .text = doc.content else {
+            clearLSPHover()
+            return
+        }
+        let point: CGPoint?
+        if let window {
+            let loc = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+            point = bounds.contains(loc) ? loc : nil
+        } else {
+            point = lastMousePoint.flatMap { bounds.contains($0) ? $0 : nil }
+        }
+        guard let point else {
+            clearLSPHover()
+            return
+        }
+        let commandOnly = Self.isCommandOnly(event.modifierFlags)
+        let overControl = revertHit(at: point) != nil || tickHit(at: point) != nil
+            || conflictHit(at: point) != nil || annotatedLine(at: point) != nil
+        if commandOnly && !overControl {
+            updateLSPHover(at: point)
+        } else {
+            clearLSPHover()
+        }
+        if revertHit(at: point) != nil || tickHit(at: point) != nil || conflictHit(at: point) != nil {
+            NSCursor.arrow.set()
+        } else if annotatedLine(at: point) != nil || lspHover != nil {
+            NSCursor.pointingHand.set()
+        } else if annotationWidth > 0, point.x >= annotationX, point.x < annotationX + annotationWidth {
+            NSCursor.arrow.set()
+        } else {
+            NSCursor.iBeam.set()
+        }
+    }
+
+    private static func isCommandOnly(_ flags: NSEvent.ModifierFlags) -> Bool {
+        flags.intersection([.command, .option, .control, .shift]) == .command
+    }
+
+    private func updateLSPHover(at point: CGPoint) {
+        let target = lspSymbolTarget(at: point)
+        if target != lspHover {
+            setLSPHover(target)
+        }
+    }
+
+    private func clearLSPHover() {
+        guard lspHover != nil else { return }
+        setLSPHover(nil)
+    }
+
+    private func setLSPHover(_ target: LSPHoverTarget?) {
+        lspHover = target
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        guard let target else {
+            lspHoverUnderline.clear()
+            return
+        }
+        let lh = codeFont.lineHeight
+        let layout = ctLine(.right, target.line)
+        let x0 = CTLineGetOffsetForStringIndex(layout, target.range.lowerBound, nil)
+        let x1 = CTLineGetOffsetForStringIndex(layout, target.range.upperBound, nil)
+        guard x1 > x0 else {
+            lspHoverUnderline.clear()
+            return
+        }
+        let y = CGFloat(target.row) * lh + min(lh - 1.5, codeFont.baseline + 2)
+        let rect = CGRect(x: textInset + x0, y: pixelRound(y), width: x1 - x0, height: 1.25)
+        lspHoverUnderline.set([rect], color: theme.accent)
+    }
+
+    /// Returns the eligible identifier symbol under `point` on the LSP-enabled right/live pane, or `nil`.
+    func lspSymbolTarget(at point: CGPoint) -> LSPHoverTarget? {
+        guard isLSPEnabled, let doc = document, case .text = doc.content else { return nil }
+        let rightRect = textRect(.right)
+        guard point.x >= rightRect.minX, point.x < rightRect.maxX else { return nil }
+        if mode == .sideBySide, pane(at: point) != .right { return nil }
+
+        let count = paneRowCount(.right)
+        guard count > 0 else { return nil }
+        let scroll = resolveScroll()
+        let rawRow = Int(floor((point.y + scroll.right) / codeFont.lineHeight))
+        guard rawRow >= 0, rawRow < count else { return nil }
+        guard let src = source(pane: .right, row: rawRow), src.side == .right else { return nil }
+        guard src.line >= 0, src.line < doc.right.lines.count else { return nil }
+
+        let text = doc.right.lines[src.line] as NSString
+        guard text.length > 0 else { return nil }
+
+        let layout = ctLine(.right, src.line)
+        let lineWidth = CGFloat(CTLineGetTypographicBounds(layout, nil, nil, nil))
+        let x = point.x - (rightRect.minX + textInset - scroll.x)
+        guard x >= 0, x <= lineWidth else { return nil }
+
+        guard let pos = position(at: point, pane: .right) else { return nil }
+        var col = pos.column
+        if col >= text.length || (col > 0 && CTLineGetOffsetForStringIndex(layout, col, nil) > x) {
+            col -= 1
+        }
+        guard col >= 0, col < text.length else { return nil }
+
+        guard let range = Self.symbolRange(in: text, spans: doc.right.spans(at: src.line), at: col) else { return nil }
+        return LSPHoverTarget(row: rawRow, line: src.line, column: col, range: range)
+    }
+
+    /// Finds the UTF-16 identifier range covering `column` in `text`, excluding non-identifiers,
+    /// pure numbers, comments, strings, keywords, operators, and backtick struct tags.
+    static func symbolRange(in text: NSString, spans: [SyntaxSpan], at column: Int) -> Range<Int>? {
+        let length = text.length
+        guard length > 0, column >= 0, column < length else { return nil }
+        func isIdentChar(_ c: unichar) -> Bool {
+            (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c >= 0x80
+        }
+        func isDigit(_ c: unichar) -> Bool { c >= 48 && c <= 57 }
+
+        guard isIdentChar(text.character(at: column)) else { return nil }
+        var start = column
+        var end = column + 1
+        while start > 0, isIdentChar(text.character(at: start - 1)) { start -= 1 }
+        while end < length, isIdentChar(text.character(at: end)) { end += 1 }
+
+        // Reject pure numeric literals (e.g. `123`, `0xFF`).
+        if isDigit(text.character(at: start)) { return nil }
+
+        // Check whether the covering syntax span forbids jump (comments, strings, numbers, keywords, operators, struct tags).
+        for span in spans {
+            let sStart = Int(span.start)
+            let sEnd = sStart + Int(span.length)
+            if sEnd <= column { continue }
+            if sStart > column { break }
+            switch span.kind {
+            case .comment, .string, .number, .keyword, .operator:
+                return nil
+            case .annotation:
+                if sStart < length, text.character(at: sStart) == 96 { return nil } // Go struct tag (`json:"..."`)
+            default:
+                break
+            }
+        }
+        return start..<end
     }
 
     /// Overview of every change in the file, plus the viewport position.
@@ -2155,6 +2393,13 @@ final class CodeCanvasView: NSView {
             }
             return
         }
+        if isLSPEnabled, event.clickCount == 1, Self.isCommandOnly(event.modifierFlags),
+           let target = lspSymbolTarget(at: point) {
+            clearLSPHover()
+            dragSelecting = false
+            delegate?.canvas(self, goToDefinitionAt: target.line, character: target.column)
+            return
+        }
         let side = pane(at: point)
         guard let pos = position(at: point, pane: side) else { selection = nil; return }
         switch event.clickCount {
@@ -2248,10 +2493,16 @@ final class CodeCanvasView: NSView {
         return parts.joined(separator: "\n")
     }
 
-    /// 1-based line number of the selection start (or the top visible line) on the new side.
+    /// 1-based line number of the selection start (or visible focus line / top visible line) on the new side.
     func currentLineNumber() -> Int {
         if let sel = selection, let src = source(pane: sel.pane, row: sel.lower.row) { return src.line + 1 }
         let scroll = resolveScroll()
+        if let focus = focusLine, focus.side == .right {
+            let focusRow = row(forLine: focus.line, side: .right)
+            if let visible = visibleRows(top: scroll.right, count: paneRowCount(.right)), visible.contains(focusRow) {
+                return focus.line + 1
+            }
+        }
         let row = max(0, Int((scroll.right + bounds.height * 0.3) / codeFont.lineHeight))
         if let src = source(pane: .right, row: min(row, max(0, paneRowCount(.right) - 1))) { return src.line + 1 }
         return 1

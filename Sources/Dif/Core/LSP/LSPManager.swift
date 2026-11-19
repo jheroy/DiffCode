@@ -4,7 +4,7 @@ import Foundation
 /// semantic token decoding, go-to-definition queries, and idle server reaping.
 actor LSPManager {
     /// Shared app-wide manager (enabled in Direct edition, disabled in sandboxed App Store edition).
-    static let shared = LSPManager()
+    static let shared = LSPManager(respectsEdition: true)
 
     private struct ServerKey: Hashable, Sendable {
         let serverID: String
@@ -21,8 +21,9 @@ actor LSPManager {
         var openDocuments: [String: LSPDocumentSession]
     }
 
-    /// Global gating flag. Defaults to `true` in Direct edition and `false` in App Store edition.
+    /// Global gating flag. Defaults to `AppEnvironment.hasLSP` (`true` in Direct edition, `false` in App Store edition).
     private(set) var isEnabled: Bool
+    private let respectsEdition: Bool
     private let idleTimeout: Duration
     private let serverOverrides: [String: LSPResolvedServer]
 
@@ -33,13 +34,21 @@ actor LSPManager {
     private var reaperTask: Task<Void, Never>?
 
     init(
-        isEnabled: Bool = !AppEnvironment.isAppStore,
+        isEnabled: Bool = AppEnvironment.hasLSP,
         idleTimeout: Duration = .seconds(300),
-        serverOverrides: [String: LSPResolvedServer] = [:]
+        serverOverrides: [String: LSPResolvedServer] = [:],
+        respectsEdition: Bool = false
     ) {
         self.isEnabled = isEnabled
+        self.respectsEdition = respectsEdition
         self.idleTimeout = idleTimeout
         self.serverOverrides = serverOverrides
+    }
+
+    /// Effective runtime enablement: `LSPManager.shared` also respects `AppEnvironment.hasLSP` dynamically
+    /// so the sandboxed App Store edition can never spawn language server processes.
+    var isEffectivelyEnabled: Bool {
+        isEnabled && (!respectsEdition || AppEnvironment.hasLSP)
     }
 
     /// Enables or disables LSP support at runtime. Disabling immediately shuts down all running servers.
@@ -64,7 +73,7 @@ actor LSPManager {
 
     /// Returns whether an LSP server binary is configured and installed for `language`.
     func isServerAvailable(for language: LanguageSpec) -> Bool {
-        guard isEnabled, let descriptor = LSPServerRegistry.descriptor(for: language) else { return false }
+        guard isEffectivelyEnabled, let descriptor = LSPServerRegistry.descriptor(for: language) else { return false }
         if serverOverrides[descriptor.id] != nil { return true }
         if unavailableServerIDs.contains(descriptor.id) { return false }
         return LSPServerRegistry.resolveServer(for: descriptor) != nil
@@ -112,7 +121,7 @@ actor LSPManager {
         text: String,
         workspaceRoot: URL? = nil
     ) async {
-        guard isEnabled else { return }
+        guard isEffectivelyEnabled else { return }
         guard let fileURL = LSPURI.fileURL(from: uri) else { return }
         let normalizedURI = LSPURI.uri(from: fileURL)
 
@@ -181,7 +190,7 @@ actor LSPManager {
 
     /// Sends a full-document `textDocument/didChange` notification for an open document.
     func didChange(uri: String, version: Int, text: String) async {
-        guard isEnabled else { return }
+        guard isEffectivelyEnabled else { return }
         let normalizedURI = LSPURI.normalize(uri)
         guard let key = documentToServer[normalizedURI],
               let server = servers[key] else { return }
@@ -214,7 +223,7 @@ actor LSPManager {
 
     /// Sends a `textDocument/didSave` notification for an open document.
     func didSave(uri: String, text: String? = nil) async {
-        guard isEnabled else { return }
+        guard isEffectivelyEnabled else { return }
         let normalizedURI = LSPURI.normalize(uri)
         guard let key = documentToServer[normalizedURI],
               let server = servers[key] else { return }
@@ -262,7 +271,7 @@ actor LSPManager {
 
     /// Requests full semantic tokens for an open document and decodes them into per-line spans.
     func semanticTokens(uri: String) async -> [Int: [LSPSemanticSpan]]? {
-        guard isEnabled else { return nil }
+        guard isEffectivelyEnabled else { return nil }
         let normalizedURI = LSPURI.normalize(uri)
         guard let key = documentToServer[normalizedURI],
               let server = servers[key],
@@ -298,7 +307,7 @@ actor LSPManager {
 
     /// Resolves `textDocument/definition` at a 0-based `(line, character)` UTF-16 position.
     func definition(uri: String, line: Int, character: Int) async -> [LSPLocation] {
-        guard isEnabled else { return [] }
+        guard isEffectivelyEnabled else { return [] }
         let normalizedURI = LSPURI.normalize(uri)
         guard let key = documentToServer[normalizedURI],
               let server = servers[key] else {
@@ -364,7 +373,7 @@ actor LSPManager {
         descriptor: LSPServerDescriptor,
         workspace: LSPWorkspaceContext
     ) async -> ServerInstance? {
-        guard isEnabled else { return nil }
+        guard isEffectivelyEnabled else { return nil }
         let key = ServerKey(serverID: descriptor.id, rootPath: workspace.rootURL.path)
 
         if let existing = servers[key] {
@@ -393,7 +402,7 @@ actor LSPManager {
         starting.removeValue(forKey: key)
 
         if let instance = result {
-            guard isEnabled else {
+            guard isEffectivelyEnabled else {
                 await instance.transport.shutdown()
                 return nil
             }

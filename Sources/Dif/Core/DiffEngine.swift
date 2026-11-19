@@ -4,6 +4,9 @@ import Foundation
 final class TextBuffer {
     private(set) var lines: [String]
     var spans: [[SyntaxSpan]] = []
+    /// Base Lexer spans preserved separately once LSP semantic tokens are overlaid,
+    /// so subsequent semantic refreshes re-merge cleanly without compounding.
+    var baseSpans: [[SyntaxSpan]]?
     /// The lexer state at the start of each line and after the last, for buffers that can be edited:
     /// an edit then re-colours only the lines it affects.
     var states: [Highlighter.State]?
@@ -50,6 +53,11 @@ final class TextBuffer {
         } else {
             spans = []
         }
+        if count > 0, baseSpans?.count == count {
+            baseSpans!.replaceSubrange(raw.start..<(raw.start + raw.removed), with: repeatElement([], count: raw.inserted))
+        } else {
+            baseSpans = nil
+        }
         if count > 0, states?.count == count + 1 {
             // The states going into the first rewritten line, and into the line after them, are kept.
             states!.replaceSubrange((raw.start + 1)..<(raw.start + raw.removed),
@@ -58,6 +66,38 @@ final class TextBuffer {
             states = nil
         }
         return result
+    }
+
+    /// Merges per-line LSP semantic spans over the preserved base Lexer spans.
+    /// Returns the 0-based line indices whose displayed spans changed.
+    @discardableResult
+    func applySemanticTokens(_ semanticByLine: [Int: [LSPSemanticSpan]]) -> IndexSet {
+        guard !lines.isEmpty else { return IndexSet() }
+        if baseSpans == nil || baseSpans?.count != lines.count {
+            if spans.count == lines.count {
+                baseSpans = spans
+            } else {
+                baseSpans = [[SyntaxSpan]](repeating: [], count: lines.count)
+            }
+        }
+        if spans.count != lines.count {
+            spans = baseSpans!
+        }
+        let base = baseSpans!
+        var changed = IndexSet()
+        for line in 0..<lines.count {
+            let merged: [SyntaxSpan]
+            if let sem = semanticByLine[line], !sem.isEmpty {
+                merged = SyntaxOverlay.merge(base: base[line], semantic: sem)
+            } else {
+                merged = base[line]
+            }
+            if spans[line] != merged {
+                spans[line] = merged
+                changed.insert(line)
+            }
+        }
+        return changed
     }
 }
 
@@ -538,6 +578,8 @@ struct DiffRequest: Equatable {
         case commit(hash: String, parent: String?)
         /// A plain file from the working tree, no comparison.
         case file
+        /// An external read-only file opened via LSP navigation (sibling `go.work` repo, `$GOROOT`, `pkg/mod`…).
+        case externalFile(displayPath: String, workspaceRoot: URL?)
     }
 
     var root: URL
@@ -551,6 +593,39 @@ struct DiffRequest: Equatable {
     var isAgainstHead: Bool {
         if case .worktree(let base) = source { return base == "HEAD" || base == Git.emptyTree }
         return false
+    }
+
+    var isExternalFile: Bool {
+        if case .externalFile = source { return true }
+        return false
+    }
+
+    var fileURL: URL {
+        root.appendingPathComponent(path)
+    }
+
+    /// True when the right side represents a live file on disk eligible for LSP semantic highlighting & navigation.
+    var isLiveFile: Bool {
+        switch source {
+        case .file, .externalFile: return true
+        case .worktree: return kind != .deleted
+        case .commit: return false
+        }
+    }
+
+    /// Repository or workspace root passed to `LSPManager` for workspace/go.work discovery.
+    var lspRepoRoot: URL? {
+        switch source {
+        case .externalFile(_, let workspaceRoot): return workspaceRoot
+        case .file, .worktree: return root
+        case .commit: return nil
+        }
+    }
+
+    /// Path shown in the viewer header (`<repo>/<relPath>` or `~/...` for external files).
+    var displayPath: String {
+        if case .externalFile(let display, _) = source { return display }
+        return path
     }
 }
 
@@ -595,10 +670,10 @@ enum DiffLoader {
         var leftTitle = "", rightTitle = ""
 
         switch request.source {
-        case .file:
+        case .file, .externalFile:
             newData = readWorktree(root, request.path)
             guard let data = newData else {
-                return .message(L("File not found", "文件不存在"), detail: request.path)
+                return .message(L("File not found", "文件不存在"), detail: request.displayPath)
             }
             if imageExtensions.contains(ext) {
                 return DiffDocument(left: .empty, right: .empty, hunks: [], language: .plain,
@@ -609,6 +684,12 @@ enum DiffLoader {
             }
             if data.count > maxTextBytes {
                 return .message(L("File too large to display", "文件过大，无法显示"), detail: data.count.byteSizeString)
+            }
+            if request.isExternalFile {
+                let buffer = await makeBuffer(data, language)
+                let doc = DiffDocument(left: .empty, right: buffer, hunks: [], language: language, isPlainFile: true)
+                doc.editing = EditInfo(readOnlyReason: L("Read-only", "只读"))
+                return doc
             }
             let (buffer, editing) = await makeWorktreeSide(data, language, url: root.appendingPathComponent(request.path), base: nil)
             let doc = DiffDocument(left: .empty, right: buffer, hunks: [], language: language, isPlainFile: true)

@@ -130,6 +130,21 @@ private struct ViewerHeader: View {
     var body: some View {
         let viewer = store.viewer
         HStack(spacing: 8) {
+            if store.canNavigateBack || store.canNavigateForward {
+                HStack(spacing: 2) {
+                    IconButton(symbol: "chevron.left", help: L("Navigate Back (⌘[)", "后退 (⌘[)"), size: 11) {
+                        store.navigateBack()
+                    }
+                    .disabled(!store.canNavigateBack)
+                    .opacity(store.canNavigateBack ? 1 : 0.35)
+                    IconButton(symbol: "chevron.right", help: L("Navigate Forward (⌘])", "前进 (⌘])"), size: 11) {
+                        store.navigateForward()
+                    }
+                    .disabled(!store.canNavigateForward)
+                    .opacity(store.canNavigateForward ? 1 : 0.35)
+                }
+                Divider().frame(height: 14)
+            }
             if let request = viewer.request {
                 FileIcon(path: request.path, size: 13)
                 PathLabel(request: request)
@@ -259,8 +274,9 @@ private struct PathLabel: View {
     var request: DiffRequest
 
     var body: some View {
-        let name = (request.path as NSString).lastPathComponent
-        let directory = (request.path as NSString).deletingLastPathComponent
+        let shown = request.displayPath
+        let name = (shown as NSString).lastPathComponent
+        let directory = (shown as NSString).deletingLastPathComponent
         HStack(spacing: 6) {
             Text(name)
                 .font(.ui(size: 13, weight: .semibold))
@@ -281,7 +297,7 @@ private struct PathLabel: View {
                     .truncationMode(.head)
             }
         }
-        .help(request.oldPath.map { "\($0) → \(request.path)" } ?? request.path)
+        .help(request.isExternalFile ? request.fileURL.path : (request.oldPath.map { "\($0) → \(request.path)" } ?? request.path))
     }
 }
 

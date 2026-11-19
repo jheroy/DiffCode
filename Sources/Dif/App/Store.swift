@@ -64,6 +64,13 @@ final class AppStore {
     var commitFocusToken = 0
     @ObservationIgnored var commitFocusRequestedAt: CFTimeInterval = 0
 
+    // LSP navigation (see LSPNavigation.swift).
+    /// Back (`⌘[`) / Forward (`⌘]`) stack for definition jumps.
+    var jumpHistory = JumpHistory()
+    /// Active external read-only file request (sibling `go.work` repo, `$GOROOT`, `pkg/mod`…), cleared on normal navigation.
+    var externalRequest: DiffRequest?
+    @ObservationIgnored var definitionTask: Task<Void, Never>?
+
     @ObservationIgnored var recent: [RecentFile] = []
     /// Rollbacks and deletes that can still be undone, oldest first.
     @ObservationIgnored var undoStack: [UndoItem] = []
@@ -97,6 +104,7 @@ final class AppStore {
         // A save shows in the Changes list straight away, without waiting for the file watcher.
         viewer.onFileWritten = { [weak self] root in self?.projects.first { $0.url == root }?.refresh() }
         viewer.onOpenAnnotation = { [weak self] entry in self?.openAnnotation(entry) }
+        viewer.onGoToDefinition = { [weak self] line, col in self?.goToDefinition(line: line, character: col) }
         quickOpen.store = self
         finder.store = self
         terminals.store = self
@@ -323,6 +331,7 @@ final class AppStore {
         projects.removeAll { $0.id == project.id }
         FolderAccess.shared.release(project.url.path, keepingFor: projects.map(\.url.path))
         if selectedProjectID == project.id {
+            exitExternalFileMode()
             // A work tree that went: back to its repository.
             let owner = project.worktreeOf.flatMap { id in projects.first { $0.id == id } }
             selectedProjectID = (owner ?? projects.first)?.id
@@ -463,6 +472,7 @@ final class AppStore {
     }
 
     func select(_ project: Project) {
+        exitExternalFileMode()
         // Chosen from elsewhere (Quick Open, a new repository found): it must be in sight.
         if let index = projects.firstIndex(where: { $0.id == project.id }) {
             let folded = ProjectTree.ancestors(of: index, parents: projectParents).map { projects[$0].url.path }
@@ -505,6 +515,14 @@ final class AppStore {
     /// Points the viewer at whatever the current project's selection implies: the file being browsed
     /// by path if there is one, otherwise the selection of the list column.
     func syncViewer() {
+        if let external = externalRequest {
+            if viewer.request == external {
+                viewer.reloadIfStale(base: nil)
+            } else {
+                viewer.open(external)
+            }
+            return
+        }
         guard let project = currentProject else {
             viewer.clear()
             return
@@ -586,6 +604,7 @@ final class AppStore {
         guard project.id == selectedProjectID, project.tab == .changes,
               let id = project.selectedChangeID,
               let change = project.changes.first(where: { ChangeRow.fileID($0.path) == id }) else { return }
+        exitExternalFileMode()
         // Picking another change ends browsing; the highlight following the browsed file does not.
         if project.browsedPath != change.path { project.browsedPath = nil }
         show(change, in: project)
@@ -594,6 +613,7 @@ final class AppStore {
     }
 
     func commitSelectionChanged(_ project: Project) {
+        exitExternalFileMode()
         project.loadSelectedCommit { [weak self, weak project] in
             guard let self, let project, project.id == self.selectedProjectID, project.tab == .log else { return }
             self.syncViewer()
@@ -602,13 +622,16 @@ final class AppStore {
 
     func commitFileSelectionChanged(_ project: Project) {
         guard project.id == selectedProjectID, project.tab == .log else { return }
+        exitExternalFileMode()
         syncViewer()
         if project.browsedPath == nil, let path = viewer.request?.path { follow(path, in: project) }
     }
 
     /// The user picked a commit or one of its files: the viewer goes back to following the Log.
     func pickedInLog(_ project: Project, commitChanged: Bool) {
-        guard project.browsedPath != nil else { return }
+        let wasExternal = externalRequest != nil
+        exitExternalFileMode()
+        guard project.browsedPath != nil || wasExternal else { return }
         project.browsedPath = nil
         // A click on the row that is already selected changes nothing, so nothing else would bring its diff back.
         if commitChanged { commitSelectionChanged(project) } else { commitFileSelectionChanged(project) }
@@ -681,8 +704,10 @@ final class AppStore {
 
     func setTab(_ tab: ProjectTab) {
         guard let project = currentProject else { return }
+        let wasExternal = externalRequest != nil
+        exitExternalFileMode()
         if !listVisible { listVisible = true }
-        if project.tab != tab {
+        if project.tab != tab || wasExternal {
             project.tab = tab
             project.browsedPath = nil
             syncViewer()
@@ -694,6 +719,7 @@ final class AppStore {
     @discardableResult
     func stepFile(_ delta: Int) -> Bool {
         guard let project = currentProject else { return false }
+        exitExternalFileMode()
         let listed = project.comparison != nil ? project.compareChanges : project.changes
         if let path = project.browsedPath, !(project.tab == .changes && listed.contains { $0.path == path }) {
             // Browsing a file the list column does not hold: walk the files the tree shows.
@@ -754,6 +780,7 @@ final class AppStore {
     }
 
     private func browse(_ path: String, in project: Project, line: Int?) {
+        exitExternalFileMode()
         noteRecent(project, path)
         project.browsedPath = path
         viewer.setBaseStamp(project.status.headOID)
@@ -951,7 +978,7 @@ final class AppStore {
 
     func copyPath(withLine: Bool = false) {
         guard let request = viewer.request else { return }
-        var text = request.path
+        var text = request.isExternalFile ? request.fileURL.path : request.path
         if withLine, let line = viewer.container?.canvas.currentLineNumber() { text += ":\(line)" }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)

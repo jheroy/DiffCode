@@ -366,7 +366,16 @@ final class EditorSession {
             crlf!.replaceSubrange(raw.start..<(raw.start + raw.removed), with: added + [last])
         }
         var recoloured = raw.start..<(raw.start + raw.inserted)
-        if buffer.states != nil, buffer.spans.count == buffer.lines.count {
+        if buffer.states != nil, buffer.baseSpans != nil, buffer.baseSpans!.count == buffer.lines.count {
+            let range = Highlighter.rehighlight(buffer.lines, language: document.language, from: raw.start, count: raw.inserted,
+                                                spans: &buffer.baseSpans!, states: &buffer.states!)
+            if buffer.spans.count == buffer.lines.count {
+                for row in range {
+                    buffer.spans[row] = buffer.baseSpans![row]
+                }
+            }
+            recoloured = min(recoloured.lowerBound, range.lowerBound)..<max(recoloured.upperBound, range.upperBound)
+        } else if buffer.states != nil, buffer.spans.count == buffer.lines.count {
             let range = Highlighter.rehighlight(buffer.lines, language: document.language, from: raw.start, count: raw.inserted,
                                                 spans: &buffer.spans, states: &buffer.states!)
             recoloured = min(recoloured.lowerBound, range.lowerBound)..<max(recoloured.upperBound, range.upperBound)

@@ -151,6 +151,10 @@ extension AppStore {
                 guard let self, self.viewer.isTextDocument else { return }
                 self.present(.goToLine)
             },
+            AppCommand(id: "nav.back", title: L("Navigate Back", "后退"), symbol: "chevron.left", group: .navigate,
+                       key: "[", modifiers: .command, separatorBefore: true) { [weak self] in self?.navigateBack() },
+            AppCommand(id: "nav.forward", title: L("Navigate Forward", "前进"), symbol: "chevron.right", group: .navigate,
+                       key: "]", modifiers: .command) { [weak self] in self?.navigateForward() },
             AppCommand(id: "nav.nextDiff", title: L("Next Difference", "下一处差异"), symbol: "arrow.down", group: .navigate,
                        key: KeyLabel.function(7), separatorBefore: true) { viewer.stepDifference(1) },
             AppCommand(id: "nav.prevDiff", title: L("Previous Difference", "上一处差异"), symbol: "arrow.up", group: .navigate,
@@ -247,6 +251,7 @@ extension AppStore {
             },
         ]
         .filter { AppEnvironment.hasTerminal || ($0.group != .terminal && $0.id != "view.terminal") }
+        .filter { AppEnvironment.hasLSP || ($0.id != "nav.back" && $0.id != "nav.forward") }
         + editionCommands
     }
 

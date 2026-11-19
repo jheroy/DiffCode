@@ -115,6 +115,7 @@ extension ViewerModel {
         if let focused = focusedHunk, focused >= hunkCount { focusedHunk = nil }
         scheduleSave()
         scheduleDiff()
+        scheduleLSPChange()
     }
 
     // MARK: Writing
@@ -190,6 +191,7 @@ extension ViewerModel {
         signature = Self.signature(for: request, base: loadedStamp)
         updateDirty()
         onFileWritten?(request.root)
+        notifyLSPSaved()
         // Who changed what is worked out again from the file as written.
         if annotating { scheduleAnnotations() }
         return true
@@ -213,6 +215,7 @@ extension ViewerModel {
         updateDirty()
         if let doc = document, hunkCount != doc.hunks.count { hunkCount = doc.hunks.count }
         scheduleDiff()
+        scheduleLSPChange()
         onToast?(L("Changed by another program · its version is loaded; ⌘Z brings yours back",
                    "文件被其他程序改了，已载入新版本；⌘Z 找回你的修改"))
     }

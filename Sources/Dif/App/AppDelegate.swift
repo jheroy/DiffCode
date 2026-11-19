@@ -171,6 +171,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         store.settings.save()
         store.terminals.terminateAll()
+        if AppEnvironment.hasLSP {
+            // Best-effort clean shutdown of language servers without hanging app quit.
+            let done = DispatchSemaphore(value: 0)
+            Task.detached(priority: .userInitiated) {
+                await LSPManager.shared.shutdownAll()
+                done.signal()
+            }
+            _ = done.wait(timeout: .now() + 0.5)
+        }
         DiffLoader.cleanup()
         // Here, not when Restart is clicked: by now nothing can call the quit off.
         if relaunchAfterQuit { relaunchWhenGone() }
@@ -245,6 +254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self else { return event }
             switch event.type {
             case .flagsChanged:
+                self.store.viewer.container?.canvas.handleFlagsChanged(event)
                 let flags = event.modifierFlags.intersection([.shift, .control, .option, .command])
                 let isShift = event.keyCode == 56 || event.keyCode == 60
                 if isShift, flags == .shift {

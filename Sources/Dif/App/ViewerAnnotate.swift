@@ -36,6 +36,8 @@ extension ViewerModel {
         switch request.source {
         case .file:
             return (request.path, nil)
+        case .externalFile:
+            return nil
         case .worktree:
             // A file never committed has nothing to tell; one added since the commit compared with may well have.
             if request.kind == .deleted || request.kind == .untracked { return nil }

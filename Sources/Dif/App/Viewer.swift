@@ -78,6 +78,14 @@ final class ViewerModel: CodeCanvasDelegate {
     /// A line's commit was clicked in the Annotate column.
     @ObservationIgnored var onOpenAnnotation: ((LineAnnotations.Entry) -> Void)?
 
+    // LSP (see ViewerLSP.swift).
+    @ObservationIgnored var lspDocument: ActiveLSPDocument?
+    @ObservationIgnored var lspGeneration: UInt64 = 0
+    @ObservationIgnored var lspTask: Task<Void, Never>?
+    @ObservationIgnored var lspDebounceTimer: Timer?
+    /// ⌘+Click on a symbol in an LSP-enabled pane (`line` is 0-based, `character` is 0-based UTF-16).
+    @ObservationIgnored var onGoToDefinition: ((Int, Int) -> Void)?
+
     var canvasMode: CodeCanvasView.Mode { settings.unified ? .unified : .sideBySide }
 
     var isTextDocument: Bool {
@@ -103,6 +111,7 @@ final class ViewerModel: CodeCanvasDelegate {
         container.show(document, mode: canvasMode, preserveScroll: false)
         container.canvas.showsRevertButtons = canRevertHunks
         container.canvas.editor = editor
+        container.canvas.isLSPEnabled = isCurrentDocumentLSPEnabled
         if let doc = document { position(doc) }
         observeFocusChanges()
     }
@@ -180,6 +189,7 @@ final class ViewerModel: CodeCanvasDelegate {
         saveEdits()
         loadTask?.cancel()
         blameTask?.cancel()
+        closeLSPDocument()
         annotationHover = nil
         request = nil
         endEditing()
@@ -189,6 +199,7 @@ final class ViewerModel: CodeCanvasDelegate {
         focusedHunk = nil
         container?.show(nil, mode: canvasMode, preserveScroll: false)
         container?.canvas.showsRevertButtons = false
+        container?.canvas.isLSPEnabled = false
         container?.canvas.conflicts = []
         conflictCount = 0
         onDocumentChanged?()
@@ -241,6 +252,7 @@ final class ViewerModel: CodeCanvasDelegate {
         container?.show(doc, mode: canvasMode, preserveScroll: preserveScroll)
         container?.canvas.showsRevertButtons = canRevertHunks
         beginEditing(doc, caret: caret)
+        syncLSPForCurrentDocument()
         refreshConflicts()
         annotationHover = nil
         if annotating { loadAnnotations() }
@@ -518,6 +530,10 @@ final class ViewerModel: CodeCanvasDelegate {
     func canvas(_ canvas: CodeCanvasView, openAnnotation entry: LineAnnotations.Entry) {
         annotationHover = nil
         onOpenAnnotation?(entry)
+    }
+
+    func canvas(_ canvas: CodeCanvasView, goToDefinitionAt line: Int, character: Int) {
+        onGoToDefinition?(line, character)
     }
 
     func canvasDidMagnify(_ canvas: CodeCanvasView, by delta: CGFloat) {

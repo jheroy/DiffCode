@@ -48,6 +48,10 @@ enum AppEnvironment {
     /// would cripple (no tools, no files outside the granted folders); it is left out there.
     static var hasTerminal: Bool { !isAppStore }
 
+    /// Language servers (gopls, rust-analyzer, sourcekit-lsp…) invoke user toolchains and read module caches
+    /// outside the App Store sandbox; LSP is enabled in the direct download and disabled in the App Store edition.
+    static var hasLSP: Bool { !isAppStore }
+
     /// What DiffCode's own process starts with (Info.plist `LSEnvironment`) but the programs it runs must not:
     /// `MallocSpaceEfficient` trades a little allocation speed for a much smaller, less fragmented heap, which suits
     /// a viewer that idles most of the day, not a compiler or a coding agent started from its terminal.
