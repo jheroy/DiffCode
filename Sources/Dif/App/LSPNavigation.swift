@@ -158,6 +158,20 @@ final class ReferencesPickerModel {
             }
         }
     }
+    var excludeTestGo: Bool {
+        didSet {
+            if excludeTestGo != oldValue {
+                persistAndRefilter()
+            }
+        }
+    }
+    var onlyGoFiles: Bool {
+        didSet {
+            if onlyGoFiles != oldValue {
+                persistAndRefilter()
+            }
+        }
+    }
     var items: [ReferenceItem] = []
     private(set) var filteredItems: [ReferenceItem] = []
     var selectedIndex: Int = 0
@@ -165,13 +179,25 @@ final class ReferencesPickerModel {
     var isLoadingPreviews: Bool = false
     private(set) var previewContext: ReferencePreviewContext?
 
+    var fileFilter: PopupFileFilter {
+        PopupFileFilter(excludeTestGo: excludeTestGo, onlyGoFiles: onlyGoFiles)
+    }
+
     @ObservationIgnored var origin: JumpLocation?
     @ObservationIgnored var originFileURL: URL?
     @ObservationIgnored var originRepoRoot: URL?
     @ObservationIgnored weak var store: AppStore?
+    @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private var fileCache: [URL: CachedPreviewFile] = [:]
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var generation: UInt64 = 0
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        let saved = PopupFileFilter.load(scope: .references, defaults: defaults)
+        self.excludeTestGo = saved.excludeTestGo
+        self.onlyGoFiles = saved.onlyGoFiles
+    }
 
     var selectedItem: ReferenceItem? {
         guard filteredItems.indices.contains(selectedIndex) else { return nil }
@@ -401,9 +427,14 @@ final class ReferencesPickerModel {
         previewContext = nil
     }
 
+    private func persistAndRefilter() {
+        fileFilter.save(scope: .references, defaults: defaults)
+        rebuildFiltered()
+    }
+
     private func rebuildFiltered() {
         let previousID = selectedItem?.id
-        let filtered = Self.filterItems(items, query: filterQuery)
+        let filtered = Self.filterItems(items, query: filterQuery, fileFilter: fileFilter)
         filteredItems = filtered
         if let previousID, let idx = filtered.firstIndex(where: { $0.id == previousID }) {
             selectedIndex = idx
@@ -459,13 +490,18 @@ final class ReferencesPickerModel {
 
     // MARK: - Pure Filtering, Snippet & Context Helpers
 
-    /// Filters reference items by space-separated case-insensitive tokens against path, line preview, and line number.
-    nonisolated static func filterItems(_ items: [ReferenceItem], query: String) -> [ReferenceItem] {
+    /// Filters reference items by file filter toggles and space-separated case-insensitive tokens against path, line preview, and line number.
+    nonisolated static func filterItems(
+        _ items: [ReferenceItem],
+        query: String,
+        fileFilter: PopupFileFilter = PopupFileFilter()
+    ) -> [ReferenceItem] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return items }
-        let tokens = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
+        let tokens = trimmed.isEmpty ? [] : trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard fileFilter.isActive || !tokens.isEmpty else { return items }
         return items.filter { item in
-            tokens.allSatisfy { token in
+            guard fileFilter.matches(path: item.displayPath) else { return false }
+            return tokens.allSatisfy { token in
                 item.displayPath.localizedCaseInsensitiveContains(token)
                     || item.linePreview.localizedCaseInsensitiveContains(token)
                     || "\(item.lineNumber)".contains(token)

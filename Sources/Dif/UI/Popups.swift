@@ -380,7 +380,7 @@ struct FindInPathView: View {
                     TextField(L("File mask, e.g. *.kt", "文件过滤，例如 *.kt"), text: $model.options.fileMask)
                         .textFieldStyle(.plain)
                         .font(.ui(size: 12))
-                        .frame(width: UI.s(170))
+                        .frame(width: UI.s(150))
                         .onSubmit { model.search() }
                 }
                 .padding(.horizontal, 8)
@@ -398,11 +398,13 @@ struct FindInPathView: View {
                         }
                     }
                 }
+                GoFileFilterPills(excludeTestGo: $model.excludeTestGo, onlyGoFiles: $model.onlyGoFiles)
                 Spacer()
                 if model.isSearching { ProgressView().controlSize(.small).scaleEffect(0.65) }
                 Text(summary(model))
                     .font(.ui(size: 11.5))
                     .foregroundStyle(model.errorText == nil ? Color.difText3 : Color.difRemoved)
+                    .lineLimit(1)
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 10)
@@ -421,13 +423,13 @@ struct FindInPathView: View {
                     ScrollViewReader { proxy in
                         ScrollView {
                             LazyVStack(spacing: 0) {
-                                ForEach(model.hits) { hit in
-                                    FindHitRow(hit: hit, isSelected: hit.id == model.selected,
+                                ForEach(Array(model.hits.enumerated()), id: \.element.id) { index, hit in
+                                    FindHitRow(hit: hit, isSelected: index == model.selected,
                                                projectName: model.allProjects ? store.project(hit.projectID)?.name : nil)
-                                        .id(hit.id)
+                                        .id(index)
                                         .contentShape(Rectangle())
                                         .onTapGesture {
-                                            model.select(hit.id)
+                                            model.select(index)
                                             if (NSApp.currentEvent?.clickCount ?? 1) >= 2 { model.activate() }
                                         }
                                 }
@@ -479,9 +481,67 @@ struct FindInPathView: View {
 
     private func summary(_ model: FindInPathModel) -> String {
         if let error = model.errorText { return error }
-        guard !model.hits.isEmpty else { return "" }
+        guard !model.hits.isEmpty else {
+            return model.totalHitCount > 0
+                ? L("0 of \(model.totalHitCount) matches", "0 / \(model.totalHitCount) 处匹配")
+                : ""
+        }
         let count = model.truncated ? "\(model.hits.count)+" : "\(model.hits.count)"
+        if model.fileFilter.isActive && model.hits.count != model.totalHitCount {
+            return L("\(count) / \(model.totalHitCount) matches in \(model.fileCount) files", "\(model.fileCount) 个文件中有 \(count) / \(model.totalHitCount) 处匹配")
+        }
         return L("\(count) matches in \(model.fileCount) files", "\(model.fileCount) 个文件中有 \(count) 处匹配")
+    }
+}
+
+private struct GoFileFilterPills: View {
+    @Binding var excludeTestGo: Bool
+    @Binding var onlyGoFiles: Bool
+
+    var body: some View {
+        HStack(spacing: 5) {
+            FilterPillToggle(
+                label: "!*test.go",
+                help: L("Exclude *test.go files", "过滤 *test.go 文件"),
+                isOn: excludeTestGo
+            ) {
+                excludeTestGo.toggle()
+            }
+            FilterPillToggle(
+                label: "*.go",
+                help: L("Go files only", "仅显示 .go 文件"),
+                isOn: onlyGoFiles
+            ) {
+                onlyGoFiles.toggle()
+            }
+        }
+    }
+}
+
+private struct FilterPillToggle: View {
+    var label: String
+    var help: String
+    var isOn: Bool
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(label)
+                .font(.ui(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(isOn ? Color.difAccent : Color.difText2)
+                .padding(.horizontal, 7)
+                .frame(height: UI.s(24))
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(isOn ? Color.difAccent.opacity(0.16) : Color.difChip)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(isOn ? Color.difAccent.opacity(0.45) : Color.clear, lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 }
 
@@ -590,6 +650,8 @@ struct ReferencesPopupView: View {
 
                 Spacer(minLength: 8)
 
+                GoFileFilterPills(excludeTestGo: $model.excludeTestGo, onlyGoFiles: $model.onlyGoFiles)
+
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass")
                         .font(.ui(size: 11))
@@ -603,7 +665,7 @@ struct ReferencesPopupView: View {
                         onSubmit: { model.activate() },
                         onCancel: { store.dismissPopup() }
                     )
-                    .frame(width: UI.s(220), height: UI.s(20))
+                    .frame(width: UI.s(175), height: UI.s(20))
                     if !model.filterQuery.isEmpty {
                         Button {
                             model.filterQuery = ""
@@ -752,10 +814,12 @@ struct ReferencesPopupView: View {
     }
 
     private func countLabel(_ model: ReferencesPickerModel) -> String {
-        if model.filterQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let isFiltered = !model.filterQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || model.fileFilter.isActive
+        if !isFiltered {
             return "\(model.items.count)"
         }
-        return "\(model.filteredItems.count)/\(model.items.count)"
+        return "\(model.filteredItems.count) / \(model.items.count)"
     }
 }
 
