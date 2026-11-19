@@ -396,12 +396,22 @@ enum DiffParser {
 // MARK: - Word-level diff
 
 enum InlineDiff {
+    private enum TokenClass: UInt8 {
+        case lineBreak
+        case space
+        case word
+        case punct
+    }
+
     private struct Token {
         var line: Int32
         var start: Int32
         var length: Int32
         var hash: UInt64
-        var isSpace: Bool
+        var tokenClass: TokenClass
+        var unit: UInt16
+
+        var isSpace: Bool { tokenClass == .space || tokenClass == .lineBreak }
     }
 
     static let maxTokens = 3000
@@ -410,19 +420,39 @@ enum InlineDiff {
         var tokens: [Token] = []
         for (lineIndex, line) in lines.enumerated() {
             if lineIndex > 0 {
-                tokens.append(Token(line: Int32(lineIndex - 1), start: -1, length: 0, hash: 0x9E3779B97F4A7C15, isSpace: true))
+                tokens.append(Token(
+                    line: Int32(lineIndex - 1),
+                    start: -1,
+                    length: 0,
+                    hash: 0x9E3779B97F4A7C15,
+                    tokenClass: .lineBreak,
+                    unit: 0
+                ))
             }
             var start = 0
             var hash: UInt64 = 0xcbf29ce484222325
-            var cls = -1 // 0 word, 1 space
+            var cls = -1 // 0 word, 1 space, 2 punct
+            var firstUnit: UInt16 = 0
             var i = 0
             func flush(_ end: Int) {
                 if cls >= 0, end > start {
-                    tokens.append(Token(line: Int32(lineIndex), start: Int32(start), length: Int32(end - start),
-                                        hash: hash ^ UInt64(end - start), isSpace: cls == 1))
+                    let tokenClass: TokenClass = switch cls {
+                    case 1: .space
+                    case 2: .punct
+                    default: .word
+                    }
+                    tokens.append(Token(
+                        line: Int32(lineIndex),
+                        start: Int32(start),
+                        length: Int32(end - start),
+                        hash: hash ^ UInt64(end - start),
+                        tokenClass: tokenClass,
+                        unit: firstUnit
+                    ))
                 }
                 cls = -1
                 hash = 0xcbf29ce484222325
+                firstUnit = 0
             }
             for unit in line.utf16 {
                 let c: Int
@@ -438,15 +468,16 @@ enum InlineDiff {
                     flush(i)
                     // A high surrogate starts a pair; let the low surrogate (class 0) join it.
                     start = i
+                    firstUnit = unit
                     hash = (0xcbf29ce484222325 ^ UInt64(unit)) &* 0x100000001b3
                     if unit >= 0xD800 && unit <= 0xDBFF {
                         cls = 0
                     } else {
-                        cls = 0
+                        cls = 2
                         flush(i + 1)
                     }
                 } else {
-                    if c != cls { flush(i); start = i; cls = c }
+                    if c != cls { flush(i); start = i; cls = c; firstUnit = unit }
                     hash = (hash ^ UInt64(unit)) &* 0x100000001b3
                 }
                 i += 1
@@ -457,15 +488,227 @@ enum InlineDiff {
         return tokens
     }
 
+    @inline(__always)
+    private static func tokensEqual(_ a: Token, _ b: Token) -> Bool {
+        a.hash == b.hash && a.length == b.length && a.tokenClass == b.tokenClass && a.unit == b.unit
+    }
+
+    @inline(__always)
+    private static func isOpeningDelimiter(_ unit: UInt16) -> Bool {
+        unit == 40 || unit == 91 || unit == 123 // '(', '[', '{'
+    }
+
+    @inline(__always)
+    private static func isClosingDelimiter(_ unit: UInt16) -> Bool {
+        unit == 41 || unit == 93 || unit == 125 // ')', ']', '}'
+    }
+
+    @inline(__always)
+    private static func isSeparator(_ unit: UInt16) -> Bool {
+        unit == 44 || unit == 59 || unit == 58 // ',', ';', ':'
+    }
+
+    /// Scores splitting between `left` and `right` for semantic lossless boundary shifting.
+    private static func boundaryScore(left: Token?, right: Token?) -> Int {
+        guard let l = left else {
+            guard let r = right else { return 0 }
+            if r.tokenClass == .lineBreak { return 100 }
+            return r.tokenClass == .space ? 20 : 100
+        }
+        guard let r = right else {
+            if l.tokenClass == .lineBreak { return 100 }
+            return l.tokenClass == .space ? 20 : 100
+        }
+        if l.tokenClass == .lineBreak || r.tokenClass == .lineBreak {
+            if l.tokenClass == .lineBreak && r.tokenClass == .lineBreak { return 100 }
+            let other = l.tokenClass == .lineBreak ? r : l
+            return other.tokenClass == .space ? 90 : 100
+        }
+
+        // Strongly prefer whitespace -> non-whitespace boundaries (e.g. "if " | "table")
+        // over non-whitespace -> whitespace (e.g. "table" | " ").
+        if l.isSpace != r.isSpace {
+            if l.isSpace {
+                switch r.tokenClass {
+                case .word: return 50
+                case .punct where isOpeningDelimiter(r.unit): return 48
+                default: return 45
+                }
+            } else {
+                return 10
+            }
+        }
+        if l.isSpace && r.isSpace { return 0 }
+
+        // Penalize breaking member-access chains, especially right after '.' (e.g. "B().").
+        if r.tokenClass == .punct && r.unit == 46 {
+            if l.tokenClass == .punct && isClosingDelimiter(l.unit) { return 20 }
+            return l.tokenClass == .word ? -10 : -5
+        }
+        if l.tokenClass == .punct && l.unit == 46 {
+            return r.tokenClass == .word ? -25 : -15
+        }
+
+        if l.tokenClass == .punct && isClosingDelimiter(l.unit) {
+            return (r.tokenClass == .punct && isOpeningDelimiter(r.unit)) ? 35 : 25
+        }
+        if l.tokenClass == .punct && isSeparator(l.unit) { return 30 }
+        if r.tokenClass == .punct && isSeparator(r.unit) { return 15 }
+        if r.tokenClass == .punct && isOpeningDelimiter(r.unit) { return 25 }
+        if l.tokenClass == .punct && isOpeningDelimiter(l.unit) { return 18 }
+        if r.tokenClass == .punct && isClosingDelimiter(r.unit) { return 25 }
+
+        if l.tokenClass != r.tokenClass { return 12 }
+        return l.tokenClass == .punct ? -5 : 2
+    }
+
+    /// Shifts each unmatched run within its lossless equivalence window to the cleanest
+    /// semantic boundary, returning the optimal replacement for `matched`.
+    private static func shiftUnmatchedRuns<T>(
+        _ items: [T],
+        matched: inout [Bool],
+        maxPasses: Int = 1,
+        equals: (T, T) -> Bool,
+        isValidBoundary: (Int) -> Bool = { _ in true },
+        scoreBoundary: (T?, T?) -> Int
+    ) {
+        var pass = 0
+        var coalesced = true
+        while coalesced && pass < maxPasses {
+            coalesced = false
+            pass += 1
+            var i = 0
+            while i < items.count {
+                guard !matched[i] else { i += 1; continue }
+                let runStart = i
+                var runEnd = i + 1
+                while runEnd < items.count && !matched[runEnd] {
+                    runEnd += 1
+                }
+
+                var minStart = runStart
+                var minEnd = runEnd
+                while minStart > 0 && matched[minStart - 1] && equals(items[minStart - 1], items[minEnd - 1]) {
+                    minStart -= 1
+                    minEnd -= 1
+                }
+
+                var maxStart = runStart
+                var maxEnd = runEnd
+                while maxEnd < items.count && matched[maxEnd] && equals(items[maxStart], items[maxEnd]) {
+                    maxStart += 1
+                    maxEnd += 1
+                }
+
+                if minStart < maxStart {
+                    let len = runEnd - runStart
+                    var bestStart = runStart
+                    var bestScore = Int.min
+                    for candStart in minStart...maxStart {
+                        let candEnd = candStart + len
+                        guard isValidBoundary(candStart) && isValidBoundary(candEnd) else { continue }
+                        let score = scoreBoundary(
+                            candStart > 0 ? items[candStart - 1] : nil,
+                            items[candStart]
+                        ) + scoreBoundary(
+                            items[candEnd - 1],
+                            candEnd < items.count ? items[candEnd] : nil
+                        )
+                        if score > bestScore {
+                            bestScore = score
+                            bestStart = candStart
+                        }
+                    }
+                    let bestEnd = bestStart + len
+                    if bestStart != runStart {
+                        for k in runStart..<runEnd { matched[k] = true }
+                        for k in bestStart..<bestEnd { matched[k] = false }
+                        if (bestStart > 0 && !matched[bestStart - 1]) || (bestEnd < items.count && !matched[bestEnd]) {
+                            coalesced = true
+                        }
+                    }
+                    i = max(runEnd, bestEnd)
+                } else {
+                    i = runEnd
+                }
+            }
+        }
+    }
+
+    private static func shiftMatchedRuns(tokens: [Token], matched: inout [Bool]) {
+        shiftUnmatchedRuns(
+            tokens,
+            matched: &matched,
+            maxPasses: 8,
+            equals: tokensEqual,
+            scoreBoundary: boundaryScore
+        )
+    }
+
+    /// Shifts unmatched UTF-16 runs within their lossless equivalence window on single-token
+    /// fallback lines (respecting surrogate pairs and preferring word/separator boundaries).
+    static func shiftUTF16Runs(units: [UInt16], matched: inout [Bool]) {
+        @inline(__always)
+        func isLowSurrogate(_ u: UInt16) -> Bool { (0xDC00...0xDFFF).contains(u) }
+        @inline(__always)
+        func isWord(_ u: UInt16) -> Bool {
+            (u >= 48 && u <= 57) || (u >= 65 && u <= 90) || (u >= 97 && u <= 122) || u >= 0x80
+        }
+        @inline(__always)
+        func isSpace(_ u: UInt16) -> Bool { u == 32 || u == 9 }
+
+        func charBoundaryScore(left: UInt16?, right: UInt16?) -> Int {
+            guard let l = left else {
+                guard let r = right else { return 0 }
+                return isSpace(r) ? 20 : 100
+            }
+            guard let r = right else {
+                return isSpace(l) ? 20 : 100
+            }
+            if isSpace(l) != isSpace(r) {
+                return isSpace(l) ? 50 : 10
+            }
+            if isSpace(l) && isSpace(r) { return 0 }
+            if l == 95 && r != 95 { return 35 } // '_' | char
+            if r == 95 && l != 95 { return 15 } // char | '_'
+            if r == 46 { return isClosingDelimiter(l) ? 20 : (isWord(l) ? -10 : -5) }
+            if l == 46 { return isWord(r) ? -25 : -15 }
+            if isClosingDelimiter(l) { return isOpeningDelimiter(r) ? 35 : 25 }
+            if isSeparator(l) { return 30 }
+            if isSeparator(r) { return 15 }
+            if isOpeningDelimiter(r) { return 25 }
+            if isOpeningDelimiter(l) { return 18 }
+            if isClosingDelimiter(r) { return 25 }
+            if isWord(l) != isWord(r) { return 20 }
+            // CamelCase boundary: lowercase followed by uppercase.
+            if (97...122).contains(l) && (65...90).contains(r) { return 20 }
+            if isWord(l) && isWord(r) { return -20 }
+            return 0
+        }
+
+        shiftUnmatchedRuns(
+            units,
+            matched: &matched,
+            equals: ==,
+            isValidBoundary: { idx in
+                !(idx > 0 && idx < units.count && isLowSurrogate(units[idx]))
+            },
+            scoreBoundary: charBoundaryScore
+        )
+    }
+
     /// Returns per-line changed ranges for both sides of a modified hunk, or nil when the
     /// two sides share nothing worth aligning (whole-line colouring says enough).
     static func compute(old: ArraySlice<String>, new: ArraySlice<String>) -> (old: [[Range<Int>]], new: [[Range<Int>]])? {
         guard let a = tokenize(old), let b = tokenize(new), !a.isEmpty, !b.isEmpty else { return nil }
-        guard let (matchedA, matchedB) = Myers.matches(a.map(\.hash), b.map(\.hash), maxEdits: 600) else { return nil }
+        guard var (matchedA, matchedB) = Myers.matches(a.map(\.hash), b.map(\.hash), maxEdits: 600) else { return nil }
 
         var common = 0
         for (i, t) in a.enumerated() where matchedA[i] && !t.isSpace { common += 1 }
         if common == 0 { return nil }
+
+        shiftMatchedRuns(tokens: a, matched: &matchedA)
+        shiftMatchedRuns(tokens: b, matched: &matchedB)
 
         func ranges(_ tokens: [Token], _ matched: [Bool], lineCount: Int) -> [[Range<Int>]] {
             var result = [[Range<Int>]](repeating: [], count: lineCount)

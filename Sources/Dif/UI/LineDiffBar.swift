@@ -278,20 +278,37 @@ enum LineDiffExtractor {
         let midA = Array(a[prefix..<aMidEnd])
         let midB = Array(b[prefix..<bMidEnd])
 
-        if !midA.isEmpty, !midB.isEmpty, midA.count <= 512, midB.count <= 512,
-           let (matchedA, matchedB) = Myers.matches(midA, midB, maxEdits: 200) {
-            let matchedCount = matchedA.lazy.filter { $0 }.count
-            if matchedCount >= max(2, min(midA.count, midB.count) / 3) {
-                return (
-                    unmatchedRanges(in: a, offset: prefix, matched: matchedA),
-                    unmatchedRanges(in: b, offset: prefix, matched: matchedB)
-                )
+        if !midA.isEmpty, !midB.isEmpty {
+            if midA.count <= 512, midB.count <= 512,
+               let (midMatchedA, midMatchedB) = Myers.matches(midA, midB, maxEdits: 200) {
+                let matchedCount = midMatchedA.lazy.filter { $0 }.count
+                if matchedCount >= max(2, min(midA.count, midB.count) / 3) {
+                    var matchedA = [Bool](repeating: true, count: a.count)
+                    var matchedB = [Bool](repeating: true, count: b.count)
+                    for i in midMatchedA.indices { matchedA[prefix + i] = midMatchedA[i] }
+                    for i in midMatchedB.indices { matchedB[prefix + i] = midMatchedB[i] }
+                    InlineDiff.shiftUTF16Runs(units: a, matched: &matchedA)
+                    InlineDiff.shiftUTF16Runs(units: b, matched: &matchedB)
+                    return (
+                        unmatchedRanges(in: a, offset: 0, matched: matchedA),
+                        unmatchedRanges(in: b, offset: 0, matched: matchedB)
+                    )
+                }
             }
+            let leftRanges = aMidEnd > prefix ? [prefix..<aMidEnd] : []
+            let rightRanges = bMidEnd > prefix ? [prefix..<bMidEnd] : []
+            return (leftRanges, rightRanges)
         }
 
-        let leftRanges = aMidEnd > prefix ? [prefix..<aMidEnd] : []
-        let rightRanges = bMidEnd > prefix ? [prefix..<bMidEnd] : []
-        return (leftRanges, rightRanges)
+        // Pure character-level insertion or deletion: shift to semantic character boundaries.
+        func shiftedPureRanges(in units: [UInt16], midEnd: Int) -> [Range<Int>] {
+            guard midEnd > prefix else { return [] }
+            var matched = [Bool](repeating: true, count: units.count)
+            for i in prefix..<midEnd { matched[i] = false }
+            InlineDiff.shiftUTF16Runs(units: units, matched: &matched)
+            return unmatchedRanges(in: units, offset: 0, matched: matched)
+        }
+        return (shiftedPureRanges(in: a, midEnd: aMidEnd), shiftedPureRanges(in: b, midEnd: bMidEnd))
     }
 
     private static func unmatchedRanges(in units: [UInt16], offset: Int, matched: [Bool]) -> [Range<Int>] {
