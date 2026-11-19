@@ -9,11 +9,21 @@ import Observation
 @Observable
 final class ViewerModel: CodeCanvasDelegate {
     var request: DiffRequest?
-    var document: DiffDocument?
+    var document: DiffDocument? {
+        didSet {
+            if document !== oldValue {
+                activeLineDiffLocation = nil
+            }
+        }
+    }
     var isLoading = false
     var hunkCount = 0
     var focusedHunk: Int?
     var loadMilliseconds: Double = 0
+    /// Paired Left/Right line snapshot for the bottom Beyond Compare-style inline line diff bar.
+    var lineDiffSnapshot: LineDiffSnapshot?
+    /// Last active `(side, 0-based line)` reported by the canvas or navigation, retained across syntax/diff refreshes.
+    @ObservationIgnored private var activeLineDiffLocation: (side: Side, line: Int)?
     /// Conflicts left in the file on screen, when it is one git is merging.
     var conflictCount = 0
     /// How long the last `git blame` took, for the debug hooks.
@@ -44,7 +54,9 @@ final class ViewerModel: CodeCanvasDelegate {
     var vimCursorColumn = 1
 
     @ObservationIgnored weak var container: CodeScrollContainer?
-    @ObservationIgnored var settings: Settings!
+    @ObservationIgnored var settings: Settings! {
+        didSet { syncVimSettings() }
+    }
     @ObservationIgnored var onExit: (() -> Void)?
     @ObservationIgnored var onStepFile: ((Int) -> Bool)?
     @ObservationIgnored var onToast: ((String) -> Void)?
@@ -124,18 +136,76 @@ final class ViewerModel: CodeCanvasDelegate {
 
     // MARK: Canvas attachment
 
+    func syncVimSettings() {
+        guard let settings else { return }
+        vimModeEnabled = settings.vimMode
+        vimRelativeLineNumbers = settings.vimRelativeLineNumbers
+        container?.canvas.vimModeEnabled = vimModeEnabled
+        container?.canvas.vimRelativeLineNumbers = vimRelativeLineNumbers
+    }
+
+    func setVimMode(_ enabled: Bool) {
+        if let settings, settings.vimMode != enabled {
+            settings.vimMode = enabled
+            settings.save()
+        }
+        vimModeEnabled = enabled
+        container?.canvas.vimModeEnabled = enabled
+    }
+
+    func setVimRelativeLineNumbers(_ enabled: Bool) {
+        if let settings, settings.vimRelativeLineNumbers != enabled {
+            settings.vimRelativeLineNumbers = enabled
+            settings.save()
+        }
+        vimRelativeLineNumbers = enabled
+        container?.canvas.vimRelativeLineNumbers = enabled
+    }
+
+    @discardableResult
+    func refreshLineDiff(side: Side? = nil, line: Int? = nil) -> LineDiffSnapshot? {
+        if let side, let line {
+            activeLineDiffLocation = (side, line)
+        }
+        guard let doc = document, case .text = doc.content, !doc.isPlainFile, !doc.isAddedOnly else {
+            activeLineDiffLocation = nil
+            if lineDiffSnapshot != nil { lineDiffSnapshot = nil }
+            return nil
+        }
+        guard settings?.showLineDiffBar ?? true else {
+            return nil
+        }
+        let snapshot: LineDiffSnapshot?
+        if let side, let line {
+            snapshot = LineDiffExtractor.extract(from: doc, side: side, line: line)
+                ?? LineDiffExtractor.defaultSnapshot(for: doc, focusedHunk: focusedHunk)
+        } else if let loc = activeLineDiffLocation {
+            snapshot = LineDiffExtractor.extract(from: doc, side: loc.side, line: loc.line)
+                ?? LineDiffExtractor.defaultSnapshot(for: doc, focusedHunk: focusedHunk)
+        } else {
+            snapshot = LineDiffExtractor.defaultSnapshot(for: doc, focusedHunk: focusedHunk)
+        }
+        if lineDiffSnapshot != snapshot {
+            lineDiffSnapshot = snapshot
+        }
+        return snapshot
+    }
+
     func attach(_ container: CodeScrollContainer) {
         self.container = container
         container.canvas.delegate = self
         container.canvas.codeFont = CodeFont.current(settings)
-        container.canvas.vimModeEnabled = vimModeEnabled
-        container.canvas.vimRelativeLineNumbers = vimRelativeLineNumbers
+        syncVimSettings()
+        container.canvas.onActiveLineChange = { [weak self] side, line in
+            self?.refreshLineDiff(side: side, line: line)
+        }
         container.onUserScroll = { [weak self] in self?.detachedFromFocus = true }
         container.show(document, mode: canvasMode, preserveScroll: false)
         container.canvas.showsRevertButtons = canRevertHunks
         container.canvas.editor = editor
         container.canvas.isLSPEnabled = isCurrentDocumentLSPEnabled
         if let doc = document { position(doc) }
+        refreshLineDiff()
         observeFocusChanges()
     }
 
@@ -217,6 +287,8 @@ final class ViewerModel: CodeCanvasDelegate {
         request = nil
         endEditing()
         document = nil
+        activeLineDiffLocation = nil
+        lineDiffSnapshot = nil
         isLoading = false
         hunkCount = 0
         focusedHunk = nil
@@ -264,8 +336,10 @@ final class ViewerModel: CodeCanvasDelegate {
             }
             if sameFile, preserveScroll { caret = container?.canvas.editSelection }
         }
+        let preservedLineDiffLocation = preserveScroll ? activeLineDiffLocation : nil
         endEditing()
         document = doc
+        activeLineDiffLocation = preservedLineDiffLocation
         isLoading = false
         hunkCount = doc.hunks.count
         loadMilliseconds = doc.loadMilliseconds
@@ -287,6 +361,7 @@ final class ViewerModel: CodeCanvasDelegate {
         } else {
             position(doc)
         }
+        refreshLineDiff()
         if findVisible, !findQuery.isEmpty { runFind(reveal: false) }
         onDocumentChanged?()
     }
@@ -302,10 +377,16 @@ final class ViewerModel: CodeCanvasDelegate {
                 self.reveal(line: line)
             } else if !doc.hunks.isEmpty, case .text = doc.content, !doc.isPlainFile {
                 let index = self.landOnLastHunk ? doc.hunks.count - 1 : 0
+                let hunk = doc.hunks[index]
                 self.focusedHunk = index
-                container.canvas.focusedHunk = index
                 // Ready to type where the change is, as the IDE's diff puts its caret there.
-                container.canvas.placeCaret(line: doc.hunks[index].rightStart)
+                container.canvas.placeCaret(line: hunk.rightStart)
+                container.canvas.focusedHunk = index
+                if hunk.rightCount > 0 {
+                    self.refreshLineDiff(side: .right, line: hunk.rightStart)
+                } else if hunk.leftCount > 0 {
+                    self.refreshLineDiff(side: .left, line: hunk.leftStart)
+                }
                 let row = container.canvas.hunkRow(index)
                 if row > container.visibleRowCount / 3 {
                     container.scroll(toRow: row, fraction: 0.2, animated: false)
@@ -333,6 +414,7 @@ final class ViewerModel: CodeCanvasDelegate {
         container.canvas.focusLine = (.right, index)
         container.scroll(toRow: container.canvas.row(forLine: index, side: .right), fraction: 0.35, animated: false)
         detachedFromFocus = true
+        refreshLineDiff(side: .right, line: index)
     }
 
     func stepDifference(_ delta: Int) {
@@ -365,8 +447,18 @@ final class ViewerModel: CodeCanvasDelegate {
         guard let container else { return }
         focusedHunk = index
         detachedFromFocus = false
-        container.canvas.focusedHunk = index
-        if let doc = document, doc.hunks.indices.contains(index) { container.canvas.placeCaret(line: doc.hunks[index].rightStart) }
+        if let doc = document, doc.hunks.indices.contains(index) {
+            let hunk = doc.hunks[index]
+            container.canvas.placeCaret(line: hunk.rightStart)
+            container.canvas.focusedHunk = index
+            if hunk.rightCount > 0 {
+                refreshLineDiff(side: .right, line: hunk.rightStart)
+            } else if hunk.leftCount > 0 {
+                refreshLineDiff(side: .left, line: hunk.leftStart)
+            }
+        } else {
+            container.canvas.focusedHunk = index
+        }
         container.scroll(toRow: container.canvas.hunkRow(index), fraction: 0.25, animated: animated)
     }
 
@@ -514,6 +606,7 @@ final class ViewerModel: CodeCanvasDelegate {
         if center, match.side == .right {
             canvas.placeCaret(line: match.line, column: match.range.lowerBound)
         }
+        refreshLineDiff(side: match.side, line: match.line)
     }
 
     private func revealMatch(_ match: SearchMatch, center: Bool = false) {

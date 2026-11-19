@@ -936,7 +936,7 @@ final class AppStore {
 
     var vimModeEnabled: Bool {
         get { viewer.vimModeEnabled }
-        set { viewer.vimModeEnabled = newValue }
+        set { viewer.setVimMode(newValue) }
     }
 
     func expandSelection() {

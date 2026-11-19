@@ -286,12 +286,27 @@ final class CodeCanvasView: NSView {
                 refreshRelativeLineNumbersIfNeeded()
                 invalidate(.selection)
                 reportVimStateIfNeeded()
+                if let sel = selection, let src = source(pane: sel.pane, row: sel.head.row) {
+                    notifyActiveLine(side: src.side, line: src.line)
+                }
             }
         }
     }
 
     var focusedHunk: Int? {
-        didSet { if focusedHunk != oldValue { invalidate(.decor) } }
+        didSet {
+            if focusedHunk != oldValue {
+                invalidate(.decor)
+                if let index = focusedHunk, let doc = document, doc.hunks.indices.contains(index) {
+                    let h = doc.hunks[index]
+                    if h.rightCount > 0 {
+                        notifyActiveLine(side: .right, line: h.rightStart, force: true)
+                    } else if h.leftCount > 0 {
+                        notifyActiveLine(side: .left, line: h.leftStart, force: true)
+                    }
+                }
+            }
+        }
     }
 
     /// A line to tint, e.g. the target of "go to line" or a search hit.
@@ -556,14 +571,63 @@ final class CodeCanvasView: NSView {
 
     // MARK: Configuration
 
+    /// Fires whenever the active line (0-based buffer line on `.left` or `.right`) changes via click, caret/Vim motion,
+    /// focused hunk change, document load, edit, rediff, or syntax invalidation.
+    var onActiveLineChange: ((Side, Int) -> Void)?
+    private var activeLineLocation: (side: Side, line: Int)?
+    private var suppressActiveLineNotify = false
+
+    private func notifyActiveLine(side: Side, line: Int, force: Bool = false) {
+        guard !suppressActiveLineNotify else { return }
+        guard let doc = document, case .text = doc.content else { return }
+        let count = doc.buffer(side).lines.count
+        guard count > 0 else { return }
+        let clamped = max(0, min(line, count - 1))
+        let changed = activeLineLocation?.side != side || activeLineLocation?.line != clamped
+        if force || changed {
+            activeLineLocation = (side, clamped)
+            onActiveLineChange?(side, clamped)
+        }
+    }
+
+    private func notifyActiveLineFromCurrentState(force: Bool = false) {
+        guard let doc = document, case .text = doc.content else { return }
+        if let loc = activeLineLocation {
+            let count = doc.buffer(loc.side).lines.count
+            if count > 0 {
+                notifyActiveLine(side: loc.side, line: min(loc.line, count - 1), force: force)
+                return
+            }
+        }
+        if let sel = selection, let src = source(pane: sel.pane, row: sel.head.row) {
+            notifyActiveLine(side: src.side, line: src.line, force: force)
+            return
+        }
+        if !doc.hunks.isEmpty {
+            let idx = focusedHunk.flatMap { doc.hunks.indices.contains($0) ? $0 : nil } ?? 0
+            let h = doc.hunks[idx]
+            if h.rightCount > 0 {
+                notifyActiveLine(side: .right, line: h.rightStart, force: force)
+            } else if h.leftCount > 0 {
+                notifyActiveLine(side: .left, line: h.leftStart, force: force)
+            }
+            return
+        }
+        if !doc.right.lines.isEmpty {
+            notifyActiveLine(side: .right, line: 0, force: force)
+        } else if !doc.left.lines.isEmpty {
+            notifyActiveLine(side: .left, line: 0, force: force)
+        }
+    }
+
     /// True when `doc` is a newly added / untracked file whose left side has no lines and all hunks are additions.
     static func isAddedOnlyDocument(_ doc: DiffDocument) -> Bool {
-        !doc.isPlainFile && doc.left.lines.isEmpty && !doc.right.lines.isEmpty && doc.hunks.allSatisfy { $0.kind == .added }
+        doc.isAddedOnly
     }
 
     var mode: Mode {
         guard let doc = document else { return .single }
-        return (doc.isPlainFile || Self.isAddedOnlyDocument(doc)) ? .single : requestedMode
+        return (doc.isPlainFile || doc.isAddedOnly) ? .single : requestedMode
     }
 
     func setDocument(_ doc: DiffDocument?, mode: Mode) {
@@ -575,6 +639,7 @@ final class CodeCanvasView: NSView {
         vimEngine.resetToNormal(switchInputSource: false)
         vimCursor = TextPosition(row: 0, column: 0)
         lastRelativeCursorLine = -1
+        activeLineLocation = nil
         selection = nil
         focusedHunk = nil
         focusLine = nil
@@ -587,6 +652,9 @@ final class CodeCanvasView: NSView {
         rebuildHunkRows()
         invalidate(.everything)
         reportVimStateIfNeeded(force: true)
+        if doc != nil {
+            notifyActiveLineFromCurrentState(force: true)
+        }
     }
 
     func setMode(_ mode: Mode) {
@@ -656,6 +724,7 @@ final class CodeCanvasView: NSView {
             for index in tiles { pane.contentWidths.removeValue(forKey: index) }
         }
         invalidate(.scroll)
+        notifyActiveLineFromCurrentState(force: true)
     }
 
     func setCurrentMatch(_ index: Int) {
@@ -1649,6 +1718,7 @@ final class CodeCanvasView: NSView {
         rebuildHunkRows()
         invalidate([.decor, .selection, .scroll])
         container?.updateDocumentSize()
+        notifyActiveLineFromCurrentState(force: true)
     }
 
     /// New hunks for the text on screen (the real diff, back from git): the line with the caret, or the
@@ -1672,6 +1742,7 @@ final class CodeCanvasView: NSView {
             guard abs(after - before) >= 0.5 else { break }
             container?.scrollBy(dx: 0, dy: after - before)
         }
+        notifyActiveLineFromCurrentState(force: true)
     }
 
     /// Scrolls just enough to bring the caret into view, with a little room around it.
@@ -2593,6 +2664,9 @@ final class CodeCanvasView: NSView {
             }
             dragSelecting = true
         }
+        if let src = source(pane: side, row: pos.row) {
+            notifyActiveLine(side: src.side, line: src.line)
+        }
         if vimModeEnabled { reportVimStateIfNeeded() }
     }
 
@@ -2644,7 +2718,11 @@ final class CodeCanvasView: NSView {
             // removed line (which is not in the file any more) lands on the line that follows it.
             if mode == .unified, current.isEmpty {
                 let caret = rowPosition(linePosition(current.head))
-                selection = TextSelection(pane: .right, anchor: caret, head: caret)
+                if caret != current.head {
+                    suppressActiveLineNotify = true
+                    selection = TextSelection(pane: .right, anchor: caret, head: caret)
+                    suppressActiveLineNotify = false
+                }
             }
             return
         }

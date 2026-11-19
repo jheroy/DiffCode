@@ -17,6 +17,7 @@ struct CanvasHost: NSViewRepresentable {
 struct ViewerPanel: View {
     let project: Project
     @Environment(AppStore.self) private var store
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         let viewer = store.viewer
@@ -27,7 +28,7 @@ struct ViewerPanel: View {
                 ConflictBar(project: project, path: request.path)
             }
             if viewer.findVisible { FindBar() }
-            if let doc = viewer.document, case .text = doc.content, !doc.isPlainFile, !CodeCanvasView.isAddedOnlyDocument(doc) {
+            if let doc = viewer.document, case .text = doc.content, !doc.isPlainFile, !doc.isAddedOnly {
                 PaneTitles(left: doc.leftTitle, right: doc.rightTitle, unified: store.settings.unified)
             }
             ZStack {
@@ -37,6 +38,17 @@ struct ViewerPanel: View {
                 if let hover = viewer.annotationHover {
                     AnnotationCard(hover: hover, lineHeight: (store.settings.fontSize * 1.5).rounded())
                 }
+            }
+            if store.settings.showLineDiffBar, let snapshot = viewer.lineDiffSnapshot {
+                LineDiffBarView(
+                    snapshot: snapshot,
+                    theme: colorScheme == .dark ? .dark : .light,
+                    codeFont: CodeFont.current(store.settings),
+                    onClose: {
+                        store.settings.showLineDiffBar = false
+                        store.settings.save()
+                    }
+                )
             }
             if viewer.vimModeEnabled && viewer.isTextDocument {
                 VimStatusBar(viewer: viewer)
@@ -198,7 +210,7 @@ private struct ViewerHeader: View {
                     IconButton(symbol: "arrow.left", help: L("Previous file (⇧⌘[)", "上一个文件 (⇧⌘[)")) { store.stepFile(-1) }
                     IconButton(symbol: "arrow.right", help: L("Next file (⇧⌘])", "下一个文件 (⇧⌘])")) { store.stepFile(1) }
                 }
-                if viewer.isTextDocument, viewer.document?.isPlainFile == false {
+                if viewer.isTextDocument, let doc = viewer.document, !doc.isPlainFile {
                     IconButton(symbol: "arrow.up", help: L("Previous Difference (⇧F7)", "上一处差异 (⇧F7)")) { viewer.stepDifference(-1) }
                     IconButton(symbol: "arrow.down", help: L("Next Difference (F7)", "下一处差异 (F7)")) { viewer.stepDifference(1) }
                     Divider().frame(height: 14)
@@ -207,6 +219,17 @@ private struct ViewerHeader: View {
                     }
                     IconButton(symbol: "rectangle.grid.1x2", help: L("Unified (⌥⌘V)", "合并视图 (⌥⌘V)"), isActive: store.settings.unified) {
                         if !store.settings.unified { viewer.toggleUnified() }
+                    }
+                    if !doc.isAddedOnly {
+                        IconButton(symbol: "rectangle.split.1x2",
+                                   help: L("Toggle inline line diff", "显示/隐藏底部行内对比"),
+                                   isActive: store.settings.showLineDiffBar) {
+                            store.settings.showLineDiffBar.toggle()
+                            store.settings.save()
+                            if store.settings.showLineDiffBar {
+                                viewer.refreshLineDiff()
+                            }
+                        }
                     }
                     IconButton(symbol: "space", help: L("Ignore Whitespace (⌥⌘W)", "忽略空白差异 (⌥⌘W)"), isActive: store.settings.ignoreWhitespace) {
                         viewer.toggleWhitespace()

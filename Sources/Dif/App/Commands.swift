@@ -134,13 +134,15 @@ extension AppStore {
             },
             AppCommand(id: "view.vimMode", title: L("Toggle Vim Mode", "切换 Vim 模式"), symbol: "v.square", group: .view) { [weak self] in
                 guard let self else { return }
-                self.settings.vimMode.toggle()
-                self.settings.save()
+                self.viewer.setVimMode(!self.settings.vimMode)
             },
             AppCommand(id: "view.lineDiffBar", title: L("Toggle Inline Line Diff Bar", "显示/隐藏 底部行内对比栏"), symbol: "rectangle.split.1x2", group: .view) { [weak self] in
                 guard let self else { return }
                 self.settings.showLineDiffBar.toggle()
                 self.settings.save()
+                if self.settings.showLineDiffBar {
+                    self.viewer.refreshLineDiff()
+                }
             },
             AppCommand(id: "view.fontUp", title: L("Increase Font Size", "增大字号"), symbol: "textformat.size.larger", group: .view,
                        key: ".", modifiers: [.control, .shift], separatorBefore: true) { viewer.changeFontSize(by: 1) },

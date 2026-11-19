@@ -125,6 +125,8 @@ final class KeymapTests: XCTestCase {
             ("edit.copy", "c", .command),
             ("edit.paste", "v", .command),
             ("edit.selectAll", "a", .command),
+            ("edit.expandSelection", ".", .command),
+            ("edit.shrinkSelection", ";", .command),
             ("edit.find", "f", [.control, .shift, .command]),
             ("edit.findNext", "g", .command),
             ("edit.findPrevious", "g", [.command, .shift]),
@@ -152,8 +154,7 @@ final class KeymapTests: XCTestCase {
         let store = AppStore.shared
         let original = store.settings.vimMode
         defer {
-            store.settings.vimMode = original
-            store.settings.save()
+            store.viewer.setVimMode(original)
         }
 
         guard let cmd = store.commands.first(where: { $0.id == "view.vimMode" }) else {
@@ -161,7 +162,40 @@ final class KeymapTests: XCTestCase {
         }
         cmd.action()
         XCTAssertEqual(store.settings.vimMode, !original)
+        XCTAssertEqual(store.viewer.vimModeEnabled, !original)
         cmd.action()
         XCTAssertEqual(store.settings.vimMode, original)
+        XCTAssertEqual(store.viewer.vimModeEnabled, original)
+    }
+
+    @MainActor
+    func testViewerModelSyncsVimSettingsLive() throws {
+        let suiteName = "KeymapTests.ViewerVimSync.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = Settings(defaults: defaults)
+        settings.vimMode = false
+        settings.vimRelativeLineNumbers = true
+
+        let viewer = ViewerModel()
+        viewer.settings = settings
+        XCTAssertFalse(viewer.vimModeEnabled)
+        XCTAssertTrue(viewer.vimRelativeLineNumbers)
+
+        let container = CodeScrollContainer(frame: NSRect(x: 0, y: 0, width: 600, height: 300))
+        viewer.attach(container)
+        XCTAssertFalse(container.canvas.vimModeEnabled)
+        XCTAssertTrue(container.canvas.vimRelativeLineNumbers)
+
+        viewer.setVimMode(true)
+        XCTAssertTrue(settings.vimMode)
+        XCTAssertTrue(viewer.vimModeEnabled)
+        XCTAssertTrue(container.canvas.vimModeEnabled)
+
+        viewer.setVimRelativeLineNumbers(false)
+        XCTAssertFalse(settings.vimRelativeLineNumbers)
+        XCTAssertFalse(viewer.vimRelativeLineNumbers)
+        XCTAssertFalse(container.canvas.vimRelativeLineNumbers)
     }
 }

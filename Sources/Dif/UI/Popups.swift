@@ -1097,6 +1097,7 @@ struct KeymapView: View {
             shortcutRow(L("Next / Previous Change", "下一处 / 上一处变更"), "⌃⌥⇧↓ / ⌃⌥⇧↑")
             shortcutRow(L("Find in File", "在文件中查找"), "⌃⇧⌘F")
             shortcutRow(L("Next / Previous Occurrence", "下一个 / 上一个匹配"), "⌘G / ⇧⌘G")
+            shortcutRow(L("Expand / Shrink Selection", "扩大 / 缩小选区"), "⌘. / ⌘;")
             shortcutRow(L("Find in Files (Secondary)", "在文件中查找（备用）"), "⇧⌘F")
             shortcutRow(L("Back to the File List", "回到文件列表"), "Esc / ⌘H")
             shortcutRow(L("Zoom Text", "缩放文字"), L("Pinch", "双指捏合"))
@@ -1321,11 +1322,13 @@ struct SettingsView: View {
             settings.save()
             store.viewer.container?.setMode(store.viewer.canvasMode)
         }
-        .onChange(of: settings.vimMode) { _, _ in
+        .onChange(of: settings.vimMode) { _, enabled in
             settings.save()
+            store.viewer.setVimMode(enabled)
         }
-        .onChange(of: settings.vimRelativeLineNumbers) { _, _ in
+        .onChange(of: settings.vimRelativeLineNumbers) { _, enabled in
             settings.save()
+            store.viewer.setVimRelativeLineNumbers(enabled)
         }
     }
 

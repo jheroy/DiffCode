@@ -303,4 +303,102 @@ final class LineDiffBarTests: XCTestCase {
         XCTAssertEqual(command.group, .view)
         XCTAssertEqual(command.symbol, "rectangle.split.1x2")
     }
+
+    @MainActor
+    func testViewerModelLineDiffSnapshotLifecycleAndCanvasSync() throws {
+        let suiteName = "LineDiffBarTests.Viewer.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = Settings(defaults: defaults)
+        let viewer = ViewerModel()
+        viewer.settings = settings
+        let container = CodeScrollContainer(frame: NSRect(x: 0, y: 0, width: 900, height: 400))
+        viewer.attach(container)
+
+        let left = TextBuffer(lines: ["same0", "old1", "same2", "deleted3", "same4"])
+        let right = TextBuffer(lines: ["same0", "new1", "same2", "same4"])
+        var hunks = [
+            Hunk(leftStart: 1, leftCount: 1, rightStart: 1, rightCount: 1),
+            Hunk(leftStart: 3, leftCount: 1, rightStart: 3, rightCount: 0),
+        ]
+        DiffLoader.addInlineHighlights(&hunks, left: left.lines, right: right.lines)
+        let diffDoc = DiffDocument(left: left, right: right, hunks: hunks, language: .swift)
+
+        viewer.document = diffDoc
+        container.show(diffDoc, mode: .sideBySide, preserveScroll: false)
+        viewer.refreshLineDiff()
+
+        let initial = try XCTUnwrap(viewer.lineDiffSnapshot)
+        XCTAssertEqual(initial.hunkKind, .modified)
+        XCTAssertEqual(initial.left.lineNumber, 2)
+        XCTAssertEqual(initial.right.lineNumber, 2)
+        XCTAssertEqual(initial.left.text, "old1")
+        XCTAssertEqual(initial.right.text, "new1")
+
+        // Selecting a deleted line on the left pane updates the snapshot via onActiveLineChange.
+        container.canvas.selection = TextSelection(
+            pane: .left,
+            anchor: TextPosition(row: 3, column: 0),
+            head: TextPosition(row: 3, column: 0)
+        )
+        let deletedSnap = try XCTUnwrap(viewer.lineDiffSnapshot)
+        XCTAssertEqual(deletedSnap.hunkKind, .deleted)
+        XCTAssertEqual(deletedSnap.left.lineNumber, 4)
+        XCTAssertEqual(deletedSnap.left.text, "deleted3")
+        XCTAssertEqual(deletedSnap.right, .empty)
+
+        // Caret move on the right pane updates the snapshot to the unchanged context line.
+        container.canvas.placeCaret(line: 0)
+        let unchangedSnap = try XCTUnwrap(viewer.lineDiffSnapshot)
+        XCTAssertNil(unchangedSnap.hunkKind)
+        XCTAssertEqual(unchangedSnap.left.lineNumber, 1)
+        XCTAssertEqual(unchangedSnap.right.lineNumber, 1)
+        XCTAssertEqual(unchangedSnap.right.text, "same0")
+
+        // Focusing a deleted hunk updates the snapshot to that deleted line.
+        container.canvas.focusedHunk = 1
+        let focusedDeleted = try XCTUnwrap(viewer.lineDiffSnapshot)
+        XCTAssertEqual(focusedDeleted.hunkKind, .deleted)
+        XCTAssertEqual(focusedDeleted.left.text, "deleted3")
+
+        // Unified mode maps removed rows via source(pane: .right, row:) to `.left`.
+        container.setMode(.unified)
+        let removedRow = try XCTUnwrap(diffDoc.unifiedRows.firstIndex { $0.kind == .removed && Int($0.left) == 3 })
+        container.canvas.selection = TextSelection(
+            pane: .right,
+            anchor: TextPosition(row: removedRow, column: 0),
+            head: TextPosition(row: removedRow, column: 0)
+        )
+        let unifiedSnap = try XCTUnwrap(viewer.lineDiffSnapshot)
+        XCTAssertEqual(unifiedSnap.hunkKind, .deleted)
+        XCTAssertEqual(unifiedSnap.left.text, "deleted3")
+
+        // When hidden, active line is still tracked so re-enabling refreshes to the latest line.
+        settings.showLineDiffBar = false
+        container.canvas.placeCaret(line: 2)
+        XCTAssertEqual(viewer.lineDiffSnapshot?.left.text, "deleted3")
+        settings.showLineDiffBar = true
+        viewer.refreshLineDiff()
+        XCTAssertEqual(viewer.lineDiffSnapshot?.right.text, "same2")
+
+        // Plain files and added-only files clear lineDiffSnapshot to nil.
+        let plainDoc = DiffDocument(left: .empty, right: right, hunks: [], language: .swift, isPlainFile: true)
+        viewer.document = plainDoc
+        container.show(plainDoc, mode: .single, preserveScroll: false)
+        viewer.refreshLineDiff()
+        XCTAssertNil(viewer.lineDiffSnapshot)
+
+        let addedDoc = DiffDocument(
+            left: .empty,
+            right: TextBuffer(lines: ["newFileLine"]),
+            hunks: [Hunk(leftStart: 0, leftCount: 0, rightStart: 0, rightCount: 1)],
+            language: .swift
+        )
+        XCTAssertTrue(addedDoc.isAddedOnly)
+        viewer.document = addedDoc
+        container.show(addedDoc, mode: .sideBySide, preserveScroll: false)
+        viewer.refreshLineDiff()
+        XCTAssertNil(viewer.lineDiffSnapshot)
+    }
 }

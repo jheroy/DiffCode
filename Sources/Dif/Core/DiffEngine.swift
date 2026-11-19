@@ -196,6 +196,11 @@ final class DiffDocument {
     var additions: Int { hunks.reduce(0) { $0 + $1.rightCount } }
     var deletions: Int { hunks.reduce(0) { $0 + $1.leftCount } }
 
+    /// True when this is a newly added / untracked file whose left side has no lines and all hunks are additions.
+    var isAddedOnly: Bool {
+        !isPlainFile && left.lines.isEmpty && !right.lines.isEmpty && hunks.allSatisfy { $0.kind == .added }
+    }
+
     init(left: TextBuffer, right: TextBuffer, hunks: [Hunk], language: LanguageSpec,
          content: Content = .text, isPlainFile: Bool = false) {
         self.left = left

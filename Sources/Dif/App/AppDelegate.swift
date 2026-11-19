@@ -412,6 +412,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         edit.addItem(withTitle: L("Copy", "复制"), action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         edit.addItem(withTitle: L("Paste", "粘贴"), action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         edit.addItem(withTitle: L("Select All", "全选"), action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        edit.addItem(ClosureMenuItem(L("Expand Selection", "扩大选区"), key: ".", modifiers: .command) { [store] in
+            guard store.popup == nil, store.terminals.focusedID == nil else { return }
+            store.viewer.expandSelection()
+        })
+        edit.addItem(ClosureMenuItem(L("Shrink Selection", "缩小选区"), key: ";", modifiers: .command) { [store] in
+            guard store.popup == nil, store.terminals.focusedID == nil else { return }
+            store.viewer.shrinkSelection()
+        })
         edit.addItem(.separator())
         edit.addItem(ClosureMenuItem(L("Find…", "查找…"), key: "f", modifiers: [.control, .shift, .command]) { [store] in store.viewer.showFind() })
         edit.addItem(ClosureMenuItem(L("Find Next", "查找下一个"), key: "g", modifiers: .command) { [store] in store.viewer.stepFind(1) })
