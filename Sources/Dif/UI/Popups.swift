@@ -1038,7 +1038,10 @@ struct GoToLineView: View {
                         onSubmit: {
                             let digits = text.split(separator: ":").first.map(String.init) ?? text
                             store.dismissPopup(restoreFocus: false)
-                            if let line = Int(digits.trimmingCharacters(in: .whitespaces)) { store.viewer.reveal(line: line) }
+                            if let line = Int(digits.trimmingCharacters(in: .whitespaces)) {
+                                store.recordCurrentJumpOriginIfDifferent(targetLine1Based: line)
+                                store.viewer.reveal(line: line)
+                            }
                             store.viewer.focusCanvas()
                         },
                         onCancel: { store.dismissPopup() })

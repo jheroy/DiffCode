@@ -21,9 +21,10 @@ struct ActiveLSPDocument: Equatable {
 /// right pane) and gated on `AppEnvironment.hasLSP`. Historical commit diffs and the HEAD left pane
 /// never attach to LSP.
 ///
-/// All document lifecycle notifications (`didClose`, `didOpen`, `didChange`, `didSave`) are chained
-/// sequentially through `lspTask` so rapid switches (e.g. `A -> B -> A` via `⌘[`) can never deliver
-/// a stale `didClose(A)` after the newer `didOpen(A)`.
+/// Document lifecycle notifications (`didClose`, `didOpen`, `didChange`, `didSave`) are chained
+/// sequentially through `lspLifecycleTask` and are NEVER cancelled by trailing edits/saves/flushes
+/// on the same document, so `didOpen` can never be skipped and leave a file permanently orphaned.
+/// Only the trailing `semanticTokens` refresh (`lspTask`) is cancelled when superseded.
 extension ViewerModel {
     /// Debounce delay after keystrokes before sending `didChange` and refreshing semantic tokens.
     static let lspChangeDelay: TimeInterval = 0.18
@@ -57,8 +58,7 @@ extension ViewerModel {
 
         lspDebounceTimer?.invalidate()
         lspDebounceTimer = nil
-        let previousTask = lspTask
-        previousTask?.cancel()
+        lspTask?.cancel()
         lspGeneration &+= 1
         let gen = lspGeneration
 
@@ -72,22 +72,31 @@ extension ViewerModel {
         let active = ActiveLSPDocument(fileURL: fileURL, language: doc.language, repoRoot: repoRoot, version: nextVersion)
         lspDocument = active
         let text = doc.right.lines.joined(separator: "\n")
+        let language = doc.language
         let manager = lspManager
+        let previousLifecycle = lspLifecycleTask
 
-        lspTask = Task { @MainActor [weak self, weak doc] in
-            await previousTask?.value
+        let lifecycleTask = Task { @MainActor [weak self, weak doc] in
+            await previousLifecycle?.value
             if let oldURL = previousURL {
                 await manager.didClose(fileURL: oldURL)
             }
-            guard let self, let doc, !Task.isCancelled, self.lspGeneration == gen, self.document === doc else { return }
+            // Only skip didOpen if a DIFFERENT file or newer DiffDocument superseded this open.
+            // Never skip didOpen just because a save/change/flush bumped lspGeneration on the same document.
+            guard let self, let doc, self.lspDocument?.fileURL == fileURL, self.document === doc else { return }
             await manager.didOpen(
                 fileURL: fileURL,
                 text: text,
                 version: nextVersion,
-                language: doc.language,
+                language: language,
                 repoRoot: repoRoot
             )
-            guard !Task.isCancelled, self.lspGeneration == gen, self.document === doc else { return }
+        }
+        lspLifecycleTask = lifecycleTask
+
+        lspTask = Task { @MainActor [weak self, weak doc] in
+            await lifecycleTask.value
+            guard let self, let doc, !Task.isCancelled, self.lspGeneration == gen, self.document === doc else { return }
             guard let tokens = await manager.semanticTokens(fileURL: fileURL) else { return }
             guard !Task.isCancelled, self.lspGeneration == gen, self.document === doc else { return }
             let changed = doc.right.applySemanticTokens(tokens)
@@ -97,21 +106,34 @@ extension ViewerModel {
         }
     }
 
+    /// Re-verifies LSP canvas flag & active document sync on same-file early returns in `ViewerModel.open`.
+    func ensureLSPSyncedAfterEarlyReturn() {
+        let enabled = isCurrentDocumentLSPEnabled
+        container?.canvas.isLSPEnabled = enabled
+        guard enabled, let request else { return }
+        let canonical = LSPURI.canonicalFileURL(request.fileURL)
+        if lspDocument?.fileURL != canonical {
+            syncLSPForCurrentDocument()
+        }
+    }
+
     /// Closes any active LSP document and cancels pending semantic token fetches in FIFO order.
     func closeLSPDocument() {
         lspDebounceTimer?.invalidate()
         lspDebounceTimer = nil
-        let previousTask = lspTask
-        previousTask?.cancel()
+        lspTask?.cancel()
         lspGeneration &+= 1
         if let active = lspDocument {
             lspDocument = nil
             let oldURL = active.fileURL
             let manager = lspManager
-            lspTask = Task { @MainActor in
-                await previousTask?.value
+            let previousLifecycle = lspLifecycleTask
+            let closeTask = Task { @MainActor in
+                await previousLifecycle?.value
                 await manager.didClose(fileURL: oldURL)
             }
+            lspLifecycleTask = closeTask
+            lspTask = closeTask
         } else {
             lspTask = nil
         }
@@ -136,27 +158,90 @@ extension ViewerModel {
         lspDebounceTimer = timer
     }
 
-    /// Immediately flushes any pending debounced `didChange` notification (e.g. before `definition`).
+    /// Immediately flushes any pending debounced `didChange` notification (e.g. before `definition`),
+    /// reopening the document if its LSP session is missing.
     func flushLSPChangeIfNeeded() async {
         if lspDebounceTimer == nil {
-            await lspTask?.value
+            await lspLifecycleTask?.value
             return
         }
         lspDebounceTimer?.invalidate()
         lspDebounceTimer = nil
-        guard var active = lspDocument, let doc = document, case .text = doc.content else { return }
+        guard var active = lspDocument, let doc = document, case .text = doc.content else {
+            await lspLifecycleTask?.value
+            return
+        }
         active.version += 1
         lspDocument = active
         let text = doc.right.lines.joined(separator: "\n")
-        let previousTask = lspTask
-        previousTask?.cancel()
+        let fileURL = active.fileURL
+        let version = active.version
+        let language = active.language
+        let repoRoot = active.repoRoot
         let manager = lspManager
+        lspTask?.cancel()
+        let previousLifecycle = lspLifecycleTask
         let flushTask = Task { @MainActor in
-            await previousTask?.value
-            await manager.didChange(fileURL: active.fileURL, version: active.version, text: text)
+            await previousLifecycle?.value
+            let uri = LSPURI.uri(from: fileURL)
+            if await manager.openSession(forURI: uri) == nil {
+                await manager.didOpen(
+                    fileURL: fileURL,
+                    text: text,
+                    version: version,
+                    language: language,
+                    repoRoot: repoRoot
+                )
+            } else {
+                await manager.didChange(
+                    fileURL: fileURL,
+                    version: version,
+                    text: text,
+                    language: language,
+                    repoRoot: repoRoot
+                )
+            }
         }
+        lspLifecycleTask = flushTask
         lspTask = flushTask
         await flushTask.value
+    }
+
+    /// Ensures the active document is open and synchronized in `LSPManager` before querying `definition` / `references`.
+    /// Self-heals if the server restarted, was idle-reaped, or an earlier open did not complete.
+    @discardableResult
+    func ensureLSPDocumentSynced() async -> ActiveLSPDocument? {
+        guard isCurrentDocumentLSPEnabled else { return nil }
+        if lspDocument == nil {
+            syncLSPForCurrentDocument()
+        }
+        await flushLSPChangeIfNeeded()
+        guard var active = lspDocument, let doc = document, case .text = doc.content else { return nil }
+        let uri = LSPURI.uri(from: active.fileURL)
+        if await lspManager.openSession(forURI: uri) == nil {
+            active.version += 1
+            lspDocument = active
+            let text = doc.right.lines.joined(separator: "\n")
+            let fileURL = active.fileURL
+            let version = active.version
+            let language = active.language
+            let repoRoot = active.repoRoot
+            let manager = lspManager
+            let previousLifecycle = lspLifecycleTask
+            let reopenTask = Task { @MainActor in
+                await previousLifecycle?.value
+                await manager.didOpen(
+                    fileURL: fileURL,
+                    text: text,
+                    version: version,
+                    language: language,
+                    repoRoot: repoRoot
+                )
+            }
+            lspLifecycleTask = reopenTask
+            await reopenTask.value
+        }
+        return lspDocument
     }
 
     /// Notifies LSP that the active document was saved to disk, flushing any pending change first.
@@ -171,23 +256,45 @@ extension ViewerModel {
             updated.version += 1
             lspDocument = updated
         }
-        let previousTask = lspTask
-        previousTask?.cancel()
+        lspTask?.cancel()
         lspGeneration &+= 1
         let gen = lspGeneration
         let text = doc.right.lines.joined(separator: "\n")
         let fileURL = updated.fileURL
         let version = updated.version
+        let language = updated.language
+        let repoRoot = updated.repoRoot
         let manager = lspManager
+        let previousLifecycle = lspLifecycleTask
+
+        let lifecycleTask = Task { @MainActor [weak self, weak doc] in
+            await previousLifecycle?.value
+            guard let self, let doc, self.lspDocument?.fileURL == fileURL, self.document === doc else { return }
+            let uri = LSPURI.uri(from: fileURL)
+            if await manager.openSession(forURI: uri) == nil {
+                await manager.didOpen(
+                    fileURL: fileURL,
+                    text: text,
+                    version: version,
+                    language: language,
+                    repoRoot: repoRoot
+                )
+            } else if hadPendingChange {
+                await manager.didChange(
+                    fileURL: fileURL,
+                    version: version,
+                    text: text,
+                    language: language,
+                    repoRoot: repoRoot
+                )
+            }
+            await manager.didSave(fileURL: fileURL, text: text, language: language, repoRoot: repoRoot)
+        }
+        lspLifecycleTask = lifecycleTask
 
         lspTask = Task { @MainActor [weak self, weak doc] in
-            await previousTask?.value
+            await lifecycleTask.value
             guard let self, let doc, !Task.isCancelled, self.lspGeneration == gen, self.document === doc else { return }
-            if hadPendingChange {
-                await manager.didChange(fileURL: fileURL, version: version, text: text)
-            }
-            await manager.didSave(fileURL: fileURL, text: text)
-            guard !Task.isCancelled, self.lspGeneration == gen, self.document === doc else { return }
             guard let tokens = await manager.semanticTokens(fileURL: fileURL) else { return }
             guard !Task.isCancelled, self.lspGeneration == gen, self.document === doc else { return }
             let changed = doc.right.applySemanticTokens(tokens)
@@ -201,20 +308,44 @@ extension ViewerModel {
         guard AppEnvironment.hasLSP, var active = lspDocument, let doc = document, case .text = doc.content else { return }
         active.version += 1
         lspDocument = active
-        let previousTask = lspTask
-        previousTask?.cancel()
+        lspTask?.cancel()
         lspGeneration &+= 1
         let gen = lspGeneration
         let text = doc.right.lines.joined(separator: "\n")
         let fileURL = active.fileURL
         let version = active.version
+        let language = active.language
+        let repoRoot = active.repoRoot
         let manager = lspManager
+        let previousLifecycle = lspLifecycleTask
+
+        let lifecycleTask = Task { @MainActor [weak self, weak doc] in
+            await previousLifecycle?.value
+            guard let self, let doc, self.lspDocument?.fileURL == fileURL, self.document === doc else { return }
+            let uri = LSPURI.uri(from: fileURL)
+            if await manager.openSession(forURI: uri) == nil {
+                await manager.didOpen(
+                    fileURL: fileURL,
+                    text: text,
+                    version: version,
+                    language: language,
+                    repoRoot: repoRoot
+                )
+            } else {
+                await manager.didChange(
+                    fileURL: fileURL,
+                    version: version,
+                    text: text,
+                    language: language,
+                    repoRoot: repoRoot
+                )
+            }
+        }
+        lspLifecycleTask = lifecycleTask
 
         lspTask = Task { @MainActor [weak self, weak doc] in
-            await previousTask?.value
+            await lifecycleTask.value
             guard let self, let doc, !Task.isCancelled, self.lspGeneration == gen, self.document === doc else { return }
-            await manager.didChange(fileURL: fileURL, version: version, text: text)
-            guard !Task.isCancelled, self.lspGeneration == gen, self.document === doc else { return }
             guard let tokens = await manager.semanticTokens(fileURL: fileURL) else { return }
             guard !Task.isCancelled, self.lspGeneration == gen, self.document === doc else { return }
             let changed = doc.right.applySemanticTokens(tokens)

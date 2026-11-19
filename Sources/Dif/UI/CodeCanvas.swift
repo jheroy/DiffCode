@@ -64,6 +64,8 @@ protocol CodeCanvasDelegate: AnyObject {
     func canvas(_ canvas: CodeCanvasView, didUpdateVimState state: VimUIState)
     /// A Vim command triggered an IDE / viewer action (`line` is 0-based, `column` is 0-based UTF-16).
     func canvas(_ canvas: CodeCanvasView, performVimAction action: VimAction, line: Int, column: Int)
+    /// Records a jump origin (0-based right-pane line & UTF-16 column) before a Vim jump motion or distant click.
+    func canvas(_ canvas: CodeCanvasView, recordJumpOrigin origin: TextPosition)
 }
 
 // MARK: - Layers
@@ -2649,7 +2651,16 @@ final class CodeCanvasView: NSView {
             return
         }
         let side = pane(at: point)
+        let previousCaret = activeCaretPosition()
         guard let pos = position(at: point, pane: side) else { selection = nil; return }
+        if !event.modifierFlags.contains(.shift),
+           mode != .sideBySide || side == .right,
+           let prev = previousCaret {
+            let newPos = linePosition(pos)
+            if abs(newPos.row - prev.row) >= 5 {
+                delegate?.canvas(self, recordJumpOrigin: prev)
+            }
+        }
         if vimEngine.mode.isVisual || vimEngine.mode.isCommandLine {
             vimEngine.resetToNormal(switchInputSource: false)
         }
@@ -2752,8 +2763,24 @@ final class CodeCanvasView: NSView {
         return parts.joined(separator: "\n")
     }
 
-    /// 1-based line number of the selection start (or visible focus line / top visible line) on the new side.
+    /// Active right-pane caret position (0-based line, 0-based UTF-16 column), when a caret or Vim cursor exists.
+    func activeCaretPosition() -> TextPosition? {
+        guard let doc = document, case .text = doc.content, !doc.right.lines.isEmpty else { return nil }
+        if let editSel = editSelection {
+            return TextEditing.clamp(editSel.head, in: doc.right.lines)
+        }
+        if let sel = selection, mode != .sideBySide || sel.pane == .right {
+            return linePosition(sel.head)
+        }
+        if vimModeEnabled {
+            return TextEditing.clamp(vimCursor, in: doc.right.lines)
+        }
+        return nil
+    }
+
+    /// 1-based line number of the active caret (or selection start / visible focus line / top visible line) on the new side.
     func currentLineNumber() -> Int {
+        if let pos = activeCaretPosition() { return pos.row + 1 }
         if let sel = selection, let src = source(pane: sel.pane, row: sel.lower.row) { return src.line + 1 }
         let scroll = resolveScroll()
         if let focus = focusLine, focus.side == .right {

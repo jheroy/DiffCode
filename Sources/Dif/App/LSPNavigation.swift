@@ -724,7 +724,7 @@ extension AppStore {
     /// - If the clicked position is a reference, jumps directly to a single definition or opens the picker
     ///   when multiple definitions are returned.
     func smartLSPNavigate(line: Int, character: Int) {
-        guard AppEnvironment.hasLSP, let active = viewer.lspDocument, let request = viewer.request else { return }
+        guard AppEnvironment.hasLSP, viewer.isCurrentDocumentLSPEnabled, let request = viewer.request else { return }
 
         let symbol = symbolAt(line: line, utf16Column: character)
         let origin = makeJumpLocation(from: request, line1Based: line + 1, column: character)
@@ -733,11 +733,16 @@ extension AppStore {
         definitionTask?.cancel()
         definitionTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.viewer.flushLSPChangeIfNeeded()
+            guard let active = await self.viewer.ensureLSPDocumentSynced() else { return }
+            guard !Task.isCancelled, self.viewer.lspDocument?.fileURL == active.fileURL else { return }
+            let liveText = self.viewer.document?.right.lines.joined(separator: "\n")
             let rawDefs = await lsp.definition(
                 fileURL: active.fileURL,
                 line: line,
-                character: character
+                character: character,
+                text: liveText,
+                language: active.language,
+                repoRoot: active.repoRoot
             )
             guard !Task.isCancelled, self.viewer.lspDocument?.fileURL == active.fileURL else { return }
 
@@ -755,7 +760,10 @@ extension AppStore {
                     fileURL: active.fileURL,
                     line: line,
                     character: character,
-                    includeDeclaration: false
+                    includeDeclaration: false,
+                    text: liveText,
+                    language: active.language,
+                    repoRoot: active.repoRoot
                 )
                 guard !Task.isCancelled, self.viewer.lspDocument?.fileURL == active.fileURL else { return }
 
@@ -766,7 +774,10 @@ extension AppStore {
                         fileURL: active.fileURL,
                         line: line,
                         character: character,
-                        includeDeclaration: true
+                        includeDeclaration: true,
+                        text: liveText,
+                        language: active.language,
+                        repoRoot: active.repoRoot
                     ).filter { $0.fileURL != nil }
                     guard !Task.isCancelled, self.viewer.lspDocument?.fileURL == active.fileURL else { return }
 
@@ -835,7 +846,7 @@ extension AppStore {
 
     /// Explicit "Go to Definition" (e.g. from context menu): always resolves `textDocument/definition`.
     func goToDefinition(atLine line: Int, utf16Column character: Int) {
-        guard AppEnvironment.hasLSP, let active = viewer.lspDocument, let request = viewer.request else { return }
+        guard AppEnvironment.hasLSP, viewer.isCurrentDocumentLSPEnabled, let request = viewer.request else { return }
 
         let symbol = symbolAt(line: line, utf16Column: character)
         let origin = makeJumpLocation(from: request, line1Based: line + 1, column: character)
@@ -844,11 +855,16 @@ extension AppStore {
         definitionTask?.cancel()
         definitionTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.viewer.flushLSPChangeIfNeeded()
+            guard let active = await self.viewer.ensureLSPDocumentSynced() else { return }
+            guard !Task.isCancelled, self.viewer.lspDocument?.fileURL == active.fileURL else { return }
+            let liveText = self.viewer.document?.right.lines.joined(separator: "\n")
             let rawDefs = await lsp.definition(
                 fileURL: active.fileURL,
                 line: line,
-                character: character
+                character: character,
+                text: liveText,
+                language: active.language,
+                repoRoot: active.repoRoot
             )
             guard !Task.isCancelled, self.viewer.lspDocument?.fileURL == active.fileURL else { return }
 
@@ -891,7 +907,7 @@ extension AppStore {
     /// Explicit "Find All References" (e.g. from context menu): resolves `textDocument/references`
     /// with `includeDeclaration: true` and presents the References Picker Popup with preview.
     func findAllReferences(atLine line: Int, utf16Column character: Int) {
-        guard AppEnvironment.hasLSP, let active = viewer.lspDocument, let request = viewer.request else { return }
+        guard AppEnvironment.hasLSP, viewer.isCurrentDocumentLSPEnabled, let request = viewer.request else { return }
 
         let symbol = symbolAt(line: line, utf16Column: character)
         let origin = makeJumpLocation(from: request, line1Based: line + 1, column: character)
@@ -900,17 +916,25 @@ extension AppStore {
         definitionTask?.cancel()
         definitionTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.viewer.flushLSPChangeIfNeeded()
+            guard let active = await self.viewer.ensureLSPDocumentSynced() else { return }
+            guard !Task.isCancelled, self.viewer.lspDocument?.fileURL == active.fileURL else { return }
+            let liveText = self.viewer.document?.right.lines.joined(separator: "\n")
             async let refsTask = lsp.references(
                 fileURL: active.fileURL,
                 line: line,
                 character: character,
-                includeDeclaration: true
+                includeDeclaration: true,
+                text: liveText,
+                language: active.language,
+                repoRoot: active.repoRoot
             )
             async let defsTask = lsp.definition(
                 fileURL: active.fileURL,
                 line: line,
-                character: character
+                character: character,
+                text: liveText,
+                language: active.language,
+                repoRoot: active.repoRoot
             )
             let (rawRefs, rawDefs) = await (refsTask, defsTask)
             guard !Task.isCancelled, self.viewer.lspDocument?.fileURL == active.fileURL else { return }
@@ -974,13 +998,14 @@ extension AppStore {
 
         let canonicalTarget = LSPURI.canonicalFileURL(targetURL)
         let targetLine0 = location.range.start.line
+        let targetCol = max(0, location.range.start.character)
 
         if let activeFile = viewer.lspDocument?.fileURL,
            canonicalTarget == activeFile,
            let origin,
            origin.fileURL == canonicalTarget,
            origin.line == targetLine0 + 1 {
-            viewer.reveal(line: targetLine0 + 1)
+            viewer.reveal(line: targetLine0 + 1, column: targetCol)
             viewer.focusCanvas()
             return
         }
@@ -1003,20 +1028,49 @@ extension AppStore {
         if let origin {
             jumpHistory.push(origin)
         }
+        isNavigatingJumpHistory = true
+        defer { isNavigatingJumpHistory = false }
         navigate(to: target)
     }
 
-    /// `⌘[`: Navigates back to the previous recorded jump location.
+    /// Records an in-file jump origin (`line0Based`, `column`) on the unified jump list unless currently walking jump history.
+    func recordJumpOrigin(line0Based: Int, column: Int) {
+        guard !isNavigatingJumpHistory, let request = viewer.request else { return }
+        let origin = makeJumpLocation(from: request, line1Based: line0Based + 1, column: column)
+        jumpHistory.push(origin)
+    }
+
+    /// Records a cross-file jump origin (`previousRequest`, `line0Based`, `column`) unless currently walking jump history.
+    func recordJumpOrigin(from request: DiffRequest, line0Based: Int, column: Int) {
+        guard !isNavigatingJumpHistory else { return }
+        let origin = makeJumpLocation(from: request, line1Based: line0Based + 1, column: column)
+        jumpHistory.push(origin)
+    }
+
+    /// Records the current viewer caret as a jump origin when jumping to a different 1-based line in the same file.
+    func recordCurrentJumpOriginIfDifferent(targetLine1Based: Int) {
+        guard !isNavigatingJumpHistory, let request = viewer.request else { return }
+        let pos = viewer.currentCaretPosition()
+        guard targetLine1Based != pos.row + 1 else { return }
+        let origin = makeJumpLocation(from: request, line1Based: pos.row + 1, column: pos.column)
+        jumpHistory.push(origin)
+    }
+
+    /// `<C-o>` / `⌘[`: Navigates back to the previous recorded jump location.
     func navigateBack() {
         guard let target = jumpHistory.back(from: currentJumpLocation()) else { return }
         definitionTask?.cancel()
+        isNavigatingJumpHistory = true
+        defer { isNavigatingJumpHistory = false }
         jumpToLocation(target)
     }
 
-    /// `⌘]`: Navigates forward to the next recorded jump location.
+    /// `<C-i>` / `⌘]`: Navigates forward to the next recorded jump location.
     func navigateForward() {
         guard let target = jumpHistory.forward(from: currentJumpLocation()) else { return }
         definitionTask?.cancel()
+        isNavigatingJumpHistory = true
+        defer { isNavigatingJumpHistory = false }
         jumpToLocation(target)
     }
 
@@ -1032,9 +1086,8 @@ extension AppStore {
 
     private func currentJumpLocation() -> JumpLocation? {
         guard let request = viewer.request else { return nil }
-        let line = viewer.container?.canvas.currentLineNumber() ?? 1
-        let col = viewer.container?.canvas.editSelection?.head.column ?? 0
-        return makeJumpLocation(from: request, line1Based: line, column: col)
+        let pos = viewer.currentCaretPosition()
+        return makeJumpLocation(from: request, line1Based: pos.row + 1, column: pos.column)
     }
 
     private func makeJumpLocation(from request: DiffRequest, line1Based: Int, column: Int) -> JumpLocation {
@@ -1063,38 +1116,50 @@ extension AppStore {
 
     private func navigate(to target: LSPNavigationTarget) {
         switch target {
-        case .activeProject(let projectID, let relativePath, _, let line, _):
+        case .activeProject(let projectID, let relativePath, _, let line, let column):
             guard let project = projects.first(where: { $0.id == projectID }) ?? currentProject else { return }
             exitExternalFileMode()
-            openFile(in: project, path: relativePath, line: line)
+            openFile(in: project, path: relativePath, line: line, column: column)
             viewer.focusCanvas()
 
-        case .otherProject(let projectID, let relativePath, _, let line, _):
+        case .otherProject(let projectID, let relativePath, _, let line, let column):
             guard let project = projects.first(where: { $0.id == projectID }) else { return }
             exitExternalFileMode()
             uncollapseAncestors(of: project)
-            openFile(in: project, path: relativePath, line: line)
+            openFile(in: project, path: relativePath, line: line, column: column)
             viewer.focusCanvas()
 
-        case .externalReadOnly(let fileURL, let repoRoot, let workspaceRoot, let displayPath, let line, _):
+        case .externalReadOnly(let fileURL, let repoRoot, let workspaceRoot, let displayPath, let line, let column):
             openExternalFile(
                 fileURL: fileURL,
                 repoRoot: repoRoot,
                 workspaceRoot: workspaceRoot,
                 displayPath: displayPath,
-                line: line
+                line: line,
+                column: column
             )
         }
     }
 
     private func jumpToLocation(_ location: JumpLocation) {
+        let targetURL = LSPURI.canonicalFileURL(location.fileURL)
+        if let currentRequest = viewer.request,
+           LSPURI.canonicalFileURL(currentRequest.fileURL) == targetURL,
+           viewer.document != nil,
+           !viewer.isLoading {
+            // Same currently open file: restore exact caret + scroll in-place without reloading from disk or losing edits.
+            viewer.reveal(line: location.line, column: location.column, resetVimToNormal: true)
+            viewer.focusCanvas()
+            return
+        }
+
         if !location.isExternal,
            let projectID = location.projectID,
            let project = projects.first(where: { $0.id == projectID }),
            let relativePath = location.relativePath {
             exitExternalFileMode()
             uncollapseAncestors(of: project)
-            openFile(in: project, path: relativePath, line: location.line)
+            openFile(in: project, path: relativePath, line: location.line, column: location.column)
             viewer.focusCanvas()
             return
         }
@@ -1119,7 +1184,8 @@ extension AppStore {
         repoRoot: URL?,
         workspaceRoot: URL?,
         displayPath: String,
-        line: Int?
+        line: Int?,
+        column: Int? = nil
     ) {
         let canonical = LSPURI.canonicalFileURL(fileURL)
         let baseRoot = repoRoot.map { LSPURI.canonicalFileURL($0) } ?? canonical.deletingLastPathComponent()
@@ -1133,7 +1199,7 @@ extension AppStore {
         )
         externalRequest = req
         viewer.setBaseStamp(nil)
-        viewer.open(req, line: line)
+        viewer.open(req, line: line, column: column)
         viewer.focusCanvas()
     }
 

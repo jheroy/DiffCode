@@ -67,9 +67,15 @@ final class ViewerModel: CodeCanvasDelegate {
     @ObservationIgnored var onDocumentChanged: (() -> Void)?
     /// App-level Vim action dispatched from the canvas (`line` is 0-based, `column` is 0-based UTF-16).
     @ObservationIgnored var onVimAction: ((VimAction, Int, Int) -> Void)?
+    /// Records an in-file jump origin (`line` is 0-based, `column` is 0-based UTF-16) on the unified jump list.
+    @ObservationIgnored var onRecordJump: ((Int, Int) -> Void)?
+    /// Fires before leaving an already-loaded file for a different file (`previousRequest`, 0-based line, 0-based UTF-16 column).
+    @ObservationIgnored var onWillSwitchFile: ((DiffRequest, Int, Int) -> Void)?
 
-    @ObservationIgnored private var loadTask: Task<Void, Never>?
+    @ObservationIgnored var loadTask: Task<Void, Never>?
     @ObservationIgnored private var pendingLine: Int?
+    @ObservationIgnored private var pendingColumn: Int?
+    @ObservationIgnored private var findOrigin: TextPosition?
     @ObservationIgnored private var landOnLastHunk = false
     @ObservationIgnored private var detachedFromFocus = false
     @ObservationIgnored private var armed: (delta: Int, at: Date)?
@@ -114,6 +120,7 @@ final class ViewerModel: CodeCanvasDelegate {
     @ObservationIgnored var lspManager: LSPManager = .shared
     @ObservationIgnored var lspDocument: ActiveLSPDocument?
     @ObservationIgnored var lspGeneration: UInt64 = 0
+    @ObservationIgnored var lspLifecycleTask: Task<Void, Never>?
     @ObservationIgnored var lspTask: Task<Void, Never>?
     @ObservationIgnored var lspDebounceTimer: Timer?
     /// ⌘+Click on a symbol in an LSP-enabled pane (`line` is 0-based, `character` is 0-based UTF-16).
@@ -209,12 +216,39 @@ final class ViewerModel: CodeCanvasDelegate {
         observeFocusChanges()
     }
 
+    /// Current right-pane caret position (0-based line, 0-based UTF-16 column).
+    /// When a file is mid-load with a pending jump target, returns that pending target so rapid
+    /// back-to-back `<C-o>` / `<C-i>` presses record the right position instead of the previous file's caret.
+    func currentCaretPosition() -> TextPosition {
+        if isLoading, let pendingLine {
+            return TextPosition(row: max(0, pendingLine - 1), column: max(0, pendingColumn ?? 0))
+        }
+        if let pos = container?.canvas.activeCaretPosition() {
+            return pos
+        }
+        let line1 = container?.canvas.currentLineNumber() ?? max(1, vimCursorLine)
+        let col0 = max(0, vimCursorColumn - 1)
+        return TextPosition(row: max(0, line1 - 1), column: col0)
+    }
+
     // MARK: Loading
 
     /// Shows `request`. A request that is already on screen is left alone unless a line is given.
-    func open(_ request: DiffRequest, line: Int? = nil, preserveScroll: Bool = false) {
+    func open(_ request: DiffRequest, line: Int? = nil, column: Int? = nil, preserveScroll: Bool = false) {
         if request == self.request {
-            if let line, document != nil, !isLoading { reveal(line: line) } else if line != nil { pendingLine = line }
+            if let line, document != nil, !isLoading {
+                let current = currentCaretPosition()
+                if line != current.row + 1 {
+                    onRecordJump?(current.row, current.column)
+                }
+                reveal(line: line, column: column)
+            } else if line != nil {
+                pendingLine = line
+                pendingColumn = column
+            }
+            if !isLoading, document != nil {
+                ensureLSPSyncedAfterEarlyReturn()
+            }
             return
         }
         if let current = self.request, let editor, editor.hasEdits, !isLoading,
@@ -228,12 +262,32 @@ final class ViewerModel: CodeCanvasDelegate {
                 onDocumentChanged?()
             }
             if current.source == .file || request.source == .file || self.request == request {
-                if let line { reveal(line: line) }
+                if let line {
+                    let pos = currentCaretPosition()
+                    if line != pos.row + 1 {
+                        onRecordJump?(pos.row, pos.column)
+                    }
+                    reveal(line: line, column: column)
+                }
+                ensureLSPSyncedAfterEarlyReturn()
                 reloadIfStale(base: baseStamp)
                 return
             }
         }
-        load(request, line: line, preserveScroll: preserveScroll)
+        if let previousRequest = self.request, document != nil, !isLoading {
+            let prevURL = LSPURI.canonicalFileURL(previousRequest.fileURL)
+            let nextURL = LSPURI.canonicalFileURL(request.fileURL)
+            if prevURL != nextURL {
+                let pos = currentCaretPosition()
+                onWillSwitchFile?(previousRequest, pos.row, pos.column)
+            } else if let line {
+                let pos = currentCaretPosition()
+                if line != pos.row + 1 {
+                    onRecordJump?(pos.row, pos.column)
+                }
+            }
+        }
+        load(request, line: line, column: column, preserveScroll: preserveScroll)
     }
 
     func reload() {
@@ -304,11 +358,12 @@ final class ViewerModel: CodeCanvasDelegate {
 
     func setBaseStamp(_ stamp: String?) { baseStamp = stamp }
 
-    private func load(_ request: DiffRequest, line: Int?, preserveScroll: Bool) {
+    private func load(_ request: DiffRequest, line: Int?, column: Int? = nil, preserveScroll: Bool) {
         // Leaving the text, or reading it again: what was typed goes to the file first.
         saveEdits()
         self.request = request
         pendingLine = line
+        pendingColumn = column
         loadTask?.cancel()
         isLoading = true
         let stamp = baseStamp
@@ -330,7 +385,7 @@ final class ViewerModel: CodeCanvasDelegate {
                 let saved = saveEdits()
                 if saved, sameFile {
                     // What was just read is older than what is on screen: read it again.
-                    load(request, line: pendingLine, preserveScroll: true)
+                    load(request, line: pendingLine, column: pendingColumn, preserveScroll: true)
                     return
                 }
             }
@@ -368,13 +423,23 @@ final class ViewerModel: CodeCanvasDelegate {
 
     /// Initial viewport: the requested line, else the first change (as IntelliJ does).
     private func position(_ doc: DiffDocument) {
-        guard let container else { return }
+        guard let container else {
+            if let line = pendingLine {
+                let col = pendingColumn
+                pendingLine = nil
+                pendingColumn = nil
+                reveal(line: line, column: col)
+            }
+            return
+        }
         container.whenLaidOut { [weak self, weak container] in
             guard let self, let container, self.document === doc else { return }
             self.detachedFromFocus = false
             if let line = self.pendingLine {
+                let col = self.pendingColumn
                 self.pendingLine = nil
-                self.reveal(line: line)
+                self.pendingColumn = nil
+                self.reveal(line: line, column: col)
             } else if !doc.hunks.isEmpty, case .text = doc.content, !doc.isPlainFile {
                 let index = self.landOnLastHunk ? doc.hunks.count - 1 : 0
                 let hunk = doc.hunks[index]
@@ -406,11 +471,38 @@ final class ViewerModel: CodeCanvasDelegate {
 
     // MARK: Navigation
 
-    /// Scrolls to a 1-based line of the new side and tints it.
-    func reveal(line: Int) {
-        guard let container, let doc = document, case .text = doc.content, !doc.right.lines.isEmpty else { return }
+    /// Scrolls to a 1-based line (and optional 0-based UTF-16 column) of the new side and tints it.
+    func reveal(line: Int, column: Int? = nil, resetVimToNormal: Bool = false) {
+        guard let doc = document, case .text = doc.content, !doc.right.lines.isEmpty else { return }
         let index = max(0, min(line - 1, doc.right.lines.count - 1))
-        container.canvas.placeCaret(line: index)
+        let nsLine = doc.right.lines[index] as NSString
+        let maxCol = nsLine.length
+        let targetCol: Int
+        if let column {
+            let inInsert = container?.canvas.vimEngine.mode.isInsert ?? false
+            if vimModeEnabled && (resetVimToNormal || !inInsert) {
+                let lastCol = maxCol > 0
+                    ? TextEditing.characterBoundary(in: nsLine, from: maxCol, forward: false)
+                    : 0
+                targetCol = max(0, min(column, lastCol))
+            } else {
+                targetCol = max(0, min(column, maxCol))
+            }
+        } else {
+            targetCol = 0
+        }
+        guard let container else {
+            vimCursorLine = index + 1
+            vimCursorColumn = targetCol + 1
+            return
+        }
+        if resetVimToNormal && container.canvas.vimModeEnabled {
+            container.canvas.vimEngine.resetToNormal(switchInputSource: true)
+        }
+        container.canvas.placeCaret(line: index, column: targetCol)
+        if resetVimToNormal && container.canvas.vimModeEnabled {
+            container.canvas.reportVimStateIfNeeded(force: true)
+        }
         container.canvas.focusLine = (.right, index)
         container.scroll(toRow: container.canvas.row(forLine: index, side: .right), fraction: 0.35, animated: false)
         detachedFromFocus = true
@@ -445,10 +537,14 @@ final class ViewerModel: CodeCanvasDelegate {
 
     func focus(hunk index: Int, animated: Bool = true) {
         guard let container else { return }
+        let origin = currentCaretPosition()
         focusedHunk = index
         detachedFromFocus = false
         if let doc = document, doc.hunks.indices.contains(index) {
             let hunk = doc.hunks[index]
+            if hunk.rightStart != origin.row {
+                onRecordJump?(origin.row, origin.column)
+            }
             container.canvas.placeCaret(line: hunk.rightStart)
             container.canvas.focusedHunk = index
             if hunk.rightCount > 0 {
@@ -523,6 +619,7 @@ final class ViewerModel: CodeCanvasDelegate {
 
     func showFind() {
         guard isTextDocument else { return }
+        findOrigin = currentCaretPosition()
         if let selected = container?.canvas.selectedText(), !selected.isEmpty, !selected.contains("\n") {
             findQuery = selected
         }
@@ -533,6 +630,7 @@ final class ViewerModel: CodeCanvasDelegate {
 
     func hideFind() {
         findVisible = false
+        findOrigin = nil
         findCount = 0
         findIndex = 0
         container?.canvas.setHighlightedRanges([[:], [:]], navigation: [], current: -1)
@@ -592,20 +690,35 @@ final class ViewerModel: CodeCanvasDelegate {
         container.canvas.setHighlightedRanges(bySide, navigation: list, current: current)
         findCount = list.count
         findIndex = current + 1
-        if reveal, current >= 0 { revealMatch(list[current]) }
+        if reveal, current >= 0 {
+            let match = list[current]
+            if match.side == .right {
+                if let origin = findOrigin, match.line != origin.row {
+                    onRecordJump?(origin.row, origin.column)
+                    findOrigin = nil
+                }
+                container.canvas.placeCaret(line: match.line, column: match.range.lowerBound)
+            }
+            revealMatch(match)
+        }
     }
 
     func stepFind(_ delta: Int, center: Bool = false) {
         guard let canvas = container?.canvas, !canvas.matches.isEmpty else { return }
+        let origin = currentCaretPosition()
         let count = canvas.matches.count
         let next = ((canvas.currentMatch + delta) % count + count) % count
         canvas.setCurrentMatch(next)
         findIndex = next + 1
         let match = canvas.matches[next]
-        revealMatch(match, center: center)
-        if center, match.side == .right {
+        if match.side == .right {
+            if match.line != origin.row {
+                onRecordJump?(origin.row, origin.column)
+            }
+            findOrigin = nil
             canvas.placeCaret(line: match.line, column: match.range.lowerBound)
         }
+        revealMatch(match, center: center)
         refreshLineDiff(side: match.side, line: match.line)
     }
 
@@ -648,6 +761,9 @@ final class ViewerModel: CodeCanvasDelegate {
         findIndex = targetIndex + 1
         let match = matches[targetIndex]
         if match.side == .right {
+            if match.line != line {
+                onRecordJump?(line, column)
+            }
             canvas.placeCaret(line: match.line, column: match.range.lowerBound)
         }
         revealMatch(match, center: true)
@@ -705,6 +821,10 @@ final class ViewerModel: CodeCanvasDelegate {
         if vimCursorColumn != state.cursorColumn { vimCursorColumn = state.cursorColumn }
     }
 
+    func canvas(_ canvas: CodeCanvasView, recordJumpOrigin origin: TextPosition) {
+        onRecordJump?(origin.row, origin.column)
+    }
+
     func canvas(_ canvas: CodeCanvasView, performVimAction action: VimAction, line: Int, column: Int) {
         switch action {
         case .openFind:
@@ -719,7 +839,7 @@ final class ViewerModel: CodeCanvasDelegate {
         case .save:
             saveFromVim()
         case .jumpToLine(let lineNum):
-            reveal(line: lineNum)
+            reveal(line: lineNum, column: column)
         case .scrollCenter:
             container?.scroll(toRow: canvas.row(forLine: line, side: .right), fraction: 0.5, animated: false)
         case .scrollTop:

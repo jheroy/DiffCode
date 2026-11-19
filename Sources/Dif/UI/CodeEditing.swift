@@ -672,6 +672,9 @@ extension CodeCanvasView: @preconcurrency NSTextInputClient {
     }
 
     private func applyVimResult(_ result: VimResult) {
+        if let origin = result.jumpOrigin {
+            delegate?.canvas(self, recordJumpOrigin: origin)
+        }
         let nonEmptyEdits = result.edits.filter { $0.from != $0.to || !$0.text.isEmpty }
         if !nonEmptyEdits.isEmpty, let editor {
             commitComposition()

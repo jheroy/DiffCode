@@ -299,6 +299,8 @@ struct VimResult: Equatable, Sendable {
     var actions: [VimAction] = []
     var enteredInsert: Bool = false
     var exitedInsert: Bool = false
+    /// Origin cursor position to record onto the Vim jump list before applying this jump motion.
+    var jumpOrigin: TextPosition? = nil
 
     static let ignored = VimResult(handled: false)
     static let passThrough = VimResult(handled: false, passThroughToInsert: true)
@@ -609,6 +611,7 @@ final class VimEngine {
         // :<number> -> jump to 1-based line
         if let lineNum = Int(cmd), lineNum >= 1 {
             let maxRow = max(0, context.lines.count - 1)
+            let origin = clampPos(context.cursor, in: context.lines, allowPastEnd: false)
             let targetRow = max(0, min(lineNum - 1, maxRow))
             let col = firstNonBlank(in: context.lines, row: targetRow)
             goalColumn = nil
@@ -616,7 +619,8 @@ final class VimEngine {
                 handled: true,
                 cursor: TextPosition(row: targetRow, column: col),
                 clearVisual: true,
-                actions: [.jumpToLine(lineNum)]
+                actions: [.jumpToLine(lineNum)],
+                jumpOrigin: targetRow != origin.row ? origin : nil
             )
         }
 
@@ -1026,7 +1030,7 @@ final class VimEngine {
             return replayLastChange(overrideCount: overrideCount, cursor: cursor, context: context)
 
         // Search
-        case "/":
+        case "/", "?":
             clearPending()
             return VimResult(handled: true, actions: [.openFind])
         case "*":
@@ -1063,7 +1067,11 @@ final class VimEngine {
             let row = explicit.map { max(0, min($0 - 1, maxRow)) } ?? maxRow
             let col = firstNonBlank(in: context.lines, row: row)
             goalColumn = nil
-            return VimResult(handled: true, cursor: TextPosition(row: row, column: col))
+            return VimResult(
+                handled: true,
+                cursor: TextPosition(row: row, column: col),
+                jumpOrigin: row != cursor.row ? cursor : nil
+            )
 
         default:
             clearPending()
@@ -1092,7 +1100,11 @@ final class VimEngine {
                 return applyLineRangeOperator(op, firstRow: first, lastRow: last, cursor: cursor, context: context)
             }
             goalColumn = nil
-            return VimResult(handled: true, cursor: TextPosition(row: targetRow, column: firstNonBlank(in: context.lines, row: targetRow)))
+            return VimResult(
+                handled: true,
+                cursor: TextPosition(row: targetRow, column: firstNonBlank(in: context.lines, row: targetRow)),
+                jumpOrigin: targetRow != cursor.row ? cursor : nil
+            )
         case "c":
             // `gc` commentary operator (waiting for `c` -> `gcc`, or motion/text object)
             if op == nil {
@@ -1458,6 +1470,18 @@ final class VimEngine {
         }
     }
 
+    private func isJumpMotion(_ motion: ReplayMotion, from origin: TextPosition, to target: TextPosition) -> Bool {
+        guard target.row != origin.row else { return false }
+        switch motion {
+        case .docStart, .docEnd, .matchBracket, .enclosing, .method:
+            return true
+        case .left, .right, .up, .down,
+             .wordForward, .WORDForward, .wordBack, .WORDBack, .wordEnd, .WORDEnd,
+             .lineStart, .firstNonBlank, .lineEnd, .findChar:
+            return false
+        }
+    }
+
     private func runMotionOrOperator(_ motion: ReplayMotion, op: Operator?, count: Int, cursor: TextPosition, context: VimContext) -> VimResult {
         if let op {
             return applyOperator(op, motion: motion, count: count, cursor: cursor, context: context)
@@ -1465,7 +1489,8 @@ final class VimEngine {
         guard let outcome = evaluateMotion(motion, count: count, from: cursor, in: context.lines, forOperator: false) else {
             return VimResult(handled: true)
         }
-        return VimResult(handled: true, cursor: outcome.target)
+        let jumpOrigin = isJumpMotion(motion, from: cursor, to: outcome.target) ? cursor : nil
+        return VimResult(handled: true, cursor: outcome.target, jumpOrigin: jumpOrigin)
     }
 
     private func evaluateMotion(_ motion: ReplayMotion, count: Int, from cursor: TextPosition, in lines: [String], forOperator: Bool, isChange: Bool = false) -> MotionOutcome? {
@@ -3019,7 +3044,12 @@ final class VimEngine {
         let col = firstNonBlank(in: context.lines, row: row)
         goalColumn = nil
         let action: VimAction = fullPage ? .scrollFullPage(down: down) : .scrollHalfPage(down: down)
-        return VimResult(handled: true, cursor: TextPosition(row: row, column: col), actions: [action])
+        return VimResult(
+            handled: true,
+            cursor: TextPosition(row: row, column: col),
+            actions: [action],
+            jumpOrigin: row != cursor.row ? cursor : nil
+        )
     }
 
     private func scrollAndMoveVisual(down: Bool, fullPage: Bool, anchor: TextPosition, cursor: TextPosition, linewise: Bool, context: VimContext) -> VimResult {
