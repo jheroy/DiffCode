@@ -99,6 +99,9 @@ final class Project: Identifiable {
     /// Whether AI commit message generation (`agy`) is currently running for this project.
     var isGeneratingCommitMessage = false
     @ObservationIgnored var commitMessageGenerationTask: Task<Void, Never>?
+    /// Monotonic token isolating each AI commit generation attempt so a late `defer` from a cancelled
+    /// request can never clear a newer request's spinner, task handle, or generated text.
+    @ObservationIgnored var commitMessageGenerationID = 0
     /// The last commit made here in this session, while it can still be undone.
     var lastCommit: WorkingTree.CommitResult?
     /// The next commit replaces the last one (Amend), starting from its message.
@@ -248,6 +251,31 @@ final class Project: Identifiable {
         }
         if overrides != commitOverrides { commitOverrides = overrides }
         if excluded != excludedLines { excludedLines = excluded }
+    }
+
+    /// Starts a new AI commit message generation attempt, returning its unique token.
+    func beginCommitMessageGeneration() -> Int {
+        commitMessageGenerationTask?.cancel()
+        commitMessageGenerationID += 1
+        isGeneratingCommitMessage = true
+        return commitMessageGenerationID
+    }
+
+    /// Clears generation state only when `token` is still the active generation attempt.
+    @discardableResult
+    func finishCommitMessageGeneration(token: Int) -> Bool {
+        guard commitMessageGenerationID == token else { return false }
+        isGeneratingCommitMessage = false
+        commitMessageGenerationTask = nil
+        return true
+    }
+
+    /// Cancels any active AI commit message generation and invalidates its token immediately.
+    func cancelCommitMessageGeneration() {
+        commitMessageGenerationID += 1
+        commitMessageGenerationTask?.cancel()
+        commitMessageGenerationTask = nil
+        isGeneratingCommitMessage = false
     }
 
     /// "main", "origin/main", "v1.0" for the Log's branch filter.

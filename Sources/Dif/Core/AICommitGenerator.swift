@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 /// Errors thrown while collecting checked diffs or generating a commit message with `agy`.
@@ -42,8 +43,16 @@ enum AICommitGenerator {
     static let defaultMaxTotalBytes = 48 * 1024
     /// Soft per-file diff budget when many files are checked.
     static let defaultMaxFileBytes = 12 * 1024
+    /// Maximum number of checked files listed individually in the Checked Files summary.
+    static let defaultMaxSummaryFiles = 200
+    /// Maximum UTF-8 byte length of the Checked Files summary.
+    static let defaultMaxSummaryBytes = 8 * 1024
+    /// Hard upper bound for the full `--print=<prompt>` payload (well below macOS `ARG_MAX` of 1 MB).
+    static let defaultMaxPromptBytes = 96 * 1024
     /// Default timeout passed to `agy --print-timeout`.
     static let defaultTimeoutSeconds = 60
+    /// Delay after `SIGTERM` before escalating to `SIGKILL` for an unresponsive child process.
+    static let defaultKillGracePeriod: TimeInterval = 2.0
 
     struct CheckedDiffPayload: Sendable, Equatable {
         /// Compact overview of every checked file (including files whose diff body was truncated).
@@ -99,7 +108,9 @@ enum AICommitGenerator {
         in root: URL,
         isInitial: Bool = false,
         maxTotalBytes: Int = defaultMaxTotalBytes,
-        maxFileBytes: Int = defaultMaxFileBytes
+        maxFileBytes: Int = defaultMaxFileBytes,
+        maxSummaryFiles: Int = defaultMaxSummaryFiles,
+        maxSummaryBytes: Int = defaultMaxSummaryBytes
     ) async throws -> CheckedDiffPayload {
         guard !changes.isEmpty else {
             throw AICommitError.noCheckedChanges
@@ -107,10 +118,22 @@ enum AICommitGenerator {
 
         let totalBudget = max(1024, maxTotalBytes)
         let perFileBudget = min(totalBudget, max(maxFileBytes, totalBudget / max(1, changes.count)))
+        let summaryFileCap = max(1, maxSummaryFiles)
+        let summaryByteCap = max(256, maxSummaryBytes)
 
         var summaryLines: [String] = []
-        summaryLines.reserveCapacity(changes.count)
-        for change in changes {
+        summaryLines.reserveCapacity(min(changes.count, summaryFileCap) + 1)
+        var summaryBytes = 0
+        var summaryTruncated = false
+        let summaryOverflowReserve = 48
+
+        for (index, change) in changes.enumerated() {
+            if summaryLines.count >= summaryFileCap {
+                summaryTruncated = true
+                let remaining = changes.count - index
+                summaryLines.append("... and \(remaining) more file(s)")
+                break
+            }
             let isPartial = excludedLines[change.path]?.isEmpty == false
             var line: String
             if change.kind == .renamed, let old = change.oldPath {
@@ -128,12 +151,20 @@ enum AICommitGenerator {
             if !meta.isEmpty {
                 line += " (\(meta.joined(separator: ", ")))"
             }
+            let lineCost = line.utf8.count + (summaryLines.isEmpty ? 0 : 1)
+            if !summaryLines.isEmpty && summaryBytes + lineCost + summaryOverflowReserve > summaryByteCap {
+                summaryTruncated = true
+                let remaining = changes.count - index
+                summaryLines.append("... and \(remaining) more file(s)")
+                break
+            }
             summaryLines.append(line)
+            summaryBytes += lineCost
         }
 
         var diffSections: [String] = []
         var usedBytes = 0
-        var truncated = false
+        var truncated = summaryTruncated
         var nonEmptyFiles = 0
 
         for (index, change) in changes.enumerated() {
@@ -142,7 +173,13 @@ enum AICommitGenerator {
             let excluded = excludedLines[change.path] ?? []
             let rawSection: String?
             if !excluded.isEmpty {
-                rawSection = try await partialFileDiff(for: change, excluded: excluded, in: root)
+                rawSection = try await partialFileDiff(
+                    for: change,
+                    excluded: excluded,
+                    in: root,
+                    isInitial: isInitial,
+                    maxBytes: perFileBudget
+                )
             } else {
                 rawSection = try await wholeFileDiff(
                     for: change,
@@ -271,14 +308,16 @@ enum AICommitGenerator {
     private static func partialFileDiff(
         for change: FileChange,
         excluded: Set<ChangeLine>,
-        in root: URL
+        in root: URL,
+        isInitial: Bool,
+        maxBytes: Int
     ) async throws -> String? {
         let sides: WorkingTree.Sides
         do {
             sides = try await WorkingTree.partialSides(of: change, in: root)
         } catch {
             // If the file is binary/UTF-16 or cannot be partially sliced, fall back to its full diff.
-            return try await wholeFileDiff(for: change, in: root, isInitial: false, maxBytes: defaultMaxFileBytes)
+            return try await wholeFileDiff(for: change, in: root, isInitial: isInitial, maxBytes: maxBytes)
         }
         let relocated = WorkingTree.relocate(excluded, old: sides.oldText, new: sides.newText, hunks: sides.hunks)
         guard let partialData = WorkingTree.partialContent(
@@ -287,7 +326,7 @@ enum AICommitGenerator {
             hunks: sides.hunks,
             excluded: relocated.lines
         ) else {
-            return try await wholeFileDiff(for: change, in: root, isInitial: false, maxBytes: defaultMaxFileBytes)
+            return try await wholeFileDiff(for: change, in: root, isInitial: isInitial, maxBytes: maxBytes)
         }
         if partialData == sides.old {
             return nil
@@ -359,7 +398,17 @@ enum AICommitGenerator {
     private static func truncateUTF8(_ text: String, maxBytes: Int) -> (text: String, wasTruncated: Bool) {
         let utf8 = text.utf8
         guard utf8.count > maxBytes else { return (text, false) }
-        var end = utf8.index(utf8.startIndex, offsetBy: max(0, maxBytes))
+        let limit = max(0, maxBytes)
+        let worstSuffix = "\n... [truncated: omitted \(utf8.count) bytes]"
+        if limit <= worstSuffix.utf8.count {
+            var end = utf8.index(utf8.startIndex, offsetBy: limit)
+            while end > utf8.startIndex, end.samePosition(in: text) == nil {
+                end = utf8.index(before: end)
+            }
+            return (String(text[..<end]), true)
+        }
+        let contentLimit = limit - worstSuffix.utf8.count
+        var end = utf8.index(utf8.startIndex, offsetBy: contentLimit)
         while end > utf8.startIndex, end.samePosition(in: text) == nil {
             end = utf8.index(before: end)
         }
@@ -374,28 +423,51 @@ enum AICommitGenerator {
     // MARK: - Prompt & Response Cleaning
 
     /// Builds the prompt sent to `agy`, combining strict rules, the user's format template, file summary, and diff.
-    static func buildPrompt(diff: String, format: String, summary: String) -> String {
-        let trimmedFormat = format.trimmingCharacters(in: .whitespacesAndNewlines)
-        let effectiveFormat = trimmedFormat.isEmpty ? Settings.defaultCommitMessageFormat : trimmedFormat
-
-        var sections: [String] = [
-            """
+    /// Enforces a hard `maxPromptBytes` ceiling so CLI arguments stay safely below macOS `ARG_MAX`.
+    static func buildPrompt(
+        diff: String,
+        format: String,
+        summary: String,
+        maxPromptBytes: Int = defaultMaxPromptBytes
+    ) -> String {
+        let promptCap = max(2048, maxPromptBytes)
+        let rules = """
             You are generating a Git commit message based ONLY on the checked changes provided below.
             Rules:
             - Do NOT run any tools, shell commands, or read any files.
             - Strictly follow the commit message format below.
             - Output ONLY the final commit message text (no markdown code fences, no surrounding quotes, no preamble, no explanation).
             - Summarize ONLY the changes present in the diff below.
-            """,
-            effectiveFormat,
-        ]
+            """
+
+        let trimmedFormat = format.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawFormat = trimmedFormat.isEmpty ? Settings.defaultCommitMessageFormat : trimmedFormat
+        let formatCap = max(512, promptCap / 4)
+        let boundedFormat = truncateUTF8(rawFormat, maxBytes: formatCap).text
 
         let trimmedSummary = summary.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedSummary.isEmpty {
-            sections.append("## Checked Files\n\(trimmedSummary)")
+        let summarySection: String?
+        if trimmedSummary.isEmpty {
+            summarySection = nil
+        } else {
+            let summaryCap = min(defaultMaxSummaryBytes, max(512, promptCap / 4))
+            let boundedSummary = truncateUTF8(trimmedSummary, maxBytes: summaryCap).text
+            summarySection = "## Checked Files\n\(boundedSummary)"
         }
-        sections.append("## Git Diff (Checked Changes Only)\n\(diff)")
-        return sections.joined(separator: "\n\n")
+
+        let diffHeader = "## Git Diff (Checked Changes Only)\n"
+        var prefixSections: [String] = [rules, boundedFormat]
+        if let summarySection {
+            prefixSections.append(summarySection)
+        }
+        let prefix = prefixSections.joined(separator: "\n\n") + "\n\n" + diffHeader
+        let remainingForDiff = max(256, promptCap - prefix.utf8.count)
+        let boundedDiff = truncateUTF8(diff, maxBytes: remainingForDiff).text
+        let full = prefix + boundedDiff
+        if full.utf8.count <= promptCap {
+            return full
+        }
+        return truncateUTF8(full, maxBytes: promptCap).text
     }
 
     /// Cleans LLM stdout: strips wrapping code fences, accidental label prefixes, surrounding quotes, and blank edges.
@@ -523,6 +595,12 @@ enum AICommitGenerator {
         private var process: Process?
         private var isCancelled = false
         private var isTimedOut = false
+        private var killScheduled = false
+        private let killGracePeriod: TimeInterval
+
+        init(killGracePeriod: TimeInterval = AICommitGenerator.defaultKillGracePeriod) {
+            self.killGracePeriod = killGracePeriod
+        }
 
         var cancelled: Bool { lock.lock(); defer { lock.unlock() }; return isCancelled }
         var timedOut: Bool { lock.lock(); defer { lock.unlock() }; return isTimedOut }
@@ -531,19 +609,29 @@ enum AICommitGenerator {
             lock.lock()
             process = p
             let shouldStop = isCancelled || isTimedOut
+            let shouldScheduleKill = shouldStop && !killScheduled
+            if shouldScheduleKill { killScheduled = true }
             lock.unlock()
-            if shouldStop, p.isRunning {
-                p.terminate()
+            if shouldStop {
+                terminate(p, scheduleKill: shouldScheduleKill)
             }
+        }
+
+        func detach() {
+            lock.lock()
+            process = nil
+            lock.unlock()
         }
 
         func cancel() {
             lock.lock()
             isCancelled = true
             let p = process
+            let shouldScheduleKill = p != nil && !killScheduled
+            if shouldScheduleKill { killScheduled = true }
             lock.unlock()
-            if let p, p.isRunning {
-                p.terminate()
+            if let p {
+                terminate(p, scheduleKill: shouldScheduleKill)
             }
         }
 
@@ -551,9 +639,26 @@ enum AICommitGenerator {
             lock.lock()
             isTimedOut = true
             let p = process
+            let shouldScheduleKill = p != nil && !killScheduled
+            if shouldScheduleKill { killScheduled = true }
             lock.unlock()
-            if let p, p.isRunning {
-                p.terminate()
+            if let p {
+                terminate(p, scheduleKill: shouldScheduleKill)
+            }
+        }
+
+        private func terminate(_ p: Process, scheduleKill: Bool) {
+            guard p.isRunning else { return }
+            let pid = p.processIdentifier
+            p.terminate()
+            guard scheduleKill, pid > 0 else { return }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + killGracePeriod) { [self] in
+                self.lock.lock()
+                let stillAttached = self.process === p
+                self.lock.unlock()
+                if stillAttached, p.isRunning {
+                    kill(pid, SIGKILL)
+                }
             }
         }
     }
@@ -564,10 +669,11 @@ enum AICommitGenerator {
         arguments: [String],
         environment: [String: String],
         workingDirectory: URL,
-        timeoutSeconds: Int
+        timeoutSeconds: Int,
+        killGracePeriod: TimeInterval = defaultKillGracePeriod
     ) async throws -> String {
         try Task.checkCancellation()
-        let box = ProcessBox()
+        let box = ProcessBox(killGracePeriod: killGracePeriod)
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
                 DispatchQueue.global(qos: .userInitiated).async {
@@ -612,6 +718,7 @@ enum AICommitGenerator {
                     let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
                     group.wait()
                     p.waitUntilExit()
+                    box.detach()
                     watchdog.cancel()
 
                     if box.cancelled {
