@@ -122,6 +122,7 @@ extension ViewerModel {
         lspDebounceTimer?.invalidate()
         lspDebounceTimer = nil
         lspTask?.cancel()
+        lspTask = nil
         lspGeneration &+= 1
         if let active = lspDocument {
             lspDocument = nil
@@ -133,9 +134,6 @@ extension ViewerModel {
                 await manager.didClose(fileURL: oldURL)
             }
             lspLifecycleTask = closeTask
-            lspTask = closeTask
-        } else {
-            lspTask = nil
         }
     }
 
@@ -180,11 +178,14 @@ extension ViewerModel {
         let repoRoot = active.repoRoot
         let manager = lspManager
         lspTask?.cancel()
+        lspTask = nil
         let previousLifecycle = lspLifecycleTask
-        let flushTask = Task { @MainActor in
+        let flushTask = Task { @MainActor [weak self, weak doc] in
             await previousLifecycle?.value
+            guard let self, let doc, self.lspDocument?.fileURL == fileURL, self.document === doc else { return }
             let uri = LSPURI.uri(from: fileURL)
             if await manager.openSession(forURI: uri) == nil {
+                guard self.lspDocument?.fileURL == fileURL, self.document === doc else { return }
                 await manager.didOpen(
                     fileURL: fileURL,
                     text: text,
@@ -193,6 +194,7 @@ extension ViewerModel {
                     repoRoot: repoRoot
                 )
             } else {
+                guard self.lspDocument?.fileURL == fileURL, self.document === doc else { return }
                 await manager.didChange(
                     fileURL: fileURL,
                     version: version,
@@ -203,7 +205,6 @@ extension ViewerModel {
             }
         }
         lspLifecycleTask = flushTask
-        lspTask = flushTask
         await flushTask.value
     }
 
@@ -216,20 +217,22 @@ extension ViewerModel {
             syncLSPForCurrentDocument()
         }
         await flushLSPChangeIfNeeded()
-        guard var active = lspDocument, let doc = document, case .text = doc.content else { return nil }
-        let uri = LSPURI.uri(from: active.fileURL)
+        guard let active = lspDocument, let doc = document, case .text = doc.content else { return nil }
+        let fileURL = active.fileURL
+        let uri = LSPURI.uri(from: fileURL)
         if await lspManager.openSession(forURI: uri) == nil {
-            active.version += 1
-            lspDocument = active
+            guard var current = lspDocument, current.fileURL == fileURL, document === doc else { return nil }
+            current.version += 1
+            lspDocument = current
             let text = doc.right.lines.joined(separator: "\n")
-            let fileURL = active.fileURL
-            let version = active.version
-            let language = active.language
-            let repoRoot = active.repoRoot
+            let version = current.version
+            let language = current.language
+            let repoRoot = current.repoRoot
             let manager = lspManager
             let previousLifecycle = lspLifecycleTask
-            let reopenTask = Task { @MainActor in
+            let reopenTask = Task { @MainActor [weak self, weak doc] in
                 await previousLifecycle?.value
+                guard let self, let doc, self.lspDocument?.fileURL == fileURL, self.document === doc else { return }
                 await manager.didOpen(
                     fileURL: fileURL,
                     text: text,
@@ -241,6 +244,7 @@ extension ViewerModel {
             lspLifecycleTask = reopenTask
             await reopenTask.value
         }
+        guard lspDocument?.fileURL == fileURL, document === doc else { return nil }
         return lspDocument
     }
 
@@ -271,7 +275,9 @@ extension ViewerModel {
             await previousLifecycle?.value
             guard let self, let doc, self.lspDocument?.fileURL == fileURL, self.document === doc else { return }
             let uri = LSPURI.uri(from: fileURL)
-            if await manager.openSession(forURI: uri) == nil {
+            let session = await manager.openSession(forURI: uri)
+            guard self.lspDocument?.fileURL == fileURL, self.document === doc else { return }
+            if session == nil {
                 await manager.didOpen(
                     fileURL: fileURL,
                     text: text,
@@ -288,6 +294,7 @@ extension ViewerModel {
                     repoRoot: repoRoot
                 )
             }
+            guard self.lspDocument?.fileURL == fileURL, self.document === doc else { return }
             await manager.didSave(fileURL: fileURL, text: text, language: language, repoRoot: repoRoot)
         }
         lspLifecycleTask = lifecycleTask
@@ -323,7 +330,9 @@ extension ViewerModel {
             await previousLifecycle?.value
             guard let self, let doc, self.lspDocument?.fileURL == fileURL, self.document === doc else { return }
             let uri = LSPURI.uri(from: fileURL)
-            if await manager.openSession(forURI: uri) == nil {
+            let session = await manager.openSession(forURI: uri)
+            guard self.lspDocument?.fileURL == fileURL, self.document === doc else { return }
+            if session == nil {
                 await manager.didOpen(
                     fileURL: fileURL,
                     text: text,
