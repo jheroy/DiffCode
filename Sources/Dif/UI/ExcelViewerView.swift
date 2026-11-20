@@ -660,9 +660,8 @@ struct ExcelViewerView: View {
 
     private func consumePendingSheet(on session: ExcelViewerState) {
         guard let target = viewer.pendingExcelSheet else { return }
-        if session.selectSheet(named: target) {
-            viewer.pendingExcelSheet = nil
-        }
+        _ = session.selectSheet(named: target)
+        viewer.pendingExcelSheet = nil
     }
 }
 
@@ -1763,17 +1762,13 @@ final class ExcelGridHostView: NSView, NSTableViewDataSource, NSTableViewDelegat
         let mods = event.modifierFlags.intersection([.command, .shift, .option, .control])
         let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
 
-        if mods == .command && chars == "n" {
-            if isInSearchField || !state.searchQuery.isEmpty {
-                state.navigateSearch(1)
-                return nil
-            }
+        if mods == .command && chars == "n", !state.searchQuery.isEmpty {
+            state.navigateSearch(1)
+            return nil
         }
-        if mods == .command && chars == "p" {
-            if isInSearchField || !state.searchQuery.isEmpty {
-                state.navigateSearch(-1)
-                return nil
-            }
+        if mods == .command && chars == "p", !state.searchQuery.isEmpty {
+            state.navigateSearch(-1)
+            return nil
         }
         if mods == .command && chars == "g" {
             state.navigateSearch(1)

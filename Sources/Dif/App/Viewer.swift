@@ -147,6 +147,9 @@ final class ViewerModel: CodeCanvasDelegate {
     }
 
     func excelSessionKey(for fileURL: URL? = nil) -> String {
+        if let request, case .commit(let hash, _) = request.source {
+            return "commit:\(hash):\(request.root.standardizedFileURL.path)/\(request.path)"
+        }
         if let url = fileURL ?? request?.fileURL {
             return url.standardizedFileURL.path
         }
@@ -160,7 +163,7 @@ final class ViewerModel: CodeCanvasDelegate {
 
     func excelSession(for key: String, workbook: XLSXWorkbook, fileURL: URL?) -> ExcelViewerState {
         if let existing = excelSessions[key] {
-            if let fileURL, existing.fileURL != fileURL {
+            if existing.fileURL != fileURL {
                 existing.fileURL = fileURL
             }
             return existing
@@ -173,7 +176,8 @@ final class ViewerModel: CodeCanvasDelegate {
     func selectExcelSheet(_ name: String) {
         pendingExcelSheet = name
         excelSheetSelectToken += 1
-        if !isLoading, let session = activeExcelSession, session.selectSheet(named: name) {
+        if !isLoading, let session = activeExcelSession {
+            _ = session.selectSheet(named: name)
             pendingExcelSheet = nil
         }
     }
@@ -441,10 +445,9 @@ final class ViewerModel: CodeCanvasDelegate {
         let isSpreadsheetReload: Bool
         if preserveScroll,
            case .spreadsheet(_, let oldURL) = previousDoc?.content,
-           case .spreadsheet(_, let newURL) = doc.content {
-            let oldKey = oldURL?.standardizedFileURL.path ?? ""
-            let newKey = newURL?.standardizedFileURL.path ?? ""
-            isSpreadsheetReload = (!oldKey.isEmpty && oldKey == newKey) || (oldKey.isEmpty && newKey.isEmpty)
+           case .spreadsheet(_, let newURL) = doc.content,
+           let oldURL, let newURL {
+            isSpreadsheetReload = oldURL.standardizedFileURL == newURL.standardizedFileURL
         } else {
             isSpreadsheetReload = false
         }
@@ -468,18 +471,18 @@ final class ViewerModel: CodeCanvasDelegate {
         if annotating { loadAnnotations() }
         if case .spreadsheet(let workbook, let fileURL) = doc.content {
             if findVisible { findVisible = false }
-            let effectiveURL = fileURL ?? request?.fileURL
-            let key = excelSessionKey(for: effectiveURL)
+            let key = excelSessionKey(for: fileURL)
             if let existing = excelSessions[key] {
-                existing.applyWorkbook(workbook, fileURL: effectiveURL, isReload: true)
+                existing.applyWorkbook(workbook, fileURL: fileURL, isReload: true)
             } else {
-                excelSessions[key] = ExcelViewerState(workbook: workbook, fileURL: effectiveURL)
+                excelSessions[key] = ExcelViewerState(workbook: workbook, fileURL: fileURL)
             }
-            if let pending = pendingExcelSheet, let session = excelSessions[key], session.selectSheet(named: pending) {
+            if let pending = pendingExcelSheet {
+                _ = excelSessions[key]?.selectSheet(named: pending)
                 pendingExcelSheet = nil
             }
             if isSpreadsheetReload {
-                let name = effectiveURL?.lastPathComponent ?? ((request?.path as NSString?)?.lastPathComponent ?? "")
+                let name = fileURL?.lastPathComponent ?? ((request?.path as NSString?)?.lastPathComponent ?? "")
                 if !name.isEmpty {
                     onToast?(L("File reloaded: \(name)", "文件已重新加载: \(name)"))
                 }

@@ -66,11 +66,10 @@ struct ViewerPanel: View {
             case .image(let old, let new):
                 ImageDiffView(old: old, new: new, leftTitle: doc.leftTitle, rightTitle: doc.rightTitle).background(Color.difWindow)
             case .spreadsheet(let workbook, let fileURL):
-                let effectiveURL = fileURL ?? viewer.request?.fileURL
                 ExcelViewerView(
                     workbook: workbook,
-                    fileURL: effectiveURL,
-                    sessionKey: viewer.excelSessionKey(for: effectiveURL),
+                    fileURL: fileURL,
+                    sessionKey: viewer.excelSessionKey(for: fileURL),
                     viewer: viewer
                 )
                 .background(Color.difWindow)

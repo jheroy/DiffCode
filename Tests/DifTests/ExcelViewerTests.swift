@@ -424,4 +424,56 @@ final class ExcelViewerTests: XCTestCase {
         let state2 = ExcelViewerState(workbook: makeSampleWorkbook(), defaults: defaults)
         XCTAssertTrue(state2.hideBottomTabs)
     }
+
+    // MARK: - 8. Historical Commit Session Isolation & Stale Pending Sheet Clearing
+
+    func testCommitSessionKeyDoesNotCollideWithLiveFile() {
+        let root = URL(fileURLWithPath: "/tmp/repo")
+        let liveReq = DiffRequest(root: root, path: "data/Config.xlsx", source: .file)
+        let commitReq = DiffRequest(root: root, path: "data/Config.xlsx", source: .commit(hash: "abc1234", parent: nil))
+
+        let viewer = ViewerModel()
+        viewer.settings = Settings.shared
+
+        viewer.request = liveReq
+        let liveKey = viewer.excelSessionKey(for: liveReq.fileURL)
+
+        viewer.request = commitReq
+        let commitKey = viewer.excelSessionKey(for: nil)
+
+        XCTAssertNotEqual(liveKey, commitKey)
+        XCTAssertTrue(commitKey.hasPrefix("commit:abc1234:"))
+    }
+
+    func testUnmatchedPendingExcelSheetIsClearedOnLoad() async throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("dif-excel-stale-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let fileA = dir.appendingPathComponent("First.xlsx")
+        try makeMinimalXLSXFile(at: fileA, sheets: [
+            (name: "OnlySheet", headers: ["A"], rows: [["1"]]),
+        ])
+        let fileB = dir.appendingPathComponent("Second.xlsx")
+        try makeMinimalXLSXFile(at: fileB, sheets: [
+            (name: "Default", headers: ["A"], rows: [["1"]]),
+            (name: "GhostSheet", headers: ["A"], rows: [["2"]]),
+        ])
+
+        let viewer = ViewerModel()
+        viewer.settings = Settings.shared
+
+        // Request a sheet that does NOT exist in First.xlsx
+        viewer.selectExcelSheet("GhostSheet")
+        viewer.open(DiffRequest(root: dir, path: "First.xlsx", source: .file))
+        await viewer.loadTask?.value
+
+        XCTAssertEqual(viewer.activeExcelSession?.activeSheetName, "OnlySheet")
+        XCTAssertNil(viewer.pendingExcelSheet, "Unmatched pendingExcelSheet must be cleared after load")
+
+        // Opening Second.xlsx later must NOT jump to GhostSheet from the stale request
+        viewer.open(DiffRequest(root: dir, path: "Second.xlsx", source: .file))
+        await viewer.loadTask?.value
+        XCTAssertEqual(viewer.activeExcelSession?.activeSheetName, "Default")
+    }
 }
