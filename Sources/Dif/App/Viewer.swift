@@ -126,11 +126,56 @@ final class ViewerModel: CodeCanvasDelegate {
     /// ⌘+Click on a symbol in an LSP-enabled pane (`line` is 0-based, `character` is 0-based UTF-16).
     @ObservationIgnored var onGoToDefinition: ((Int, Int) -> Void)?
 
+    // Spreadsheet viewer (see ExcelViewerView.swift).
+    /// Target sheet name requested before (or while) an `.xlsx` workbook finishes loading.
+    var pendingExcelSheet: String?
+    /// Bumped on every `selectExcelSheet(_:)` call so `ExcelViewerView` reacts even for repeated requests.
+    var excelSheetSelectToken: Int = 0
+    /// Per-file spreadsheet UI sessions (sheet selection, search, pinned rows, visible columns) preserved across reloads.
+    @ObservationIgnored var excelSessions: [String: ExcelViewerState] = [:]
+
     var canvasMode: CodeCanvasView.Mode { settings.unified ? .unified : .sideBySide }
 
     var isTextDocument: Bool {
         if let doc = document, case .text = doc.content { return true }
         return false
+    }
+
+    var isSpreadsheet: Bool {
+        if let doc = document, case .spreadsheet = doc.content { return true }
+        return false
+    }
+
+    func excelSessionKey(for fileURL: URL? = nil) -> String {
+        if let url = fileURL ?? request?.fileURL {
+            return url.standardizedFileURL.path
+        }
+        return request?.path ?? ""
+    }
+
+    var activeExcelSession: ExcelViewerState? {
+        guard let doc = document, case .spreadsheet(_, let fileURL) = doc.content else { return nil }
+        return excelSessions[excelSessionKey(for: fileURL)]
+    }
+
+    func excelSession(for key: String, workbook: XLSXWorkbook, fileURL: URL?) -> ExcelViewerState {
+        if let existing = excelSessions[key] {
+            if let fileURL, existing.fileURL != fileURL {
+                existing.fileURL = fileURL
+            }
+            return existing
+        }
+        let session = ExcelViewerState(workbook: workbook, fileURL: fileURL)
+        excelSessions[key] = session
+        return session
+    }
+
+    func selectExcelSheet(_ name: String) {
+        pendingExcelSheet = name
+        excelSheetSelectToken += 1
+        if !isLoading, let session = activeExcelSession, session.selectSheet(named: name) {
+            pendingExcelSheet = nil
+        }
     }
 
     /// True when single changes of the document can be put back: a local change with both sides present.
@@ -351,6 +396,7 @@ final class ViewerModel: CodeCanvasDelegate {
         container?.canvas.isLSPEnabled = false
         container?.canvas.conflicts = []
         conflictCount = 0
+        pendingExcelSheet = nil
         onDocumentChanged?()
     }
 
@@ -391,6 +437,18 @@ final class ViewerModel: CodeCanvasDelegate {
             }
             if sameFile, preserveScroll { caret = container?.canvas.editSelection }
         }
+        let previousDoc = document
+        let isSpreadsheetReload: Bool
+        if preserveScroll,
+           case .spreadsheet(_, let oldURL) = previousDoc?.content,
+           case .spreadsheet(_, let newURL) = doc.content {
+            let oldKey = oldURL?.standardizedFileURL.path ?? ""
+            let newKey = newURL?.standardizedFileURL.path ?? ""
+            isSpreadsheetReload = (!oldKey.isEmpty && oldKey == newKey) || (oldKey.isEmpty && newKey.isEmpty)
+        } else {
+            isSpreadsheetReload = false
+        }
+
         let preservedLineDiffLocation = preserveScroll ? activeLineDiffLocation : nil
         endEditing()
         document = doc
@@ -408,6 +466,25 @@ final class ViewerModel: CodeCanvasDelegate {
         refreshConflicts()
         annotationHover = nil
         if annotating { loadAnnotations() }
+        if case .spreadsheet(let workbook, let fileURL) = doc.content {
+            if findVisible { findVisible = false }
+            let effectiveURL = fileURL ?? request?.fileURL
+            let key = excelSessionKey(for: effectiveURL)
+            if let existing = excelSessions[key] {
+                existing.applyWorkbook(workbook, fileURL: effectiveURL, isReload: true)
+            } else {
+                excelSessions[key] = ExcelViewerState(workbook: workbook, fileURL: effectiveURL)
+            }
+            if let pending = pendingExcelSheet, let session = excelSessions[key], session.selectSheet(named: pending) {
+                pendingExcelSheet = nil
+            }
+            if isSpreadsheetReload {
+                let name = effectiveURL?.lastPathComponent ?? ((request?.path as NSString?)?.lastPathComponent ?? "")
+                if !name.isEmpty {
+                    onToast?(L("File reloaded: \(name)", "文件已重新加载: \(name)"))
+                }
+            }
+        }
         if preserveScroll {
             if let previousFocus, previousFocus < doc.hunks.count {
                 focusedHunk = previousFocus
@@ -618,6 +695,10 @@ final class ViewerModel: CodeCanvasDelegate {
     // MARK: Find in file
 
     func showFind() {
+        if isSpreadsheet {
+            activeExcelSession?.requestSearchFocus()
+            return
+        }
         guard isTextDocument else { return }
         findOrigin = currentCaretPosition()
         if let selected = container?.canvas.selectedText(), !selected.isEmpty, !selected.contains("\n") {
@@ -704,6 +785,10 @@ final class ViewerModel: CodeCanvasDelegate {
     }
 
     func stepFind(_ delta: Int, center: Bool = false) {
+        if isSpreadsheet {
+            activeExcelSession?.navigateSearch(delta)
+            return
+        }
         guard let canvas = container?.canvas, !canvas.matches.isEmpty else { return }
         let origin = currentCaretPosition()
         let count = canvas.matches.count
