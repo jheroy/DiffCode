@@ -1370,16 +1370,23 @@ private final class ExcelCellView: NSView {
 
 // MARK: - AppKit Header Cell & Header View (Red Comment Triangle, Tooltips, Click-to-Copy)
 
-private final class ExcelHeaderCell: NSTableHeaderCell {
+/// Custom table header cell for Excel columns.
+/// IMPORTANT: Keep ONLY trivial bitwise-copy-safe value properties (`Bool` flags) on this
+/// `NSCell` subclass — NEVER add Swift reference-counted stored properties (`NSColor`, `String`,
+/// objects, etc.), because `NSCell.copy(with:)` uses `NSCopyObject` (raw `memcpy`) without
+/// retaining Swift ivars, causing a double-free `SIGSEGV` in `__ivar_destroyer` on dealloc.
+final class ExcelHeaderCell: NSTableHeaderCell {
     var hasComment: Bool = false
     var isSearchMatch: Bool = false
     var isHighlightedMatch: Bool = false
-    var headerBackgroundColor: NSColor = Palette.panel
-    var headerTextColor: NSColor = Palette.textPrimary
-    var gridColor: NSColor = Palette.hairline
-    var matchTint: NSColor = NSColor(cgColor: CanvasTheme.dark.searchMatch) ?? .systemYellow
-    var currentMatchTint: NSColor = NSColor(cgColor: CanvasTheme.dark.searchCurrent) ?? .systemOrange
-    var accentColor: NSColor = Palette.accent
+    var isDark: Bool = true
+
+    private static let darkHeaderBackground = NSColor(hex: 0x27292D)
+    private static let lightHeaderBackground = NSColor(hex: 0xF4F6F9)
+    private static let darkHeaderText = NSColor(hex: 0xDFE1E5)
+    private static let lightHeaderText = NSColor(hex: 0x1F2329)
+    private static let darkGridColor = NSColor(hex: 0x35373C)
+    private static let lightGridColor = NSColor(hex: 0xE6E8EE)
 
     private static let paragraphStyle: NSParagraphStyle = {
         let style = NSMutableParagraphStyle()
@@ -1389,6 +1396,14 @@ private final class ExcelHeaderCell: NSTableHeaderCell {
     }()
 
     override func draw(withFrame cellFrame: NSRect, in controlView: NSView) {
+        let canvasTheme: CanvasTheme = isDark ? .dark : .light
+        let headerBackgroundColor = isDark ? Self.darkHeaderBackground : Self.lightHeaderBackground
+        let headerTextColor = isDark ? Self.darkHeaderText : Self.lightHeaderText
+        let gridColor = isDark ? Self.darkGridColor : Self.lightGridColor
+        let matchTint = NSColor(cgColor: canvasTheme.searchMatch) ?? NSColor.systemYellow.withAlphaComponent(0.35)
+        let currentMatchTint = NSColor(cgColor: canvasTheme.searchCurrent) ?? NSColor.systemOrange.withAlphaComponent(0.65)
+        let accentColor = NSColor(cgColor: canvasTheme.accent) ?? .controlAccentColor
+
         headerBackgroundColor.setFill()
         cellFrame.fill()
 
@@ -2139,6 +2154,7 @@ final class ExcelGridHostView: NSView, NSTableViewDataSource, NSTableViewDelegat
             let hCol = NSTableColumn(identifier: colID)
             let hCell = ExcelHeaderCell(textCell: title)
             hCell.font = headerFont
+            hCell.isDark = isDark
             hCol.headerCell = hCell
             hCol.title = title
             hCol.minWidth = 44
@@ -2208,12 +2224,7 @@ final class ExcelGridHostView: NSView, NSTableViewDataSource, NSTableViewDelegat
         for (colIdx, col) in headerTableView.tableColumns.enumerated() {
             guard let cell = col.headerCell as? ExcelHeaderCell else { continue }
             cell.font = headerFont
-            cell.headerBackgroundColor = headerBackground
-            cell.headerTextColor = cellTextColor
-            cell.gridColor = gridLineColor
-            cell.matchTint = matchTintColor
-            cell.currentMatchTint = currentMatchTintColor
-            cell.accentColor = accentColor
+            cell.isDark = isDark
             cell.hasComment = sheet.comment(row: -1, col: colIdx) != nil
             cell.isSearchMatch = state.activeSheetMatchSet.contains(XLSXCellAddress(row: -1, col: colIdx))
             cell.isHighlightedMatch = (state.highlightedHeaderColumn == colIdx)

@@ -57,9 +57,10 @@ final class SearchFieldEditor: NSTextView {
     }
 }
 
-/// Custom cell supplying a dedicated `SearchFieldEditor` per `SearchField`.
-private final class SearchFieldCell: NSTextFieldCell {
-    let editor: SearchFieldEditor = {
+/// `NSTextField` subclass that owns the dedicated `SearchFieldEditor` so `SearchFieldCell`
+/// holds zero stored properties (protecting against `NSCell.copy(with:)` / `NSCopyObject` ARC corruption).
+private final class SearchTextField: NSTextField {
+    let customEditor: SearchFieldEditor = {
         let view = SearchFieldEditor()
         view.isFieldEditor = true
         view.isRichText = false
@@ -71,9 +72,14 @@ private final class SearchFieldCell: NSTextFieldCell {
         view.isContinuousSpellCheckingEnabled = false
         return view
     }()
+}
 
+/// Custom cell supplying the owning `SearchTextField`'s dedicated `SearchFieldEditor`.
+/// IMPORTANT: Keep ZERO stored properties on `NSCell` subclasses — AppKit's `NSCopyObject`
+/// bitwise-copies ivars without retaining Swift references.
+private final class SearchFieldCell: NSTextFieldCell {
     override func fieldEditor(for controlView: NSView) -> NSTextView? {
-        editor
+        (controlView as? SearchTextField)?.customEditor
     }
 }
 
@@ -212,14 +218,14 @@ struct SearchField: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
     static func makeConfiguredTextField(placeholder: String, font: NSFont, coordinator: Coordinator) -> NSTextField {
-        let field = NSTextField()
+        let field = SearchTextField()
         let defaultTextColor = field.textColor
         let cell = SearchFieldCell()
         cell.usesSingleLineMode = true
         cell.wraps = false
         cell.isScrollable = true
         cell.lineBreakMode = .byTruncatingTail
-        cell.editor.onMarkedTextChanged = { [weak coordinator, weak field] in
+        field.customEditor.onMarkedTextChanged = { [weak coordinator, weak field] in
             guard let coordinator, let field else { return }
             coordinator.syncFromField(field)
         }
@@ -269,8 +275,8 @@ struct SearchField: NSViewRepresentable {
 
     func updateNSView(_ field: NSTextField, context: Context) {
         context.coordinator.parent = self
-        if let cell = field.cell as? SearchFieldCell {
-            cell.editor.onMarkedTextChanged = { [weak coordinator = context.coordinator, weak field] in
+        if let searchField = field as? SearchTextField {
+            searchField.customEditor.onMarkedTextChanged = { [weak coordinator = context.coordinator, weak field] in
                 guard let coordinator, let field else { return }
                 coordinator.syncFromField(field)
             }

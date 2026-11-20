@@ -1,3 +1,5 @@
+import AppKit
+import SwiftUI
 import XCTest
 @testable import DifKit
 
@@ -475,5 +477,131 @@ final class ExcelViewerTests: XCTestCase {
         viewer.open(DiffRequest(root: dir, path: "Second.xlsx", source: .file))
         await viewer.loadTask?.value
         XCTAssertEqual(viewer.activeExcelSession?.activeSheetName, "Default")
+    }
+
+    // MARK: - 9. NSCell Copy Safety & AppKit Grid Rendering Regression Tests
+
+    func testExcelHeaderCellCopyInsideAutoreleasepoolDoesNotCrash() {
+        let cell = ExcelHeaderCell(textCell: "Price")
+        cell.font = .systemFont(ofSize: 12, weight: .semibold)
+        cell.hasComment = true
+        cell.isSearchMatch = true
+        cell.isHighlightedMatch = true
+        cell.isDark = true
+
+        // Repeatedly copy via NSCell.copy(with:) (which uses NSCopyObject bitwise memcpy)
+        // and drain autorelease pools so any unretained ARC ivars would immediately double-free.
+        for i in 0..<20 {
+            cell.isDark = (i % 2 == 0)
+            autoreleasepool {
+                let copied = cell.copy() as? ExcelHeaderCell
+                XCTAssertNotNil(copied)
+                XCTAssertEqual(copied?.stringValue, "Price")
+                XCTAssertEqual(copied?.hasComment, true)
+                XCTAssertEqual(copied?.isSearchMatch, true)
+                XCTAssertEqual(copied?.isHighlightedMatch, true)
+                XCTAssertEqual(copied?.isDark, cell.isDark)
+            }
+        }
+    }
+
+    func testSearchFieldCellCopyInsideAutoreleasepoolDoesNotCrash() throws {
+        var text = "query"
+        let binding = Binding<String>(get: { text }, set: { text = $0 })
+        let searchField = SearchField(text: binding, placeholder: "Search", focusToken: 1)
+        let coordinator = searchField.makeCoordinator()
+        let field = SearchField.makeConfiguredTextField(
+            placeholder: "Search",
+            font: .systemFont(ofSize: 13),
+            coordinator: coordinator
+        )
+
+        let originalCell = try XCTUnwrap(field.cell)
+        for _ in 0..<20 {
+            autoreleasepool {
+                let copied = originalCell.copy() as? NSCell
+                XCTAssertNotNil(copied)
+            }
+        }
+
+        // Verify the field still supplies its dedicated SearchFieldEditor after copying the cell.
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 60),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView?.addSubview(field)
+        XCTAssertTrue(window.makeFirstResponder(field))
+        XCTAssertTrue(field.currentEditor() is SearchFieldEditor)
+        window.close()
+    }
+
+    func testExcelGridHostViewLayoutDrawSwitchPinAndTeardown() throws {
+        try autoreleasepool {
+            let workbook = makeSampleWorkbook()
+            let state = ExcelViewerState(workbook: workbook, defaults: makeIsolatedDefaults())
+            // Activate search that hits both a cell and a header across sheets.
+            state.updateSearch(query: "Apple", mode: .caseInsensitive)
+
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 640, height: 360),
+                styleMask: [.titled, .resizable],
+                backing: .buffered,
+                defer: false
+            )
+            window.isReleasedWhenClosed = false
+            let host = ExcelGridHostView(frame: NSRect(x: 0, y: 0, width: 640, height: 360))
+            host.state = state
+            host.applyStyle(
+                cellFont: .monospacedSystemFont(ofSize: 12, weight: .regular),
+                headerFont: .systemFont(ofSize: 12, weight: .semibold),
+                isDark: true
+            )
+            host.reloadActiveSheet()
+
+            window.contentView?.addSubview(host)
+
+            @MainActor
+            func forceLayoutAndDraw() throws {
+                try autoreleasepool {
+                    host.layoutSubtreeIfNeeded()
+                    window.contentView?.displayIfNeeded()
+                    let rep = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+                    host.cacheDisplay(in: host.bounds, to: rep)
+                }
+            }
+
+            try forceLayoutAndDraw()
+
+            // Switch to light mode and force header + cell redraw.
+            host.applyStyle(
+                cellFont: .monospacedSystemFont(ofSize: 12, weight: .regular),
+                headerFont: .systemFont(ofSize: 12, weight: .semibold),
+                isDark: false
+            )
+            try forceLayoutAndDraw()
+
+            // Pin a row, layout, and display.
+            state.pinRows([0, 2])
+            host.reloadPinnedRows()
+            try forceLayoutAndDraw()
+
+            // Switch to sheet 2 (header-only match) and redraw headers.
+            state.selectSheet(at: 2)
+            host.reloadActiveSheet()
+            try forceLayoutAndDraw()
+
+            // Switch to sheet 1 and scroll to a cell.
+            state.selectSheet(at: 1)
+            host.reloadActiveSheet()
+            host.scrollTo(ExcelScrollTarget(sheetIndex: 1, row: 0, col: 1, center: true))
+            try forceLayoutAndDraw()
+
+            // Tear down cleanly from the window inside the autoreleasepool.
+            host.removeFromSuperview()
+            window.close()
+        }
     }
 }
