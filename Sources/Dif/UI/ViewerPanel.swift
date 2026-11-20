@@ -27,7 +27,7 @@ struct ViewerPanel: View {
             if viewer.showsConflicts, let request = viewer.request, request.root == project.url {
                 ConflictBar(project: project, path: request.path)
             }
-            if viewer.findVisible { FindBar() }
+            if viewer.findVisible && !viewer.isSpreadsheet { FindBar() }
             if let doc = viewer.document, case .text = doc.content, !doc.isPlainFile, !doc.isAddedOnly {
                 PaneTitles(left: doc.leftTitle, right: doc.rightTitle, unified: store.settings.unified)
             }
@@ -39,7 +39,7 @@ struct ViewerPanel: View {
                     AnnotationCard(hover: hover, lineHeight: (store.settings.fontSize * 1.5).rounded())
                 }
             }
-            if store.settings.showLineDiffBar, let snapshot = viewer.lineDiffSnapshot {
+            if store.settings.showLineDiffBar, !viewer.isSpreadsheet, let snapshot = viewer.lineDiffSnapshot {
                 LineDiffBarView(
                     snapshot: snapshot,
                     theme: colorScheme == .dark ? .dark : .light,
@@ -65,11 +65,13 @@ struct ViewerPanel: View {
             switch doc.content {
             case .image(let old, let new):
                 ImageDiffView(old: old, new: new, leftTitle: doc.leftTitle, rightTitle: doc.rightTitle).background(Color.difWindow)
-            case .spreadsheet(let workbook, _):
-                EmptyListState(
-                    symbol: "tablecells",
-                    title: L("Spreadsheet", "表格"),
-                    detail: "\(workbook.sheets.count) \(L("sheets", "个工作表"))"
+            case .spreadsheet(let workbook, let fileURL):
+                let effectiveURL = fileURL ?? viewer.request?.fileURL
+                ExcelViewerView(
+                    workbook: workbook,
+                    fileURL: effectiveURL,
+                    sessionKey: viewer.excelSessionKey(for: effectiveURL),
+                    viewer: viewer
                 )
                 .background(Color.difWindow)
             case .message(let title, let detail):
@@ -213,7 +215,7 @@ private struct ViewerHeader: View {
                         .foregroundStyle(Color.difText3)
                         .help(L("Time to load, diff and highlight this file", "加载、比较并高亮这个文件所用的时间"))
                 }
-                if viewer.isTextDocument {
+                if viewer.isTextDocument || viewer.isSpreadsheet {
                     IconButton(symbol: "arrow.left", help: L("Previous file (⇧⌘[)", "上一个文件 (⇧⌘[)")) { store.stepFile(-1) }
                     IconButton(symbol: "arrow.right", help: L("Next file (⇧⌘])", "下一个文件 (⇧⌘])")) { store.stepFile(1) }
                 }
@@ -259,8 +261,10 @@ private struct ViewerHeader: View {
                         }
                     }
                 }
-                IconButton(symbol: "magnifyingglass", help: L("Find in File (⌃⇧⌘F)", "在文件中查找 (⌃⇧⌘F)"), isActive: viewer.findVisible) {
-                    if viewer.findVisible { viewer.hideFind() } else { viewer.showFind() }
+                if !viewer.isSpreadsheet {
+                    IconButton(symbol: "magnifyingglass", help: L("Find in File (⌃⇧⌘F)", "在文件中查找 (⌃⇧⌘F)"), isActive: viewer.findVisible) {
+                        if viewer.findVisible { viewer.hideFind() } else { viewer.showFind() }
+                    }
                 }
                 if AppEnvironment.hasTerminal {
                     Divider().frame(height: 14)
