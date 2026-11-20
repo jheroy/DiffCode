@@ -126,6 +126,10 @@ enum FileSymbolExtractor {
         let startParenDepth: Int
         let endParenDepth: Int
         let leadingIndent: Int
+        /// True when the line ends inside an unclosed multiline string (backtick, triple quote, or Rust raw string).
+        let endInMultilineString: Bool
+        /// True when a string/rune/backtick literal closed on this line with no subsequent non-whitespace code tokens.
+        let hasTrailingLiteralAfterLastToken: Bool
         let tokens: [Token]
     }
 
@@ -189,19 +193,34 @@ enum FileSymbolExtractor {
             let tokens = line.tokens
 
             // Close grouped type / const blocks when their closing `)` returns parenDepth below block depth.
-            if inTypeBlock && line.startBraceDepth == 0 && line.endParenDepth < typeBlockParenDepth {
-                if !tokens.isEmpty, tokens[0].text != ")" {
+            if inTypeBlock && line.endBraceDepth == 0 && line.endParenDepth < typeBlockParenDepth {
+                if line.startBraceDepth == 0, !tokens.isEmpty, tokens[0].text != ")" {
                     parseGoTypeEntry(tokens: tokens, startIndex: 0, line: line, into: &results)
                 }
                 inTypeBlock = false
                 continue
             }
-            if inConstBlock && line.startBraceDepth == 0 && line.endParenDepth < constBlockParenDepth {
-                if !tokens.isEmpty, tokens[0].text != ")", !constContinuation, line.startParenDepth == constBlockParenDepth {
+            if inConstBlock && line.endBraceDepth == 0 && line.endParenDepth < constBlockParenDepth {
+                if line.startBraceDepth == 0, !tokens.isEmpty, tokens[0].text != ")", !constContinuation, line.startParenDepth == constBlockParenDepth {
                     parseGoConstEntries(tokens: tokens, startIndex: 0, line: line, into: &results)
                 }
                 inConstBlock = false
                 constContinuation = false
+                continue
+            }
+
+            // Inside a top-level `const ( ... )` block (handle even when `tokens` is empty, e.g. closing multiline backtick or `"world"` continuation).
+            if inConstBlock {
+                if !tokens.isEmpty, line.startBraceDepth == 0, line.startParenDepth == constBlockParenDepth, !constContinuation {
+                    parseGoConstEntries(tokens: tokens, startIndex: 0, line: line, into: &results)
+                }
+                if !tokens.isEmpty || line.hasTrailingLiteralAfterLastToken || line.endInMultilineString {
+                    let endsWithOp = !line.hasTrailingLiteralAfterLastToken && endsWithGoContinuationOperator(tokens)
+                    constContinuation = line.endInMultilineString
+                        || line.endBraceDepth > 0
+                        || line.endParenDepth > constBlockParenDepth
+                        || endsWithOp
+                }
                 continue
             }
 
@@ -212,17 +231,6 @@ enum FileSymbolExtractor {
                 if line.startBraceDepth == 0 && line.startParenDepth == typeBlockParenDepth {
                     parseGoTypeEntry(tokens: tokens, startIndex: 0, line: line, into: &results)
                 }
-                continue
-            }
-
-            // Inside a top-level `const ( ... )` block.
-            if inConstBlock {
-                if line.startBraceDepth == 0 && line.startParenDepth == constBlockParenDepth && !constContinuation {
-                    parseGoConstEntries(tokens: tokens, startIndex: 0, line: line, into: &results)
-                }
-                constContinuation = line.endBraceDepth > 0
-                    || line.endParenDepth > constBlockParenDepth
-                    || endsWithGoContinuationOperator(tokens)
                 continue
             }
 
@@ -257,6 +265,11 @@ enum FileSymbolExtractor {
                         constContinuation = false
                         if tokens.count > 2 && tokens[2].text != ")" {
                             parseGoConstEntries(tokens: tokens, startIndex: 2, line: line, into: &results)
+                            let endsWithOp = !line.hasTrailingLiteralAfterLastToken && endsWithGoContinuationOperator(tokens)
+                            constContinuation = line.endInMultilineString
+                                || line.endBraceDepth > 0
+                                || line.endParenDepth > constBlockParenDepth
+                                || endsWithOp
                         }
                     } else if tokens.count > 2 && tokens[2].text != ")" {
                         parseGoConstEntries(tokens: tokens, startIndex: 2, line: line, into: &results)
@@ -1133,6 +1146,7 @@ enum FileSymbolExtractor {
             let startBrace = braceDepth
             let startParen = parenDepth
             var codeEnd = count
+            var hasTrailingLiteralAfterLastToken = false
             var i = 0
 
             while i < count {
@@ -1158,6 +1172,7 @@ enum FileSymbolExtractor {
                     }
                     if units[i] == backtick {
                         inBacktick = false
+                        hasTrailingLiteralAfterLastToken = true
                     }
                     i += 1
                     continue
@@ -1171,6 +1186,7 @@ enum FileSymbolExtractor {
                     }
                     if i + 2 < count && units[i] == tripleQuoteChar && units[i + 1] == tripleQuoteChar && units[i + 2] == tripleQuoteChar {
                         tripleQuoteChar = 0
+                        hasTrailingLiteralAfterLastToken = true
                         i += 3
                         continue
                     }
@@ -1187,6 +1203,7 @@ enum FileSymbolExtractor {
                         }
                         if h == hashes {
                             rustRawHashes = nil
+                            hasTrailingLiteralAfterLastToken = true
                             i += 1 + hashes
                             continue
                         }
@@ -1258,6 +1275,7 @@ enum FileSymbolExtractor {
                         }
                         i += 1
                     }
+                    hasTrailingLiteralAfterLastToken = true
                     continue
                 }
 
@@ -1269,15 +1287,18 @@ enum FileSymbolExtractor {
                             var j = i + 3
                             while j < count && units[j] != squote && j - i < 16 { j += 1 }
                             if j < count && units[j] == squote {
+                                hasTrailingLiteralAfterLastToken = true
                                 i = j + 1
                                 continue
                             }
                         } else if i + 2 < count && units[i + 2] == squote {
+                            hasTrailingLiteralAfterLastToken = true
                             i += 3
                             continue
                         }
                         // Lifetime like `'a` — keep in masked output!
                         masked[i] = c
+                        hasTrailingLiteralAfterLastToken = false
                         i += 1
                         continue
                     } else if config.singleQuoteStrings {
@@ -1293,12 +1314,16 @@ enum FileSymbolExtractor {
                             }
                             i += 1
                         }
+                        hasTrailingLiteralAfterLastToken = true
                         continue
                     }
                 }
 
                 // 12. Normal code character
                 masked[i] = c
+                if c != space && c != tab && c != 13 && c != 10 {
+                    hasTrailingLiteralAfterLastToken = false
+                }
                 if c == openBrace { braceDepth += 1 }
                 else if c == closeBrace { braceDepth = max(0, braceDepth - 1) }
                 else if c == openParen { parenDepth += 1 }
@@ -1307,6 +1332,7 @@ enum FileSymbolExtractor {
             }
 
             let tokens = tokenize(masked)
+            let endInMultiline = inBacktick || tripleQuoteChar != 0 || rustRawHashes != nil
             result.append(ScannedLine(
                 lineNumber: index + 1,
                 original: rawLine,
@@ -1318,6 +1344,8 @@ enum FileSymbolExtractor {
                 startParenDepth: startParen,
                 endParenDepth: parenDepth,
                 leadingIndent: leadingIndent,
+                endInMultilineString: endInMultiline,
+                hasTrailingLiteralAfterLastToken: hasTrailingLiteralAfterLastToken && !endInMultiline,
                 tokens: tokens
             ))
         }
@@ -1495,14 +1523,14 @@ final class FileSymbolsModel {
     var displayPath: String = ""
     var kindFilter: FileSymbolFilter = .all {
         didSet {
-            if kindFilter != oldValue {
+            if kindFilter != oldValue, !suppressFilterRebuild {
                 rebuildFiltered(preserveSelectionIfEmptyQuery: true)
             }
         }
     }
     var filterQuery: String = "" {
         didSet {
-            if filterQuery != oldValue {
+            if filterQuery != oldValue, !suppressFilterRebuild {
                 rebuildFiltered(preserveSelectionIfEmptyQuery: false)
             }
         }
@@ -1523,6 +1551,7 @@ final class FileSymbolsModel {
     @ObservationIgnored private var documentURL: URL = URL(fileURLWithPath: "/")
     @ObservationIgnored private var usingLeftSide: Bool = false
     @ObservationIgnored private var cursorLineWhenOpened: Int = 1
+    @ObservationIgnored private var suppressFilterRebuild: Bool = false
 
     var selectedItem: FileSymbolItem? {
         guard filteredItems.indices.contains(selectedIndex) else { return nil }
@@ -1585,8 +1614,10 @@ final class FileSymbolsModel {
         self.cursorLineWhenOpened = max(1, cursorLine)
 
         self.allItems = FileSymbolExtractor.extract(lines: lines, language: language)
+        suppressFilterRebuild = true
         self.kindFilter = .all
         self.filterQuery = ""
+        suppressFilterRebuild = false
         self.filteredItems = self.allItems
         self.matchPositions = [:]
         self.selectedIndex = Self.nearestSymbolIndex(in: self.filteredItems, cursorLine: self.cursorLineWhenOpened)
@@ -1639,8 +1670,12 @@ final class FileSymbolsModel {
         store.viewer.focusCanvas()
     }
 
-    /// Clears cached document references when the popup closes.
+    /// Clears cached document references and filter state when the popup closes.
     func release() {
+        suppressFilterRebuild = true
+        kindFilter = .all
+        filterQuery = ""
+        suppressFilterRebuild = false
         documentLines = []
         documentSpans = []
         allItems = []
