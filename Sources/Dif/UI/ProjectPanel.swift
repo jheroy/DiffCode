@@ -69,7 +69,7 @@ private struct ProjectTabsHeader: View {
             if buttons != .none {
                 // The spinner takes the button's place, so nothing shifts while a refresh runs.
                 ZStack {
-                    IconButton(symbol: "arrow.clockwise", help: L("Refresh (⌘R)", "刷新 (⌘R)"), size: 11.5) { store.refreshCurrent() }
+                    IconButton(symbol: "arrow.clockwise", help: L("Refresh", "刷新"), size: 11.5) { store.refreshCurrent() }
                         .opacity(project.isRefreshing ? 0 : 1)
                     if project.isRefreshing {
                         ProgressView().controlSize(.small).scaleEffect(0.6).allowsHitTesting(false)

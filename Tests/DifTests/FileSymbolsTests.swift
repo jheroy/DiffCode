@@ -169,6 +169,78 @@ final class FileSymbolsTests: XCTestCase {
         )
     }
 
+    func testGoConstBlockWithStringsRunesBackticksAndContinuations() {
+        let source = """
+        package consts
+
+        const (
+        \tErrA = "a"
+        \tErrB = "b"
+        \tErrC = "c" // trailing comment
+        \tChA = 'a'
+        \tChB = '\\n'
+        \tRawA = `foo`
+        \tRawB = `bar`
+        \tSQL = `
+        \tfunc FakeInBacktick() {}
+        \tSELECT * FROM users
+        \t`
+        \tAfterMultilineBacktick = 1
+        \tConcatMsg = "hello " +
+        \t\t"world"
+        \tAfterConcat = "ok"
+        \tConcatBacktick = `
+        \tpart1
+        \t` +
+        \t\t`part2`
+        \tAfterConcatBacktick = 2
+        \tFlags = FlagA |
+        \t\t// comment inside continuation
+        \t\tFlagB
+        \tAfterFlags = 3
+        )
+        """
+
+        let symbols = FileSymbolExtractor.extract(lines: source.components(separatedBy: "\n"), language: .go)
+        XCTAssertEqual(symbols.map(\.name), [
+            "ErrA",
+            "ErrB",
+            "ErrC",
+            "ChA",
+            "ChB",
+            "RawA",
+            "RawB",
+            "SQL",
+            "AfterMultilineBacktick",
+            "ConcatMsg",
+            "AfterConcat",
+            "ConcatBacktick",
+            "AfterConcatBacktick",
+            "Flags",
+            "AfterFlags",
+        ])
+        XCTAssertTrue(symbols.allSatisfy { $0.kind == .constant })
+    }
+
+    func testGoTypeBlockSameLineBraceParenClose() {
+        let source = """
+        package types
+
+        type (
+        \tFirst struct {
+        \t\tX int
+        \t})
+
+        func AfterTypeBlock() {}
+        """
+
+        let symbols = FileSymbolExtractor.extract(lines: source.components(separatedBy: "\n"), language: .go)
+        XCTAssertEqual(symbols.map { "\($0.kind.rawValue):\($0.name)" }, [
+            "struct:First",
+            "function:AfterTypeBlock",
+        ])
+    }
+
     // MARK: - Other Languages Smoke Tests
 
     func testSwiftExtractionSmoke() {
@@ -381,6 +453,15 @@ final class FileSymbolsTests: XCTestCase {
         model.cycleFilter(1)
         XCTAssertEqual(model.kindFilter, .all)
         XCTAssertEqual(model.filteredItems.count, 6)
+
+        // Release resets filterQuery and kindFilter cleanly.
+        model.filterQuery = "Auth"
+        model.kindFilter = .types
+        model.release()
+        XCTAssertEqual(model.filterQuery, "")
+        XCTAssertEqual(model.kindFilter, .all)
+        XCTAssertTrue(model.allItems.isEmpty)
+        XCTAssertTrue(model.filteredItems.isEmpty)
     }
 
     @MainActor
