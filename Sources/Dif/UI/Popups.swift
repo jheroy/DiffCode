@@ -78,6 +78,7 @@ struct QuickOpenView: View {
                     HStack(spacing: 2) {
                         ScopeTab(title: L("All", "全部"), isSelected: model.scope == .all) { model.setScope(.all) }
                         ScopeTab(title: L("Files", "文件"), isSelected: model.scope == .files) { model.setScope(.files) }
+                        ScopeTab(title: L("Symbols", "符号"), isSelected: model.scope == .symbols) { model.setScope(.symbols) }
                         ScopeTab(title: L("Actions", "操作"), isSelected: model.scope == .actions) { model.setScope(.actions) }
                     }
                 }
@@ -157,6 +158,7 @@ struct QuickOpenView: View {
         switch scope {
         case .all: return L("Search files and actions", "搜索文件和操作")
         case .files: return L("Go to file — try abbreviations like \"mavm\"", "查找文件 — 支持缩写，例如 mavm")
+        case .symbols: return L("Go to symbol — functions, types, methods…", "查找符号 — 函数、结构体、方法…")
         case .actions: return L("Find an action", "查找操作")
         case .recent: return L("Recent files", "最近的文件")
         case .branches: return L("Compare the working tree with a branch, tag or commit", "将工作区与分支、标签或提交比较")
@@ -172,7 +174,9 @@ struct QuickOpenView: View {
             if model.isIndexing { return L("Reading stashes…", "正在读取 stash…") }
             return model.query.isEmpty ? L("No stashes", "没有 stash") : L("Nothing found", "没有找到")
         }
-        if model.isIndexing { return L("Indexing files…", "正在索引文件…") }
+        if model.isIndexing {
+            return model.scope == .symbols ? L("Indexing symbols…", "正在索引符号…") : L("Indexing files…", "正在索引文件…")
+        }
         return model.query.isEmpty ? L("Type to search", "输入以搜索") : L("Nothing found", "没有找到")
     }
 }
@@ -258,6 +262,32 @@ private struct QuickOpenRow: View {
                     .padding(.horizontal, 6)
                     .padding(.vertical, 1.5)
                     .background(Capsule().fill(Color.difAdded.opacity(0.14)))
+            case .symbol(let projectID, let symbol, let positions):
+                Text(symbol.kind.badge)
+                    .font(.ui(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .frame(width: UI.s(16), height: UI.s(16))
+                    .background(Circle().fill(symbol.kind.accentColor))
+                    .frame(width: UI.s(18))
+                Text(FuzzyHighlight.text(symbol.name, positions: positions, offset: 0, base: Color.difText))
+                    .font(.ui(size: 13))
+                    .lineLimit(1)
+                    .layoutPriority(1)
+                Text(symbol.detail)
+                    .font(.ui(size: 11.5))
+                    .foregroundStyle(Color.difText3)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 6)
+                if projectID != store.selectedProjectID, let owner = store.project(projectID) {
+                    Text(owner.name).font(.ui(size: 10.5)).foregroundStyle(Color.difText3)
+                }
+                Text("\(symbol.path):\(symbol.line)")
+                    .font(.ui(size: 11))
+                    .foregroundStyle(Color.difText3)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                    .frame(maxWidth: UI.s(260), alignment: .trailing)
             case .action(let command):
                 Image(systemName: command.symbol)
                     .font(.ui(size: 12))
@@ -1447,6 +1477,7 @@ struct KeymapView: View {
             shortcutRow(L("Leader Key", "前导键 (Leader)"), "Space")
             shortcutRow(L("Go to Definition / References", "定义 / 引用"), "gd / gr · Space r")
             shortcutRow(L("Go to File / Everywhere / Action", "文件 / 随处 / 操作"), "⌘P / ⌃P · Space a · ga")
+            shortcutRow(L("Go to Symbol", "查找符号"), "gs")
             shortcutRow(L("Git Pull / Push / Graph", "拉取 / 推送 / 分支树"), "gl / gp / gb")
             shortcutRow(L("Locate File / Tree / Maximize", "定位 / 文件树 / 最大化"), "Space e / ⌃E / Space o")
             shortcutRow(L("Navigate Back / Forward", "后退 / 前进"), "⌃O / ⌃I")

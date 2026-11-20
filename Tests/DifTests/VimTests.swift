@@ -488,6 +488,9 @@ final class VimTests: XCTestCase {
         h.type("ga")
         XCTAssertEqual(h.actions.last, .findAction)
 
+        h.type("gs")
+        XCTAssertEqual(h.actions.last, .goToSymbol)
+
         h.type("gl")
         XCTAssertEqual(h.actions.last, .gitPull)
 

@@ -219,6 +219,7 @@ enum VimAction: Equatable, Sendable {
     case goToDefinition         // gd
     case findReferences         // gr, <Space>r
     case goToFile               // <C-p>
+    case goToSymbol             // gs
     case searchEverywhere       // <Space>a
     case findAction             // ga
     case gitPull                // gl
@@ -1118,6 +1119,8 @@ final class VimEngine {
             return VimResult(handled: true, actions: [.findReferences])
         case "a":
             return VimResult(handled: true, actions: [.findAction])
+        case "s":
+            return VimResult(handled: true, actions: [.goToSymbol])
         case "l":
             return VimResult(handled: true, actions: [.gitPull])
         case "p":

@@ -92,13 +92,23 @@ struct FileSymbolItem: Identifiable, Equatable, Sendable {
     /// Receiver, parameter/return signature, or type kind detail (e.g. `(*Manager) (lid int64) error`, `struct`).
     let detail: String
     let kind: FileSymbolKind
-    /// 1-based line number.
+    /// 1-based start line number.
     let lineNumber: Int
     /// 0-based UTF-16 start column of the symbol name.
     let column: Int
     /// 0-based UTF-16 end column of the symbol name.
     let endColumn: Int
     let isExported: Bool
+    /// 1-based inclusive end line number of the symbol's block, when determinable.
+    var endLine: Int? = nil
+}
+
+/// Associates a file symbol with the diff hunk indices that overlap its line span.
+struct ChangedFileSymbol: Identifiable, Equatable, Sendable {
+    var id: String { symbol.id }
+    let symbol: FileSymbolItem
+    /// Sorted indices into the document's `hunks` array overlapping this symbol.
+    let hunkIndices: [Int]
 }
 
 // MARK: - Multi-Language Static Symbol Extractor
@@ -283,7 +293,7 @@ enum FileSymbolExtractor {
             }
         }
 
-        return results
+        return attachBraceEndLines(results, scanned: scanned)
     }
 
     private static func parseGoFunc(tokens: [Token], line: ScannedLine, into results: inout [FileSymbolItem]) {
@@ -581,7 +591,7 @@ enum FileSymbolExtractor {
                 break
             }
         }
-        return results
+        return attachBraceEndLines(results, scanned: scanned)
     }
 
     private static func isSwiftOperatorToken(_ text: String) -> Bool {
@@ -740,7 +750,7 @@ enum FileSymbolExtractor {
                 break
             }
         }
-        return results
+        return attachBraceEndLines(results, scanned: scanned)
     }
 
     // MARK: - TypeScript / JavaScript Extraction
@@ -859,7 +869,7 @@ enum FileSymbolExtractor {
                 break
             }
         }
-        return results
+        return attachBraceEndLines(results, scanned: scanned)
     }
 
     // MARK: - Python Extraction
@@ -932,7 +942,7 @@ enum FileSymbolExtractor {
                 scopeStack.append((line.leadingIndent, true))
             }
         }
-        return results
+        return attachPythonEndLines(results, scanned: scanned)
     }
 
     private static func cleanPythonDetail(_ raw: String) -> String {
@@ -1037,7 +1047,7 @@ enum FileSymbolExtractor {
                 isExported: tokens[0].text != "static"
             ))
         }
-        return results
+        return attachBraceEndLines(results, scanned: scanned)
     }
 
     // MARK: - Generic Fallback (Kotlin, Java, Ruby, PHP, Lua, Protobuf, etc.)
@@ -1100,7 +1110,7 @@ enum FileSymbolExtractor {
                 }
             }
         }
-        return results
+        return attachBraceEndLines(results, scanned: scanned)
     }
 
     // MARK: - Shared Scanner (Comment & String Masking with Exact UTF-16 Offsets)
@@ -1506,6 +1516,162 @@ enum FileSymbolExtractor {
         let units = Array(text.utf16)
         guard let first = units.first, isIdentStart(first) else { return false }
         return units.dropFirst().allSatisfy(isIdentContinue)
+    }
+
+    // MARK: - Symbol Block Ranges & Changed Symbol Attribution
+
+    private static let headerContinuationTokens: Set<String> = [
+        ",", "(", "->", ":", "where", "throws", "rethrows", "async", "=", "|", "&",
+    ]
+
+    /// Infers 1-based inclusive `endLine` for brace-delimited languages using `ScannedLine` brace depths.
+    private static func attachBraceEndLines(_ items: [FileSymbolItem], scanned: [ScannedLine]) -> [FileSymbolItem] {
+        guard !items.isEmpty, !scanned.isEmpty else { return items }
+        let lastFileLine = scanned.last?.lineNumber ?? scanned.count
+        var out = items
+        for i in out.indices {
+            let startIdx = out[i].lineNumber - 1
+            guard scanned.indices.contains(startIdx) else { continue }
+            let startLine = scanned[startIdx]
+            let baseDepth = startLine.startBraceDepth
+
+            if out[i].kind == .constant {
+                out[i].endLine = out[i].lineNumber
+                continue
+            }
+
+            if startLine.endBraceDepth > baseDepth {
+                out[i].endLine = findClosingBraceLine(in: scanned, after: startIdx, targetDepth: baseDepth, fallback: lastFileLine)
+                continue
+            }
+
+            if startLine.tokens.contains(where: { $0.text == "{" }) || startLine.tokens.last?.text == ";" {
+                out[i].endLine = out[i].lineNumber
+                continue
+            }
+
+            // Look ahead for multi-line signatures or Allman-style `{` on subsequent lines,
+            // stopping before the next extracted symbol so single-line declarations never steal a later block.
+            let nextSymbolIdx = (i + 1 < out.count) ? max(startIdx + 1, out[i + 1].lineNumber - 1) : scanned.count
+            let limit = min(scanned.count, nextSymbolIdx)
+            var inferredEnd = out[i].lineNumber
+            var k = startIdx + 1
+            while k < limit {
+                let prev = scanned[k - 1]
+                let cur = scanned[k]
+                if cur.endBraceDepth < baseDepth { break }
+
+                if cur.tokens.contains(where: { $0.text == "{" }) {
+                    if cur.endBraceDepth > baseDepth {
+                        inferredEnd = findClosingBraceLine(in: scanned, after: k, targetDepth: baseDepth, fallback: lastFileLine)
+                    } else {
+                        inferredEnd = cur.lineNumber
+                    }
+                    break
+                }
+                if cur.tokens.contains(where: { $0.text == ";" }) && cur.endBraceDepth == baseDepth {
+                    inferredEnd = cur.lineNumber
+                    break
+                }
+
+                let prevContinues = prev.endParenDepth > startLine.startParenDepth
+                    || prev.tokens.last.map({ headerContinuationTokens.contains($0.text) }) == true
+                if prevContinues || cur.tokens.isEmpty || k == startIdx + 1 {
+                    k += 1
+                    continue
+                }
+                break
+            }
+            out[i].endLine = inferredEnd
+        }
+        return out
+    }
+
+    private static func findClosingBraceLine(
+        in scanned: [ScannedLine],
+        after openIdx: Int,
+        targetDepth: Int,
+        fallback: Int
+    ) -> Int {
+        var j = openIdx + 1
+        while j < scanned.count {
+            if scanned[j].endBraceDepth <= targetDepth {
+                return scanned[j].lineNumber
+            }
+            j += 1
+        }
+        return fallback
+    }
+
+    /// Infers 1-based inclusive `endLine` for indentation-scoped languages (Python).
+    private static func attachPythonEndLines(_ items: [FileSymbolItem], scanned: [ScannedLine]) -> [FileSymbolItem] {
+        guard !items.isEmpty, !scanned.isEmpty else { return items }
+        var out = items
+        for i in out.indices {
+            let startIdx = out[i].lineNumber - 1
+            guard scanned.indices.contains(startIdx) else { continue }
+            let startLine = scanned[startIdx]
+            let baseIndent = startLine.leadingIndent
+
+            // Advance across multi-line `def` parameter lists before checking body indentation.
+            var headerEndIdx = startIdx
+            while headerEndIdx + 1 < scanned.count && scanned[headerEndIdx].endParenDepth > startLine.startParenDepth {
+                headerEndIdx += 1
+            }
+
+            var lastBodyLine = scanned[headerEndIdx].lineNumber
+            var prevInMultiline = scanned[headerEndIdx].endInMultilineString
+            var j = headerEndIdx + 1
+            while j < scanned.count {
+                let line = scanned[j]
+                let hasContent = !line.tokens.isEmpty || line.hasTrailingLiteralAfterLastToken
+                if !prevInMultiline && hasContent && line.leadingIndent <= baseIndent {
+                    break
+                }
+                if hasContent || line.endInMultilineString || prevInMultiline {
+                    lastBodyLine = line.lineNumber
+                }
+                prevInMultiline = line.endInMultilineString
+                j += 1
+            }
+            out[i].endLine = max(out[i].lineNumber, lastBodyLine)
+        }
+        return out
+    }
+
+    /// Attributes `hunks` to symbols whose 1-based range `lineNumber...(endLine ?? lineNumber)`
+    /// overlaps at least one hunk on `side` (defaults to `.right`).
+    static func changedSymbols(
+        symbols: [FileSymbolItem],
+        hunks: [Hunk],
+        side: Side = .right
+    ) -> [ChangedFileSymbol] {
+        guard !symbols.isEmpty, !hunks.isEmpty else { return [] }
+        var result: [ChangedFileSymbol] = []
+        for symbol in symbols {
+            let symStart = max(0, symbol.lineNumber - 1)
+            let symEnd = max(symStart, (symbol.endLine ?? symbol.lineNumber) - 1)
+            var matched: [Int] = []
+            for (index, hunk) in hunks.enumerated() {
+                let start = side == .left ? hunk.leftStart : hunk.rightStart
+                let count = side == .left ? hunk.leftCount : hunk.rightCount
+                if count > 0 {
+                    let end = start + count - 1
+                    if start <= symEnd && end >= symStart {
+                        matched.append(index)
+                    }
+                } else {
+                    // Pure deletion on the opposite side anchored inside this symbol's body.
+                    if symStart < start && start <= symEnd {
+                        matched.append(index)
+                    }
+                }
+            }
+            if !matched.isEmpty {
+                result.append(ChangedFileSymbol(symbol: symbol, hunkIndices: matched))
+            }
+        }
+        return result
     }
 }
 

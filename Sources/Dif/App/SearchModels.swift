@@ -26,11 +26,14 @@ final class SearchCancelFlag: @unchecked Sendable {
 final class QuickOpenModel {
     /// `branches`: the branches and tags to compare the working tree with (Compare with Branch…).
     /// `stashes`: the stash list.
-    enum Scope: Equatable { case all, files, actions, recent, branches, stashes }
+    /// `symbols`: functions, types and other declarations across the project (Go to Symbol).
+    enum Scope: Equatable { case all, files, symbols, actions, recent, branches, stashes }
 
     enum Item: Identifiable {
         case file(projectID: UUID, path: String, positions: [Int], kind: FileChange.Kind?)
         case excelSheet(projectID: UUID, path: String, sheetName: String, positions: [Int])
+        /// A declaration found by Go to Symbol; `positions` are the matched characters of its name.
+        case symbol(projectID: UUID, ProjectSymbol, positions: [Int])
         case action(AppCommand)
         /// A branch or tag to compare with; `positions` are the matched characters of its short name.
         case ref(GitRef, positions: [Int])
@@ -45,6 +48,7 @@ final class QuickOpenModel {
             switch self {
             case .file(let project, let path, _, _): return "f:\(project.uuidString):\(path)"
             case .excelSheet(let project, let path, let sheetName, _): return "x:\(project.uuidString):\(path):\(sheetName)"
+            case .symbol(let project, let symbol, _): return "y:\(project.uuidString):\(symbol.path):\(symbol.line):\(symbol.column)"
             case .action(let command): return "a:" + command.id
             case .ref(let ref, _): return "r:" + ref.name
             case .revision(let text): return "v:" + text
@@ -82,6 +86,10 @@ final class QuickOpenModel {
     @ObservationIgnored private var refs: [GitRef]?
     /// The stash list, read as it opens.
     @ObservationIgnored private var stashList: [StashEntry]?
+    /// Every symbol of the current project, read as Go to Symbol opens.
+    @ObservationIgnored private var symbolList: (projectID: UUID, symbols: [ProjectSymbol])?
+    /// Indexing outlives keystrokes and the popup closing, so its work lands in the cache either way.
+    @ObservationIgnored private var symbolIndexTask: (projectID: UUID, task: Task<Void, Never>, cancel: SearchCancelFlag)?
 
     func prepare(scope: Scope) {
         isPreparing = true
@@ -90,6 +98,7 @@ final class QuickOpenModel {
         if scope == .recent || scope == .actions || scope == .branches || scope == .stashes { query = "" }
         if scope == .branches { refs = nil }
         if scope == .stashes { stashList = nil }
+        symbolList = nil
         focusToken += 1
         isPreparing = false
         update()
@@ -103,7 +112,7 @@ final class QuickOpenModel {
 
     func cycleScope(_ delta: Int) {
         guard scope != .branches, scope != .stashes else { return }
-        let order: [Scope] = [.all, .files, .actions]
+        let order: [Scope] = [.all, .files, .symbols, .actions]
         let index = order.firstIndex(of: scope) ?? 0
         setScope(order[(index + delta + order.count) % order.count])
     }
@@ -134,6 +143,10 @@ final class QuickOpenModel {
         }
         if scope == .stashes {
             updateStashes(query.trimmingCharacters(in: .whitespaces), in: project, generation: generation)
+            return
+        }
+        if scope == .symbols {
+            updateSymbols(text, in: project, generation: generation)
             return
         }
         let changeKinds = Dictionary(uniqueKeysWithValues: (project?.changes ?? []).map { ($0.path, $0.kind) })
@@ -320,6 +333,62 @@ final class QuickOpenModel {
         selected = 0
     }
 
+    /// Go to Symbol: indexes the project once per opening (unchanged files come from the cache), then ranks
+    /// symbol names on every keystroke.
+    private func updateSymbols(_ text: String, in project: Project?, generation: UInt64) {
+        guard let project else {
+            isIndexing = false
+            items = []
+            return
+        }
+        guard let symbolList, symbolList.projectID == project.id else {
+            isIndexing = true
+            items = []
+            if symbolIndexTask?.projectID == project.id { return }
+            cancelSymbolIndexing()
+            let cancelFlag = SearchCancelFlag()
+            let root = project.url
+            let task = Task { @MainActor [weak self] in
+                let files = await project.files()
+                guard !cancelFlag.isCancelled else { return }
+                let symbols = await Task.detached(priority: .userInitiated) {
+                    SymbolIndex.shared.symbols(root: root, files: files, isCancelled: { cancelFlag.isCancelled })
+                }.value
+                guard let self, let symbols, !cancelFlag.isCancelled else { return }
+                self.symbolIndexTask = nil
+                self.symbolList = (project.id, symbols)
+                if self.scope == .symbols { self.update() }
+            }
+            symbolIndexTask = (project.id, task, cancelFlag)
+            return
+        }
+        guard !text.isEmpty else {
+            isIndexing = false
+            items = []
+            selected = 0
+            return
+        }
+        let projectID = project.id
+        let symbols = symbolList.symbols
+        let cancelFlag = SearchCancelFlag()
+        searchCancelFlag = cancelFlag
+        searchTask = Task { @MainActor [weak self] in
+            let ranked = await Task.detached(priority: .userInitiated) {
+                SymbolIndex.rank(query: text, in: symbols, limit: 100, isCancelled: { cancelFlag.isCancelled })
+            }.value
+            guard let self, !Task.isCancelled, !cancelFlag.isCancelled, self.searchGeneration == generation else { return }
+            self.isIndexing = false
+            self.items = ranked.map { .symbol(projectID: projectID, $0.symbol, positions: $0.positions) }
+            self.selected = 0
+        }
+    }
+
+    private func cancelSymbolIndexing() {
+        symbolIndexTask?.cancel.cancel()
+        symbolIndexTask?.task.cancel()
+        symbolIndexTask = nil
+    }
+
     /// The stash list, newest first, under Stash Changes… while there is something to stash.
     private func updateStashes(_ text: String, in project: Project?, generation: UInt64) {
         guard let project else {
@@ -382,6 +451,11 @@ final class QuickOpenModel {
                 store.viewer.selectExcelSheet(sheetName)
                 store.viewer.focusCanvas()
             }
+        case .symbol(let projectID, let symbol, _):
+            guard let project = store.project(projectID) else { return }
+            store.dismissPopup(restoreFocus: false)
+            store.openFile(in: project, path: symbol.path, line: symbol.line, column: symbol.column)
+            store.viewer.focusCanvas()
         case .action(let command):
             store.dismissPopup()
             command.action()

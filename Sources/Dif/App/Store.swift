@@ -1110,6 +1110,8 @@ final class AppStore {
             findAllReferences(atLine: line, utf16Column: column)
         case .goToFile:
             showQuickOpen(.files)
+        case .goToSymbol:
+            showQuickOpen(.symbols)
         case .searchEverywhere:
             showQuickOpen(.all)
         case .findAction:
