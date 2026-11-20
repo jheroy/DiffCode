@@ -116,6 +116,8 @@ extension AppStore {
                        key: "1", modifiers: .command) { [weak self] in self?.toggleFileTree() },
             AppCommand(id: "view.changes", title: L("Local Changes", "本地变更"), symbol: "list.bullet.indent", group: .view,
                        key: "0", modifiers: .command) { [weak self] in self?.toggleTab(.changes) },
+            AppCommand(id: "view.groups", title: L("AI Change Groups", "AI 变更分组"), symbol: "sparkles.rectangle.stack", group: .view,
+                       key: "8", modifiers: .command) { [weak self] in self?.toggleTab(.groups) },
             AppCommand(id: "view.log", title: L("Git Log", "提交历史"), symbol: "clock.arrow.circlepath", group: .view,
                        key: "9", modifiers: .command) { [weak self] in self?.toggleTab(.log) },
             AppCommand(id: "view.terminal", title: L("Terminal", "终端"), symbol: "terminal", group: .view,
@@ -166,6 +168,8 @@ extension AppStore {
                        shortcutLabel: "⇧⇧") { [weak self] in self?.showQuickOpen(.all) },
             AppCommand(id: "nav.file", title: L("Go to File…", "查找文件…"), symbol: "doc.text.magnifyingglass", group: .navigate,
                        key: "p", modifiers: .command) { [weak self] in self?.showQuickOpen(.files) },
+            AppCommand(id: "nav.symbol", title: L("Go to Symbol…", "查找符号…"), symbol: "curlybraces", group: .navigate,
+                       key: "o", modifiers: [.command, .option]) { [weak self] in self?.showQuickOpen(.symbols) },
             AppCommand(id: "nav.findInPath", title: L("Find in Files…", "在文件中查找…"), symbol: "text.magnifyingglass", group: .navigate,
                        key: "f", modifiers: .command) { [weak self] in self?.showFindInPath() },
             AppCommand(id: "nav.action", title: L("Find Action…", "查找操作…"), symbol: "command", group: .navigate,
@@ -292,6 +296,7 @@ extension AppStore {
         ]
         .filter { AppEnvironment.hasTerminal || ($0.group != .terminal && $0.id != "view.terminal") }
         .filter { AppEnvironment.hasLSP || ($0.id != "nav.back" && $0.id != "nav.forward") }
+        .filter { !AppEnvironment.isAppStore || $0.id != "view.groups" }
         + editionCommands
     }
 

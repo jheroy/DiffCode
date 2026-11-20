@@ -64,6 +64,7 @@ enum DebugHooks {
         case "light": store.settings.appearance = .light; store.settings.applyAppearance()
         case "dark": store.settings.appearance = .dark; store.settings.applyAppearance()
         case "log": store.setTab(.log)
+        case "groups": store.setTab(.groups)
         case "changes": store.setTab(.changes)
         case "project":
             if let project = store.projects.first(where: { $0.name == argument }) { store.select(project) }
@@ -164,7 +165,7 @@ enum DebugHooks {
                 canvas.selection = TextSelection(pane: .right, anchor: TextPosition(row: bounds[0], column: 4),
                                                  head: TextPosition(row: bounds[1], column: 12))
             }
-        case "tab": store.setTab(argument == "log" ? .log : .changes)
+        case "tab": store.setTab(argument == "log" ? .log : (argument == "groups" ? .groups : .changes))
         case "files": store.focusTree()
         case "sidebar": store.toggleSidebar()
         case "locate": store.locateInTree()

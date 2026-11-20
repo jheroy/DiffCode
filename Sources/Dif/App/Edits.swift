@@ -63,7 +63,7 @@ extension AppStore {
             let path = String(id.dropFirst(2))
             return project.changes.filter { $0.path == path }
         }
-        // While comparing with another commit, the list holds that comparison, not what rollback and delete act on.
+        // While comparing with another commit, browsing AI groups, or viewing history, list-level rollback/delete is disabled.
         return project.tab == .changes && project.comparison == nil ? selectedChanges(in: project) : []
     }
 

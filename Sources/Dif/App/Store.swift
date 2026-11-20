@@ -362,6 +362,8 @@ final class AppStore {
             if worktree.isDerived { remove(worktree) }
         }
         terminals.removeAll(for: project)
+        project.cancelCommitMessageGeneration()
+        project.cancelAIGroupGeneration()
         project.stopWatching()
         projects.removeAll { $0.id == project.id }
         FolderAccess.shared.release(project.url.path, keepingFor: projects.map(\.url.path))
@@ -514,6 +516,8 @@ final class AppStore {
             if !collapsedProjects.isDisjoint(with: folded) { collapsedProjects.subtract(folded) }
         }
         if selectedProjectID != project.id {
+            currentProject?.cancelAIGroupGeneration()
+            pendingGroupHunkFocus = nil
             selectedProjectID = project.id
             persistProjects()
         }
@@ -547,24 +551,47 @@ final class AppStore {
 
     // MARK: Viewer synchronisation
 
+    /// Applies the active `Settings.semanticDiffOptions` so equality checks stay consistent with `viewer.request`.
+    func resolvedRequest(_ raw: DiffRequest) -> DiffRequest {
+        var request = raw
+        request.semantic = settings.semanticDiffOptions
+        return request
+    }
+
+    /// Synchronizes `viewer`'s group hunk filter for `upcomingRequest` without wasting work on an outgoing file:
+    /// - Same file (`viewer.request == upcomingRequest`): delegates to `setHighlightedGroupHunks` so the loaded
+    ///   document re-filters in place immediately.
+    /// - Different file (`viewer.request != upcomingRequest`): assigns `viewer.highlightedGroupHunks` directly so
+    ///   the immediately following `viewer.open(upcomingRequest)` loads with the target filter in a single pass.
+    func syncGroupHunkFilter(_ hunks: Set<Int>?, for upcomingRequest: DiffRequest) {
+        if viewer.request == upcomingRequest {
+            viewer.setHighlightedGroupHunks(hunks)
+        } else {
+            viewer.highlightedGroupHunks = hunks
+        }
+    }
+
     /// Points the viewer at whatever the current project's selection implies: the file being browsed
     /// by path if there is one, otherwise the selection of the list column.
     func syncViewer() {
         if let external = externalRequest {
-            if viewer.request == external {
+            let request = resolvedRequest(external)
+            syncGroupHunkFilter(nil, for: request)
+            if viewer.request == request {
                 viewer.reloadIfStale(base: nil)
             } else {
-                viewer.open(external)
+                viewer.open(request)
             }
             return
         }
         guard let project = currentProject else {
+            viewer.highlightedGroupHunks = nil
             viewer.clear()
             return
         }
         viewer.setBaseStamp(project.status.headOID)
         if let path = project.browsedPath {
-            let request = worktreeRequest(for: path, in: project)
+            let request = resolvedRequest(worktreeRequest(for: path, in: project))
             if request.source == .file, !FileManager.default.fileExists(atPath: project.url.appendingPathComponent(path).path) {
                 // Deleted and committed, or gone with a checkout: nothing left to follow.
                 project.browsedPath = nil
@@ -572,6 +599,7 @@ final class AppStore {
                 // The same file, as a diff while it has local changes (an agent or an editor touched it)
                 // and as a plain file once it has none.
                 markInChanges(path, in: project)
+                syncGroupHunkFilter(nil, for: request)
                 if request == viewer.request {
                     viewer.reloadIfStale(base: project.status.headOID)
                 } else {
@@ -583,18 +611,20 @@ final class AppStore {
         switch project.tab {
         case .changes:
             if let comparison = project.comparison {
+                viewer.highlightedGroupHunks = nil
                 syncComparison(project, comparison)
                 return
             }
             if let id = project.selectedChangeID {
                 if !id.hasPrefix("f:") { return } // a folder or group row; leave the viewer alone
-                if let change = project.changes.first(where: { ChangeRow.fileID($0.path) == id }) {
-                    show(change, in: project)
+                if let change = project.change(forPath: String(id.dropFirst(2))) {
+                    show(change, in: project, groupHunks: nil)
                     return
                 }
                 // The file being edited left the list (typed back to what HEAD has): it stays on screen, and
                 // comes back into the list with the next keystroke that changes it.
                 if viewer.isEditing(root: project.url, path: String(id.dropFirst(2))) {
+                    viewer.setHighlightedGroupHunks(nil)
                     viewer.reloadIfStale(base: project.status.headOID)
                     return
                 }
@@ -603,10 +633,73 @@ final class AppStore {
                                                   filter: project.filter, splitUnversioned: true)
             if let first = ordered.first {
                 project.selectedChangeID = ChangeRow.fileID(first.path)
-                show(first, in: project)
+                show(first, in: project, groupHunks: nil)
             } else {
                 project.selectedChangeID = nil
-                if project.hasLoaded || viewer.request?.root != project.url { viewer.clear() }
+                if project.hasLoaded || viewer.request?.root != project.url {
+                    viewer.highlightedGroupHunks = nil
+                    viewer.clear()
+                }
+            }
+        case .groups:
+            if let group = project.activeAIGroup {
+                if project.selectedGroupID != group.id {
+                    project.selectedGroupID = group.id
+                }
+                let targetFile: AIHunkGroupFile? = {
+                    if let selectedPath = project.selectedGroupFilePath,
+                       let match = group.files.first(where: { $0.path == selectedPath }) {
+                        return match
+                    }
+                    return project.orderedGroupFiles(for: group, flat: settings.flatList).first ?? group.files.first
+                }()
+                if let file = targetFile {
+                    let targetHunk = project.selectedGroupFilePath == file.path
+                        ? (project.selectedGroupHunkIndex ?? file.hunkIndices.first ?? 0)
+                        : (file.hunkIndices.first ?? 0)
+                    if project.selectedGroupFilePath != file.path {
+                        project.selectedGroupFilePath = file.path
+                        project.selectedGroupRowID = ChangeRow.fileID(file.path)
+                        project.selectedGroupHunkIndex = targetHunk
+                    } else if project.selectedGroupRowID == nil {
+                        project.selectedGroupRowID = ChangeRow.fileID(file.path)
+                    }
+                    let targetHunks = project.highlightedGroupHunks(for: file.path)
+                    let rawRequest: DiffRequest?
+                    if let change = project.change(forPath: file.path) {
+                        rawRequest = project.request(for: change, ignoreWhitespace: settings.ignoreWhitespace)
+                    } else if FileManager.default.fileExists(atPath: project.url.appendingPathComponent(file.path).path) {
+                        rawRequest = worktreeRequest(for: file.path, in: project)
+                    } else {
+                        rawRequest = nil
+                    }
+                    if let rawRequest {
+                        let request = resolvedRequest(rawRequest)
+                        if request == viewer.request {
+                            viewer.setHighlightedGroupHunks(targetHunks)
+                            viewer.reloadIfStale(base: project.status.headOID)
+                        } else {
+                            // Prime group filter before viewer.open so ViewerModel loads filtered in a single pass
+                            // without re-filtering the outgoing file.
+                            pendingGroupHunkFocus = (root: project.url, path: file.path, hunkIndex: targetHunk)
+                            syncGroupHunkFilter(targetHunks, for: request)
+                            let sameFile = viewer.request?.path == request.path && viewer.request?.root == request.root
+                            viewer.open(request, preserveScroll: sameFile)
+                        }
+                        return
+                    }
+                }
+            }
+            if let current = viewer.request, current.root == project.url, case .worktree = current.source {
+                viewer.setHighlightedGroupHunks(nil)
+                viewer.reloadIfStale(base: project.status.headOID)
+                return
+            }
+            if let first = project.changes.first {
+                show(first, in: project, groupHunks: nil)
+            } else if project.hasLoaded || viewer.request?.root != project.url {
+                viewer.highlightedGroupHunks = nil
+                viewer.clear()
             }
         case .log:
             if project.commits.isEmpty, !project.isLoadingLog { project.loadLog(reset: true) }
@@ -617,15 +710,21 @@ final class AppStore {
                 // Keep showing the previous commit's diff while the next one loads.
                 var showingCommit = false
                 if let current = viewer.request, current.root == project.url, case .commit = current.source { showingCommit = true }
-                if !showingCommit || commits.isEmpty || (!project.isLoadingCommit && project.commitFiles.isEmpty) { viewer.clear() }
+                if !showingCommit || commits.isEmpty || (!project.isLoadingCommit && project.commitFiles.isEmpty) {
+                    viewer.highlightedGroupHunks = nil
+                    viewer.clear()
+                }
                 return
             }
-            viewer.open(request)
+            let resolved = resolvedRequest(request)
+            syncGroupHunkFilter(nil, for: resolved)
+            viewer.open(resolved)
         }
     }
 
-    private func show(_ change: FileChange, in project: Project) {
-        let request = project.request(for: change, ignoreWhitespace: settings.ignoreWhitespace)
+    private func show(_ change: FileChange, in project: Project, groupHunks: Set<Int>? = nil) {
+        let request = resolvedRequest(project.request(for: change, ignoreWhitespace: settings.ignoreWhitespace))
+        syncGroupHunkFilter(groupHunks, for: request)
         if request == viewer.request {
             viewer.reloadIfStale(base: project.status.headOID)
         } else {
@@ -695,7 +794,7 @@ final class AppStore {
     }
 
     /// "Always Select Opened File": the tree follows whatever the viewer shows.
-    private func follow(_ path: String, in project: Project) {
+    func follow(_ path: String, in project: Project) {
         guard settings.followFile, sidebarVisible, project.treeSelectedID != TreeRow.fileID(path) else { return }
         project.revealInTree(path, flash: false)
     }
@@ -704,7 +803,7 @@ final class AppStore {
 
     /// How `path` is shown from the working tree: a diff while it has local changes, otherwise the file itself.
     /// While the Changes tab compares with another commit, the diff is against that commit.
-    private func worktreeRequest(for path: String, in project: Project) -> DiffRequest {
+    func worktreeRequest(for path: String, in project: Project) -> DiffRequest {
         if project.tab == .changes, let comparison = project.comparison {
             if let change = project.comparedChange(path) {
                 return project.request(compared: change, with: comparison, ignoreWhitespace: settings.ignoreWhitespace)
@@ -739,11 +838,13 @@ final class AppStore {
 
     func setTab(_ tab: ProjectTab) {
         guard let project = currentProject else { return }
+        let targetTab: ProjectTab = (AppEnvironment.isAppStore && tab == .groups) ? .changes : tab
         let wasExternal = externalRequest != nil
         exitExternalFileMode()
         if !listVisible { listVisible = true }
-        if project.tab != tab || wasExternal {
-            project.tab = tab
+        if project.tab != targetTab || wasExternal {
+            if targetTab != .groups { pendingGroupHunkFocus = nil }
+            project.tab = targetTab
             project.browsedPath = nil
             syncViewer()
         }
@@ -782,6 +883,22 @@ final class AppStore {
             for id in ChangeTree.ancestors(of: target.path, in: project.collapsed) { project.collapsed.remove(id) }
             project.selectedChangeID = ChangeRow.fileID(target.path)
             changeSelectionChanged(project)
+        case .groups:
+            guard let groups = project.aiGroupResult?.groups, !groups.isEmpty else { return false }
+            let items: [(group: AIHunkGroup, file: AIHunkGroupFile)] = groups.flatMap { group in
+                project.orderedGroupFiles(for: group, flat: settings.flatList).map { (group, $0) }
+            }
+            guard !items.isEmpty else { return false }
+            let currentIndex = items.firstIndex {
+                $0.group.id == project.selectedGroupID && $0.file.path == project.selectedGroupFilePath
+            }
+            let nextIndex = currentIndex.map { $0 + delta } ?? (delta > 0 ? 0 : items.count - 1)
+            guard items.indices.contains(nextIndex) else { return false }
+            let target = items[nextIndex]
+            for id in ChangeTree.ancestors(of: target.file.path, in: project.groupCollapsed) {
+                project.groupCollapsed.remove(id)
+            }
+            openGroupItem(project: project, group: target.group, filePath: target.file.path, hunkIndex: target.file.hunkIndices.first ?? 0)
         case .log:
             let files = ChangeTree.orderedFiles(changes: project.commitFiles, flat: settings.flatList,
                                                 filter: "", splitUnversioned: false)
@@ -807,6 +924,8 @@ final class AppStore {
     /// Opens a file by path (from a search or jump): as a diff when it has local changes, otherwise as a plain file.
     func openFile(in project: Project, path: String, line: Int?, column: Int? = nil) {
         if selectedProjectID != project.id {
+            currentProject?.cancelAIGroupGeneration()
+            pendingGroupHunkFocus = nil
             selectedProjectID = project.id
             persistProjects()
         }
@@ -819,9 +938,11 @@ final class AppStore {
         noteRecent(project, path)
         project.browsedPath = path
         viewer.setBaseStamp(project.status.headOID)
+        let request = resolvedRequest(worktreeRequest(for: path, in: project))
+        syncGroupHunkFilter(nil, for: request)
         markInChanges(path, in: project)
         let sameFile = viewer.request?.path == path && viewer.request?.root == project.url
-        viewer.open(worktreeRequest(for: path, in: project), line: line, column: column, preserveScroll: sameFile && line == nil)
+        viewer.open(request, line: line, column: column, preserveScroll: sameFile && line == nil)
     }
 
     func noteRecent(_ project: Project, _ path: String) {
@@ -900,8 +1021,9 @@ final class AppStore {
         (window?.firstResponder as? KeyCatcher.CatcherView)?.identifier?.rawValue
     }
 
-    /// ⌘0 / ⌘9: show that tool window, or hide the list if it is already showing it.
+    /// ⌘0 / ⌘8 / ⌘9: show that tool window, or hide the list if it is already showing it.
     func toggleTab(_ tab: ProjectTab) {
+        if AppEnvironment.isAppStore && tab == .groups { return }
         guard let project = currentProject else { return }
         if listVisible, project.tab == tab {
             // As in the IDE: the first press brings the keyboard to the tool window, the next one hides it.

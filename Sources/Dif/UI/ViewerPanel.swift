@@ -21,6 +21,9 @@ struct ViewerPanel: View {
 
     var body: some View {
         let viewer = store.viewer
+        let highlightedGroupHunks: Set<Int>? = viewer.request.flatMap {
+            $0.root == project.url ? project.highlightedGroupHunks(for: $0.path) : nil
+        }
         VStack(spacing: 0) {
             ViewerHeader(project: project)
             Rectangle().fill(Color.difHairline).frame(height: 1)
@@ -55,6 +58,18 @@ struct ViewerPanel: View {
             }
         }
         .background(Color.difWindow)
+        .onAppear {
+            viewer.setHighlightedGroupHunks(highlightedGroupHunks)
+        }
+        .onChange(of: highlightedGroupHunks) { _, newValue in
+            viewer.setHighlightedGroupHunks(newValue)
+        }
+        .onChange(of: store.settings.semanticDiffOptions) { _, _ in
+            viewer.syncSemanticOptions()
+        }
+        .onChange(of: viewer.diffRevision) { _, _ in
+            viewer.refreshChangedSymbols()
+        }
     }
 
     @ViewBuilder
@@ -206,25 +221,19 @@ private struct ViewerHeader: View {
                 Text(project.name).font(.ui(size: 13, weight: .medium)).foregroundStyle(Color.difText2)
             }
             Spacer(minLength: 8)
-            if viewer.request != nil {
-                if viewer.loadMilliseconds > 0 {
-                    // Load time, shown because being fast is the point.
-                    Text(String(format: "%.0f ms", viewer.loadMilliseconds))
-                        .font(.ui(size: 10.5, weight: .medium, design: .rounded))
-                        .foregroundStyle(Color.difText3)
-                        .help(L("Time to load, diff and highlight this file", "加载、比较并高亮这个文件所用的时间"))
-                }
-                if viewer.isTextDocument || viewer.isSpreadsheet {
-                    IconButton(symbol: "arrow.left", help: L("Previous file (⇧⌘[)", "上一个文件 (⇧⌘[)")) { store.stepFile(-1) }
-                    IconButton(symbol: "arrow.right", help: L("Next file (⇧⌘])", "下一个文件 (⇧⌘])")) { store.stepFile(1) }
-                }
-                if viewer.isTextDocument, let doc = viewer.document, !doc.isPlainFile {
-                    IconButton(symbol: "arrow.up", help: L("Previous Difference (⇧F7)", "上一处差异 (⇧F7)")) { viewer.stepDifference(-1) }
-                    IconButton(symbol: "arrow.down", help: L("Next Difference (F7)", "下一处差异 (F7)")) { viewer.stepDifference(1) }
-                    Divider().frame(height: 14)
-                    if !doc.isAddedOnly {
-                        IconButton(symbol: "rectangle.split.2x1", help: L("Side-by-Side (⌥⌘V)", "并排视图 (⌥⌘V)"), isActive: !store.settings.unified) {
-                            if store.settings.unified { viewer.toggleUnified() }
+            if viewer.request != nil, viewer.loadMilliseconds > 0 {
+                // Load time, shown because being fast is the point.
+                Text(String(format: "%.0f ms", viewer.loadMilliseconds))
+                    .font(.ui(size: 10.5, weight: .medium, design: .rounded))
+                    .foregroundStyle(Color.difText3)
+                    .help(L("Time to load, diff and highlight this file", "加载、比较并高亮这个文件所用的时间"))
+            }
+            if viewer.request != nil || AppEnvironment.hasTerminal {
+                HStack(spacing: 8) {
+                    if viewer.request != nil {
+                        if viewer.isTextDocument || viewer.isSpreadsheet {
+                            IconButton(symbol: "arrow.left", help: L("Previous file (⇧⌘[)", "上一个文件 (⇧⌘[)")) { store.stepFile(-1) }
+                            IconButton(symbol: "arrow.right", help: L("Next file (⇧⌘])", "下一个文件 (⇧⌘])")) { store.stepFile(1) }
                         }
                         IconButton(symbol: "rectangle.grid.1x2", help: L("Unified (⌥⌘V)", "合并视图 (⌥⌘V)"), isActive: store.settings.unified) {
                             if !store.settings.unified { viewer.toggleUnified() }

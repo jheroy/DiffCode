@@ -1064,6 +1064,57 @@ enum DiffLoader {
         var worktreeURL: URL?
         if case .worktree = request.source, newBytes != nil { worktreeURL = root.appendingPathComponent(request.path) }
         let url = worktreeURL
+
+        if let groupFilter = includedGroupHunks {
+            let shouldHighlight = max(oldBytes?.count ?? 0, newBytes?.count ?? 0) <= 4 * 1024 * 1024
+            async let computedRawHunks: [Hunk]? = (oldBytes != nil && newBytes != nil)
+                ? computeHunks(old: oldBytes, new: newBytes, ignoreWhitespace: false)
+                : []
+            let oldLines: [String]? = oldBytes.map { TextCodec.splitLines(TextCodec.decode($0)) }
+            let newLines: [String]? = newBytes.map { TextCodec.splitLines(TextCodec.decode($0)) }
+            let rightSpans: [[SyntaxSpan]]
+            if let newLines, shouldHighlight {
+                rightSpans = Highlighter.highlight(newLines, language: language)
+            } else {
+                rightSpans = []
+            }
+
+            let rawHunks: [Hunk]
+            if oldBytes == nil {
+                let count = newLines?.count ?? 0
+                rawHunks = count == 0 ? [] : [Hunk(leftStart: 0, leftCount: 0, rightStart: 0, rightCount: count)]
+                _ = await computedRawHunks
+            } else if newBytes == nil {
+                let count = oldLines?.count ?? 0
+                rawHunks = count == 0 ? [] : [Hunk(leftStart: 0, leftCount: count, rightStart: 0, rightCount: 0)]
+                _ = await computedRawHunks
+            } else if let computed = await computedRawHunks {
+                rawHunks = computed
+            } else {
+                return finish(.message(L("Could not compute diff", "无法计算差异"), detail: request.path))
+            }
+
+            let baseline = GroupFilterBaseline(
+                oldLines: oldLines,
+                newLines: newLines,
+                rawHunks: rawHunks,
+                rightSpans: rightSpans,
+                shouldHighlight: shouldHighlight,
+                hasWorktreeFile: url != nil
+            )
+            return buildGroupFiltered(
+                baseline: baseline,
+                includedGroupHunks: groupFilter,
+                language: language,
+                semanticOptions: semanticOptions,
+                ignoreWhitespace: request.ignoreWhitespace,
+                leftTitle: leftTitle,
+                rightTitle: rightTitle
+            )
+        }
+
+        // Decode and highlight both sides in parallel. The working tree side is read so that it can be edited
+        // (except in JSON normalized view, where the right side stays read-only to avoid overwriting raw formatting).
         async let leftBuffer: TextBuffer = makeBuffer(oldBytes, language)
         async let rightSide: (TextBuffer, EditInfo?) = makeRightSide(newBytes, language, worktree: url, base: oldBytes)
         async let rawHunks: [Hunk]? = computeHunks(old: oldBytes, new: newBytes, ignoreWhitespace: request.ignoreWhitespace)

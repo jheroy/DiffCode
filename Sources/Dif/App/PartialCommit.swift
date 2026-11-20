@@ -6,9 +6,11 @@ extension AppStore {
     /// The file on screen, when its changes can be picked one by one: a local change against HEAD shown as text,
     /// compared exactly (whitespace too, or a pick could take in changes that are not on screen), outside a merge or rebase.
     func pickableChange(in project: Project) -> (change: FileChange, document: DiffDocument)? {
-        guard project.comparison == nil, project.status.operation == nil, let request = viewer.request, !request.ignoreWhitespace,
+        guard project.comparison == nil, project.status.operation == nil, let request = viewer.request,
+              !request.ignoreWhitespace, !request.semantic.ignoreComments,
               !viewer.isLoading, let change = viewerChange(in: project), change.kind != .conflicted, !change.isSubmodule,
-              let document = viewer.document, case .text = document.content, !document.isPlainFile, !document.hunks.isEmpty
+              let document = viewer.document, case .text = document.content, !document.isPlainFile,
+              !document.isJSONNormalized, !document.isGroupFiltered, !document.hunks.isEmpty
         else { return nil }
         return (change, document)
     }

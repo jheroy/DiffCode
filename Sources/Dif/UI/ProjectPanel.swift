@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Middle column: a project's local changes or its commit log.
+/// Middle column: a project's local changes, AI change groups, or its commit log.
 struct ProjectPanel: View {
     @Bindable var project: Project
 
@@ -8,14 +8,16 @@ struct ProjectPanel: View {
         switch project.tab {
         case .changes:
             if project.comparison != nil { ComparisonList(project: project) } else { ChangesList(project: project) }
+        case .groups:
+            AIGroupPanel(project: project)
         case .log:
             LogPanel(project: project)
         }
     }
 }
 
-/// Top tab bar (`Changes` / `Log`) + toolbar buttons + hairline, rendered inside the top island card.
-private struct ProjectTabsHeader: View {
+/// Top tab bar (`Changes` / `Groups` / `Log`) + toolbar buttons + hairline, rendered inside the top island card.
+struct ProjectTabsHeader: View {
     @Bindable var project: Project
     @Environment(AppStore.self) private var store
 
@@ -50,41 +52,55 @@ private struct ProjectTabsHeader: View {
 
     private func tabRow(buttons: RowButtons) -> some View {
         HStack(spacing: 4) {
-            TabButton(title: L("Changes", "变更"), count: project.comparison != nil ? project.compareChanges.count : project.changes.count,
-                      shortcut: "⌘0", isSelected: project.tab == .changes) {
-                store.setTab(.changes)
-            }
-            TabButton(title: L("Log", "历史"), count: nil, shortcut: "⌘9", isSelected: project.tab == .log) {
-                store.setTab(.log)
-            }
-            Spacer(minLength: 0)
-            if buttons == .all, project.tab == .changes, project.comparison == nil {
-                let targets = store.selectedChanges(in: project).filter(AppStore.canRollback)
-                IconButton(symbol: "arrow.uturn.backward", help: L("Rollback… (⌥⌘Z)", "回滚… (⌥⌘Z)"), size: 11.5) {
-                    store.rollback(targets, in: project)
+            HStack(spacing: 4) {
+                TabButton(title: L("Changes", "变更"), count: project.comparison != nil ? project.compareChanges.count : project.changes.count,
+                          shortcut: "⌘0", isSelected: project.tab == .changes) {
+                    store.setTab(.changes)
                 }
-                .disabled(targets.isEmpty)
-                .opacity(targets.isEmpty ? 0.35 : 1)
-            }
-            if buttons != .none {
-                // The spinner takes the button's place, so nothing shifts while a refresh runs.
-                ZStack {
-                    IconButton(symbol: "arrow.clockwise", help: L("Refresh", "刷新"), size: 11.5) { store.refreshCurrent() }
-                        .opacity(project.isRefreshing ? 0 : 1)
-                    if project.isRefreshing {
-                        ProgressView().controlSize(.small).scaleEffect(0.6).allowsHitTesting(false)
+                if !AppEnvironment.isAppStore {
+                    TabButton(title: L("Groups", "分组"), count: project.aiGroupResult?.groups.count,
+                              shortcut: "⌘8", isSelected: project.tab == .groups) {
+                        store.setTab(.groups)
                     }
                 }
-            }
-            if buttons == .all, project.tab == .changes {
-                IconButton(symbol: "tray.full", help: L("Stashes…", "Stash 列表…"), size: 11.5) { store.showStashes() }
-            }
-            if buttons == .all {
-                IconButton(symbol: store.settings.flatList ? "list.bullet" : "list.bullet.indent",
-                           help: L("Toggle Tree / Flat List", "切换 目录树 / 平铺列表"), size: 12) {
-                    store.settings.flatList.toggle()
-                    store.settings.save()
+                TabButton(title: L("Log", "历史"), count: nil, shortcut: "⌘9", isSelected: project.tab == .log) {
+                    store.setTab(.log)
                 }
+            }
+            .frame(maxHeight: .infinity)
+            .titlebarClickGuard(horizontalOutset: 4)
+            Spacer(minLength: 0)
+            if buttons != .none {
+                HStack(spacing: 4) {
+                    if buttons == .all, project.tab == .changes, project.comparison == nil {
+                        let targets = store.selectedChanges(in: project).filter(AppStore.canRollback)
+                        IconButton(symbol: "arrow.uturn.backward", help: L("Rollback… (⌥⌘Z)", "回滚… (⌥⌘Z)"), size: 11.5) {
+                            store.rollback(targets, in: project)
+                        }
+                        .disabled(targets.isEmpty)
+                        .opacity(targets.isEmpty ? 0.35 : 1)
+                    }
+                    // The spinner takes the button's place, so nothing shifts while a refresh runs.
+                    ZStack {
+                        IconButton(symbol: "arrow.clockwise", help: L("Refresh", "刷新"), size: 11.5) { store.refreshCurrent() }
+                            .opacity(project.isRefreshing ? 0 : 1)
+                        if project.isRefreshing {
+                            ProgressView().controlSize(.small).scaleEffect(0.6).allowsHitTesting(false)
+                        }
+                    }
+                    if buttons == .all, project.tab == .changes {
+                        IconButton(symbol: "tray.full", help: L("Stashes…", "Stash 列表…"), size: 11.5) { store.showStashes() }
+                    }
+                    if buttons == .all, project.tab != .groups || project.aiGroupResult != nil {
+                        IconButton(symbol: store.settings.flatList ? "list.bullet" : "list.bullet.indent",
+                                   help: L("Toggle Tree / Flat List", "切换 目录树 / 平铺列表"), size: 12) {
+                            store.settings.flatList.toggle()
+                            store.settings.save()
+                        }
+                    }
+                }
+                .frame(maxHeight: .infinity)
+                .titlebarClickGuard(horizontalOutset: 4)
             }
         }
     }
@@ -667,6 +683,10 @@ struct ChangeRowView: View {
     /// The commit tick; nil where there is nothing to commit (a commit's own file list).
     var inclusion: Inclusion? = nil
     var onToggleInclusion: () -> Void = {}
+    /// Optional 0-based hunk indices belonging to the active AI group for this file row (shown as jump badges when > 1).
+    var groupHunks: [Int]? = nil
+    var activeGroupHunk: Int? = nil
+    var onSelectGroupHunk: ((Int) -> Void)? = nil
     var onToggle: () -> Void
 
     var body: some View {

@@ -283,8 +283,10 @@ final class ViewerModel: CodeCanvasDelegate {
     // MARK: Loading
 
     /// Shows `request`. A request that is already on screen is left alone unless a line is given.
-    func open(_ request: DiffRequest, line: Int? = nil, column: Int? = nil, preserveScroll: Bool = false) {
-        if request == self.request {
+    func open(_ rawRequest: DiffRequest, line: Int? = nil, column: Int? = nil, preserveScroll: Bool = false) {
+        var request = rawRequest
+        if let settings { request.semantic = settings.semanticDiffOptions }
+        if request == self.request && loadedGroupHunks == highlightedGroupHunks {
             if let line, document != nil, !isLoading {
                 let current = currentCaretPosition()
                 if line != current.row + 1 {
@@ -301,11 +303,12 @@ final class ViewerModel: CodeCanvasDelegate {
             return
         }
         if let current = self.request, let editor, editor.hasEdits, !isLoading,
+           loadedGroupHunks == highlightedGroupHunks,
            current.root == request.root, current.path == request.path {
             // The file being edited, asked for again because the typing changed its status: it left the list,
             // or came back. The text on screen is still right, and reloading it would only make it jump.
             if case .worktree(let a) = current.source, case .worktree(let b) = request.source, a == b, current.oldPath == request.oldPath,
-               current.ignoreWhitespace == request.ignoreWhitespace {
+               current.ignoreWhitespace == request.ignoreWhitespace, current.semantic == request.semantic {
                 self.request = request
                 container?.canvas.showsRevertButtons = canRevertHunks
                 onDocumentChanged?()
@@ -408,7 +411,9 @@ final class ViewerModel: CodeCanvasDelegate {
 
     func setBaseStamp(_ stamp: String?) { baseStamp = stamp }
 
-    private func load(_ request: DiffRequest, line: Int?, column: Int? = nil, preserveScroll: Bool) {
+    private func load(_ rawRequest: DiffRequest, line: Int?, column: Int? = nil, preserveScroll: Bool) {
+        var request = rawRequest
+        if let settings { request.semantic = settings.semanticDiffOptions }
         // Leaving the text, or reading it again: what was typed goes to the file first.
         saveEdits()
         self.request = request
@@ -417,9 +422,11 @@ final class ViewerModel: CodeCanvasDelegate {
         loadTask?.cancel()
         isLoading = true
         let stamp = baseStamp
+        let groupFilter = highlightedGroupHunks
+        loadedGroupHunks = groupFilter
         loadTask = Task { @MainActor [weak self] in
-            let doc = await DiffLoader.load(request)
-            guard let self, !Task.isCancelled, self.request == request else { return }
+            let doc = await DiffLoader.load(request, includedGroupHunks: groupFilter)
+            guard let self, !Task.isCancelled, self.request == request, self.loadedGroupHunks == groupFilter else { return }
             self.signature = Self.signature(for: request, base: stamp)
             self.loadedStamp = stamp
             self.apply(doc, preserveScroll: preserveScroll)
@@ -464,7 +471,14 @@ final class ViewerModel: CodeCanvasDelegate {
         armed = nil
         container?.show(doc, mode: canvasMode, preserveScroll: preserveScroll)
         container?.canvas.showsRevertButtons = canRevertHunks
-        beginEditing(doc, caret: caret)
+        if doc.isJSONNormalized {
+            readOnlyReason = doc.editing?.readOnlyReason ?? L("JSON normalized view · read-only", "JSON 语义归一化视图 · 只读")
+        } else if doc.isGroupFiltered {
+            readOnlyReason = doc.editing?.readOnlyReason ?? L("Group view · read-only", "分组视图 · 只读")
+        } else {
+            beginEditing(doc, caret: caret)
+        }
+        refreshChangedSymbols(for: doc)
         syncLSPForCurrentDocument()
         refreshConflicts()
         annotationHover = nil
@@ -521,7 +535,16 @@ final class ViewerModel: CodeCanvasDelegate {
                 self.pendingColumn = nil
                 self.reveal(line: line, column: col)
             } else if !doc.hunks.isEmpty, case .text = doc.content, !doc.isPlainFile {
-                let index = self.landOnLastHunk ? doc.hunks.count - 1 : 0
+                var index = self.landOnLastHunk ? doc.hunks.count - 1 : 0
+                if doc.isGroupFiltered,
+                   let pending = self.pendingRawHunkFocus,
+                   pending.path == self.request?.path,
+                   Date().timeIntervalSince(pending.at) < 1.5,
+                   let mapped = doc.groupHunkIndexMap[pending.rawIndex],
+                   doc.hunks.indices.contains(mapped) {
+                    index = mapped
+                    self.pendingRawHunkFocus = nil
+                }
                 let hunk = doc.hunks[index]
                 self.focusedHunk = index
                 // Ready to type where the change is, as the IDE's diff puts its caret there.
@@ -612,16 +635,47 @@ final class ViewerModel: CodeCanvasDelegate {
             return
         }
         armed = nil
-        focus(hunk: target)
+        focusFilteredHunk(target)
     }
 
+    /// Focuses a hunk by its 0-based raw hunk index (e.g. from AI Groups).
+    /// When the active document is group-filtered, maps `index` through `doc.groupHunkIndexMap`
+    /// so raw indices always land on the exact matching filtered hunk without clamping errors.
     func focus(hunk index: Int, animated: Bool = true) {
+        guard let doc = document else {
+            if let path = request?.path {
+                pendingRawHunkFocus = (path, index, Date())
+            }
+            return
+        }
+        if doc.isGroupFiltered {
+            if let mapped = doc.groupHunkIndexMap[index], doc.hunks.indices.contains(mapped) {
+                pendingRawHunkFocus = nil
+                focusFilteredHunk(mapped, animated: animated)
+            } else {
+                // Keep in case the group filter for a newly selected group arrives on the next UI tick.
+                if let path = request?.path {
+                    pendingRawHunkFocus = (path, index, Date())
+                }
+            }
+            return
+        }
+        if let path = request?.path {
+            pendingRawHunkFocus = (path, index, Date())
+        }
+        focusFilteredHunk(index, animated: animated)
+    }
+
+    /// Focuses a hunk using its direct 0-based index in `document.hunks`.
+    private func focusFilteredHunk(_ index: Int, animated: Bool = true) {
         guard let container else { return }
         let origin = currentCaretPosition()
         focusedHunk = index
         detachedFromFocus = false
         if let doc = document, doc.hunks.indices.contains(index) {
             let hunk = doc.hunks[index]
+            if hunk.rightCount > 0 { ensureLineVisible(hunk.rightStart, side: .right) }
+            if hunk.leftCount > 0 { ensureLineVisible(hunk.leftStart, side: .left) }
             if hunk.rightStart != origin.row {
                 onRecordJump?(origin.row, origin.column)
             }
