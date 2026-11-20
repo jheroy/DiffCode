@@ -390,6 +390,13 @@ struct RepoStatus: Equatable {
 
     var conflictCount: Int { changes.reduce(0) { $0 + ($1.kind == .conflicted ? 1 : 0) } }
 
+    /// Canonical identifier for the repository's active conflict set, or `nil` when no conflicts exist.
+    var conflictSignature: String? {
+        let paths = changes.filter { $0.kind == .conflicted }.map(\.path).sorted()
+        guard !paths.isEmpty else { return nil }
+        return "\(operation?.rawValue ?? "")|\(headOID ?? "")|" + paths.joined(separator: "\n")
+    }
+
     var shortHead: String { headOID.map { String($0.prefix(7)) } ?? "" }
 }
 

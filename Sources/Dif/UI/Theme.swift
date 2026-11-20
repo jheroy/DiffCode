@@ -157,6 +157,8 @@ struct CanvasTheme {
     let removedLine: CGColor, removedWord: CGColor, removedBorder: CGColor
     // SemanticDiff: moved blocks (violet-indigo), cross-hunk rename groups (6 slots), and unchanged fold bars.
     let moved: CGColor, movedWord: CGColor, movedMark: CGColor, movedBorder: CGColor, movedAccent: CGColor
+    let conflict: CGColor, conflictWord: CGColor, conflictMark: CGColor, conflictBorder: CGColor
+    let resolvedChunk: CGColor, resolvedBorder: CGColor
     let renamePalette: [RenameHighlightStyle]
     let foldBg: CGColor, foldHoverBg: CGColor, foldBorder: CGColor, foldText: CGColor
     let selection: CGColor
@@ -326,6 +328,8 @@ struct CanvasTheme {
         deleted: c(0x868A93, 0.20), deletedWord: c(0x868A93, 0.40), deletedMark: c(0x8E929B), deletedBorder: c(0x8E929B, 0.52),
         removedLine: c(0xE5534B, 0.17), removedWord: c(0xE5534B, 0.38), removedBorder: c(0xE5534B, 0.55),
         moved: c(0x9B72FF, 0.19), movedWord: c(0x9B72FF, 0.42), movedMark: c(0xB392FF), movedBorder: c(0xA882FF, 0.65), movedAccent: c(0xB392FF),
+        conflict: c(0xE5534B, 0.22), conflictWord: c(0xE5534B, 0.44), conflictMark: c(0xF26C6C), conflictBorder: c(0xF26C6C, 0.72),
+        resolvedChunk: c(0x868A93, 0.08), resolvedBorder: c(0x868A93, 0.32),
         renamePalette: darkRenamePalette,
         foldBg: c(0x262930), foldHoverBg: c(0x303540), foldBorder: c(0x3E434D), foldText: c(0x9AA2B2),
         selection: c(0x2F65CA, 0.55),
@@ -350,6 +354,8 @@ struct CanvasTheme {
         deleted: c(0x6E7481, 0.14), deletedWord: c(0x6E7481, 0.28), deletedMark: c(0x868B97), deletedBorder: c(0x6E7481, 0.46),
         removedLine: c(0xE5534B, 0.12), removedWord: c(0xE5534B, 0.28), removedBorder: c(0xE5534B, 0.48),
         moved: c(0x7C4DFF, 0.13), movedWord: c(0x7C4DFF, 0.30), movedMark: c(0x6D4AFF), movedBorder: c(0x6D4AFF, 0.55), movedAccent: c(0x6338F0),
+        conflict: c(0xE5534B, 0.14), conflictWord: c(0xE5534B, 0.30), conflictMark: c(0xD12F2F), conflictBorder: c(0xD12F2F, 0.60),
+        resolvedChunk: c(0x6E7481, 0.06), resolvedBorder: c(0x6E7481, 0.28),
         renamePalette: lightRenamePalette,
         foldBg: c(0xF2F4F8), foldHoverBg: c(0xE6EBF5), foldBorder: c(0xDCE1EB), foldText: c(0x5E6677),
         selection: c(0x3574F0, 0.28),

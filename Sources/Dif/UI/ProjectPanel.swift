@@ -287,7 +287,10 @@ struct ChangesList: View {
     private func rowMenu(_ row: ChangeRow) -> NSMenu {
         let menu = NSMenu()
         if let file = row.file, file.kind == .conflicted {
-            menu.addItem(ClosureMenuItem(L("Resolve…", "解决冲突…")) {
+            menu.addItem(ClosureMenuItem(L("3-Way Merge…", "三方合并解决…")) {
+                store.openThreeWayMerge(in: project, focusing: file.path)
+            })
+            menu.addItem(ClosureMenuItem(L("Show Conflict Diff", "查看冲突差异")) {
                 project.selectedChangeID = row.id
                 store.focusViewer()
             })
@@ -349,8 +352,12 @@ private struct OperationBanner: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 4)
+            if conflicts > 0 {
+                BannerButton(title: L("Merge…", "解决冲突…"), prominent: true) { store.openThreeWayMerge(in: project) }
+                    .help(L("Open 3-way merge tool for all conflicted files", "打开三方合并工具解决所有冲突文件"))
+            }
             if operation != .merge {
-                BannerButton(title: L("Continue", "继续"), prominent: true) { store.continueOperation(in: project) }
+                BannerButton(title: L("Continue", "继续"), prominent: conflicts == 0) { store.continueOperation(in: project) }
                     .disabled(conflicts > 0 || project.activity != nil)
                     .opacity(conflicts > 0 ? 0.45 : 1)
                 BannerButton(title: L("Skip", "跳过"), prominent: false) { store.skipOperation(in: project) }

@@ -68,6 +68,70 @@ final class TextBuffer {
         return result
     }
 
+    /// Replaces `lines[range]` with `newLines` (allowing empty-buffer and full-deletion transitions) and
+    /// incrementally updates syntax spans and lexer states. Returns the range of lines whose highlighting changed.
+    @discardableResult
+    func replaceLines(in range: Range<Int>, with newLines: [String], language: LanguageSpec) -> Range<Int> {
+        precondition(self !== TextBuffer.empty, "the shared empty buffer is never edited")
+        let clampedLower = min(max(0, range.lowerBound), lines.count)
+        let clampedUpper = min(max(clampedLower, range.upperBound), lines.count)
+        let safeRange = clampedLower..<clampedUpper
+        let oldCount = lines.count
+
+        lines.replaceSubrange(safeRange, with: newLines)
+        for row in clampedLower..<(clampedLower + newLines.count) {
+            maxColumns = max(maxColumns, Self.columns(of: lines[row]))
+        }
+
+        if lines.isEmpty {
+            spans = []
+            baseSpans = nil
+            states = states != nil ? [Highlighter.State()] : nil
+            return 0..<0
+        }
+
+        if oldCount == 0 {
+            let tracked = Highlighter.highlightTracking(lines, language: language)
+            spans = tracked.spans
+            states = tracked.states
+            baseSpans = nil
+            return 0..<lines.count
+        }
+
+        let inserted = newLines.count
+        if spans.count == oldCount {
+            spans.replaceSubrange(safeRange, with: repeatElement([], count: inserted))
+        } else {
+            spans = [[SyntaxSpan]](repeating: [], count: lines.count)
+        }
+        baseSpans = nil
+
+        if var currentStates = states, currentStates.count == oldCount + 1 {
+            // Keep state entering `clampedLower` (`currentStates[clampedLower]`) and state entering `clampedUpper` intact.
+            let removed = clampedUpper - clampedLower
+            if inserted == 0, removed > 0 {
+                currentStates.removeSubrange((clampedLower + 1)..<(clampedUpper + 1))
+            } else if removed == 0, inserted > 0 {
+                let incoming = currentStates[clampedLower]
+                currentStates.insert(contentsOf: repeatElement(Highlighter.State(), count: inserted - 1) + [incoming], at: clampedLower + 1)
+            } else if removed > 0, inserted > 0 {
+                currentStates.replaceSubrange((clampedLower + 1)..<clampedUpper,
+                                            with: repeatElement(Highlighter.State(), count: inserted - 1))
+            }
+            states = currentStates
+            if currentStates.count == lines.count + 1 {
+                let startRow = min(clampedLower, lines.count - 1)
+                let recolourCount = min(max(1, inserted), lines.count - startRow)
+                return Highlighter.rehighlight(lines, language: language, from: startRow, count: recolourCount, spans: &spans, states: &states!)
+            }
+        }
+
+        let tracked = Highlighter.highlightTracking(lines, language: language)
+        spans = tracked.spans
+        states = tracked.states
+        return 0..<lines.count
+    }
+
     /// Merges per-line LSP semantic spans over the preserved base Lexer spans.
     /// Returns the 0-based line indices whose displayed spans changed.
     @discardableResult

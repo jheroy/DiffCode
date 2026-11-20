@@ -139,6 +139,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func undoTypingOrEdit(_ sender: Any?) {
         if let manager = textUndoManager {
             if manager.canUndo { manager.undo() }
+        } else if store.popup == nil, let merge = store.mergeSession {
+            if merge.canUndo { merge.undo() } else { NSSound.beep() }
         } else if let canvas = editingCanvas, canvas.canUndoTyping {
             // Typing in the diff, and changes rolled back there.
             canvas.undoTyping()
@@ -151,6 +153,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func redoTyping(_ sender: Any?) {
         if let manager = textUndoManager {
             if manager.canRedo { manager.redo() }
+        } else if store.popup == nil, let merge = store.mergeSession {
+            if merge.canRedo { merge.redo() } else { NSSound.beep() }
         } else if let canvas = editingCanvas, canvas.canRedoTyping {
             canvas.redoTyping()
         }
@@ -269,7 +273,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self.shiftDownAt = nil
                     if let last = self.lastShiftTap, event.timestamp - last < 0.45 {
                         self.lastShiftTap = nil
-                        self.store.showQuickOpen(.all)
+                        if self.store.mergeSession == nil {
+                            self.store.showQuickOpen(.all)
+                        }
                     } else {
                         self.lastShiftTap = event.timestamp
                     }
@@ -282,11 +288,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.lastShiftTap = nil
                 // Escape while an input method composes is the input method's: it drops the composition.
                 let composing = (self.store.window?.firstResponder as? NSTextView)?.hasMarkedText() ?? false
+                let mergeComposing = self.store.mergeSession?.canvasContainer?.canvas.hasMarkedText() ?? false
                 if event.keyCode == 53, self.store.popup != nil, !composing {
                     self.store.dismissPopup()
                     return nil
                 }
-                if !composing, self.handleSecondaryShortcut(event) {
+                if event.keyCode == 53, self.store.popup == nil, let merge = self.store.mergeSession, !composing, !mergeComposing {
+                    if merge.canvasContainer?.canvas.clearTextSelection() == true {
+                        return nil
+                    }
+                    self.store.requestCloseMergeSession()
+                    return nil
+                }
+                if !composing, !mergeComposing, self.handleSecondaryShortcut(event) {
                     return nil
                 }
             case .otherMouseDown:
@@ -313,6 +327,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func handleSecondaryShortcut(_ event: NSEvent) -> Bool {
         let mods = event.modifierFlags.intersection([.shift, .control, .option, .command])
         let chars = event.charactersIgnoringModifiers?.lowercased() ?? ""
+
+        if store.popup == nil, let merge = store.mergeSession {
+            if mods == .command {
+                if event.keyCode == 125 {
+                    merge.stepConflict(1)
+                    return true
+                }
+                if event.keyCode == 126 {
+                    merge.stepConflict(-1)
+                    return true
+                }
+                if event.keyCode == 36 || event.keyCode == 76 { // ⌘↩ Apply current merge result
+                    merge.applyCurrentFile()
+                    return true
+                }
+            }
+            return false
+        }
 
         // Find in Files secondary: ⇧⌘F (alongside ⌘F in Navigate menu).
         if mods == [.shift, .command], chars == "f" {
@@ -442,7 +474,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let navigate = menu(for: .navigate, commands)
         // F7 needs Fn on most Mac keyboards, so the IDE's "Next/Previous Change" chord works too.
         for (title, key, delta) in [("Next Change", "\u{F701}", 1), ("Previous Change", "\u{F700}", -1)] {
-            let item = ClosureMenuItem(title, key: key, modifiers: [.control, .option, .shift]) { [store] in store.viewer.stepDifference(delta) }
+            let item = ClosureMenuItem(title, key: key, modifiers: [.control, .option, .shift]) { [store] in
+                if let merge = store.mergeSession { merge.stepConflict(delta) } else { store.viewer.stepDifference(delta) }
+            }
             item.isHidden = true
             item.allowsKeyEquivalentWhenHidden = true
             navigate.addItem(item)
@@ -459,9 +493,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let fullScreen = windowMenu.addItem(withTitle: L("Enter Full Screen", "进入全屏"), action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
         fullScreen.keyEquivalentModifierMask = [.command, .control]
         windowMenu.addItem(.separator())
-        // ⌘W closes the terminal that has the keyboard, and the window otherwise.
+        // ⌘W closes the terminal that has the keyboard, or the merge overlay, and the window otherwise.
         windowMenu.addItem(ClosureMenuItem(L("Close", "关闭"), key: "w", modifiers: .command) { [store] in
-            if !store.terminals.closeFocused() { NSApp.keyWindow?.performClose(nil) }
+            if store.terminals.closeFocused() { return }
+            if store.popup == nil, store.mergeSession != nil {
+                store.requestCloseMergeSession()
+                return
+            }
+            NSApp.keyWindow?.performClose(nil)
         })
         add(windowMenu, title: L("Window", "窗口"), to: main)
         NSApp.windowsMenu = windowMenu
@@ -508,6 +547,7 @@ extension AppDelegate: NSMenuItemValidation {
         if item.action == #selector(redoTyping(_:)) {
             if store.terminals.focusedID != nil { return false }
             if let manager = textUndoManager { return manager.canRedo }
+            if store.popup == nil, let merge = store.mergeSession { return merge.canRedo }
             return editingCanvas?.canRedoTyping ?? false
         }
         guard item.action == #selector(undoTypingOrEdit(_:)) else { return true }
@@ -515,6 +555,7 @@ extension AppDelegate: NSMenuItemValidation {
         // ⌘Z typed into a terminal is the terminal's, and not a request to change files.
         if store.terminals.focusedID != nil { return false }
         if let manager = textUndoManager { return manager.canUndo }
+        if store.popup == nil, let merge = store.mergeSession { return merge.canUndo }
         if let canvas = editingCanvas, canvas.canUndoTyping { return true }
         guard store.canUndoEdit else { return false }
         item.title = L("Undo Rollback / Delete", "撤销回滚 / 删除")

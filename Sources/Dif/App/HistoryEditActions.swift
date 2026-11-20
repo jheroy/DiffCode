@@ -57,10 +57,11 @@ extension AppStore {
                 case .cherryPick: title = L("The cherry-pick stopped at conflicts", "拣选在冲突处停下了")
                 case .revert: title = L("The revert stopped at conflicts", "还原在冲突处停下了")
                 }
-                showConflictsNotice(title, note: operation == .merge
+                let note = operation == .merge
                     ? L("Then commit to finish the merge, or Abort above the list to go back.", "然后提交即可完成合并；或点列表上方的“中止”回到开始之前。")
                     : L("Then Continue above the list; Skip leaves that commit out, Abort goes back to the start.",
-                        "然后点列表上方的“继续”；“跳过”会略过这个提交，“中止”回到开始之前。"))
+                        "然后点列表上方的“继续”；“跳过”会略过这个提交，“中止”回到开始之前。")
+                handleConflictsDetected(in: project, title: title, note: note)
             } else {
                 // Stopped with nothing to resolve: the commit brings in nothing the branch does not have.
                 var request = DialogRequest(style: .caution, symbol: "exclamationmark.triangle",

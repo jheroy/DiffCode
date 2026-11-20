@@ -64,6 +64,8 @@ final class AppStore {
     /// The question on screen, while `popup == .dialog`.
     var dialog: DialogRequest?
     var dialogFocusToken = 4_000_000
+    /// Active GoLand-style 3-way merge session when resolving repository conflicts.
+    var mergeSession: ThreeWayMergeSession?
     /// Where the Git graph drops down from (window coordinates, top left); nil puts it under the title bar.
     var gitGraphAnchor: CGPoint?
     /// Bumped to put the keyboard in the commit message.
@@ -128,6 +130,7 @@ final class AppStore {
         }
         // A save shows in the Changes list straight away, without waiting for the file watcher.
         viewer.onFileWritten = { [weak self] root in self?.projects.first { $0.url == root }?.refresh() }
+        viewer.onCodeFontChanged = { [weak self] in self?.mergeSession?.applyCodeFont() }
         viewer.onOpenAnnotation = { [weak self] entry in self?.openAnnotation(entry) }
         viewer.onGoToDefinition = { [weak self] line, col in self?.smartLSPNavigate(line: line, character: col) }
         viewer.onVimAction = { [weak self] action, line, col in self?.handleVimAction(action, line: line, column: col) }
@@ -359,6 +362,9 @@ final class AppStore {
     }
 
     func remove(_ project: Project) {
+        if mergeSession?.project.id == project.id {
+            closeMergeSession(rememberDismissal: false)
+        }
         // The work trees listed under it go with it; those the user added stay, on their own.
         for worktree in projects where worktree.worktreeOf == project.id {
             worktree.worktreeOf = nil
@@ -545,6 +551,20 @@ final class AppStore {
 
     private func projectDidRefresh(_ project: Project) {
         syncWorktrees(of: project)
+        if mergeSession?.project.id == project.id {
+            mergeSession?.refreshFromProjectStatus()
+        }
+        let currentSig = project.status.conflictSignature
+        if project.id == selectedProjectID,
+           settings.autoOpenThreeWayMerge,
+           project.hadLoadedBeforeLastRefresh,
+           mergeSession == nil,
+           let currentSig,
+           currentSig != project.lastConflictSignature,
+           currentSig != project.dismissedConflictSignature {
+            openThreeWayMerge(in: project, automatic: true)
+        }
+        project.lastConflictSignature = currentSig
         guard project.id == selectedProjectID else { return }
         if sidebarVisible { project.loadTree() }
         syncViewer()
@@ -981,6 +1001,7 @@ final class AppStore {
         settings.save()
         viewer.applyCodeFont()
         finder.applyCodeFont()
+        mergeSession?.applyCodeFont()
     }
 
     func chooseCodeFontMainWeight(_ weight: CodeFontWeight) {
@@ -989,6 +1010,7 @@ final class AppStore {
         settings.save()
         viewer.applyCodeFont()
         finder.applyCodeFont()
+        mergeSession?.applyCodeFont()
     }
 
     func chooseCodeFontBoldWeight(_ weight: CodeFontWeight) {
@@ -997,6 +1019,7 @@ final class AppStore {
         settings.save()
         viewer.applyCodeFont()
         finder.applyCodeFont()
+        mergeSession?.applyCodeFont()
     }
 
     func setCodeFontLigatures(_ enabled: Bool) {
@@ -1005,6 +1028,7 @@ final class AppStore {
         settings.save()
         viewer.applyCodeFont()
         finder.applyCodeFont()
+        mergeSession?.applyCodeFont()
     }
 
     /// A font family picked in Settings for terminals; nil puts back the default face.

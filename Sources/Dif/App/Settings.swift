@@ -144,6 +144,8 @@ final class Settings {
     var vimRelativeLineNumbers: Bool
     /// Show the Beyond Compare-style bottom inline line diff bar under the code viewer.
     var showLineDiffBar: Bool
+    /// Automatically open the 3-way merge window whenever Git stops at merge/rebase/cherry-pick/stash conflicts.
+    var autoOpenThreeWayMerge: Bool
     /// Distinct local AI task roles that can independently select their provider and model.
     enum AITask: String, CaseIterable, Sendable {
         case commit
@@ -264,6 +266,7 @@ final class Settings {
         vimMode = defaults.object(forKey: "vimMode") as? Bool ?? true
         vimRelativeLineNumbers = defaults.object(forKey: "vimRelativeLineNumbers") as? Bool ?? false
         showLineDiffBar = defaults.object(forKey: "showLineDiffBar") as? Bool ?? true
+        autoOpenThreeWayMerge = defaults.object(forKey: "autoOpenThreeWayMerge") as? Bool ?? true
         let legacyProvider = AgentProvider(rawValue: defaults.string(forKey: "aiAgentProvider") ?? "") ?? .agy
         let legacyModels = defaults.dictionary(forKey: "aiAgentModels") as? [String: String] ?? [:]
         aiCommitProvider = AgentProvider(rawValue: defaults.string(forKey: "aiCommitProvider") ?? "") ?? legacyProvider
@@ -305,6 +308,7 @@ final class Settings {
         defaults.set(vimMode, forKey: "vimMode")
         defaults.set(vimRelativeLineNumbers, forKey: "vimRelativeLineNumbers")
         defaults.set(showLineDiffBar, forKey: "showLineDiffBar")
+        defaults.set(autoOpenThreeWayMerge, forKey: "autoOpenThreeWayMerge")
         defaults.set(aiCommitProvider.rawValue, forKey: "aiCommitProvider")
         defaults.set(aiCommitModels, forKey: "aiCommitModels")
         defaults.set(aiGroupingProvider.rawValue, forKey: "aiGroupingProvider")

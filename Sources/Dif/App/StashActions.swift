@@ -93,8 +93,9 @@ extension AppStore {
                 let clashes = (try? await Git.runString(["diff", "--name-only", "--diff-filter=U"], in: project.url)) ?? ""
                 if !clashes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     self.leaveStash(entry, in: project)
-                    self.showConflictsNotice(L("The stash clashes with your files", "这个 stash 与你的文件有冲突"),
-                                             note: L("The stash stays in the list until you drop it.", "这个 stash 会留在列表里，直到你删除它。"))
+                    self.handleConflictsDetected(in: project,
+                                                 title: L("The stash clashes with your files", "这个 stash 与你的文件有冲突"),
+                                                 note: L("The stash stays in the list until you drop it.", "这个 stash 会留在列表里，直到你删除它。"))
                 } else if Git.refusedForLocalChanges(message) {
                     self.showFailure(L("Your local changes are in the way", "本地改动挡住了 stash"), error,
                                      note: L("Commit or stash them first, then apply this one.", "请先提交或暂存它们，再应用这个 stash。"))

@@ -630,6 +630,44 @@ enum DebugHooks {
             let viewer = store.viewer
             let blocks = ConflictBlock.find(in: viewer.document?.right.lines ?? [])
             FileHandle.standardError.write(Data("conflict: shows=\(viewer.showsConflicts) count=\(viewer.conflictCount) blocks=\(blocks.map { "\($0.start)-\($0.end)" }) left=\(viewer.document?.leftTitle ?? "-") right=\(viewer.document?.rightTitle ?? "-") viewer=\(describeViewer(store)) dirty=\(viewer.isDirty)\n".utf8))
+        case "openmerge":
+            store.openThreeWayMerge(in: store.currentProject, focusing: argument.isEmpty ? nil : argument)
+        case "mergeapplynonconflict":
+            let filter: MergeSide? = argument == "left" ? .left : argument == "right" ? .right : nil
+            _ = store.mergeSession?.applyAllNonConflicting(sideFilter: filter)
+        case "mergeaccept", "mergeignore":
+            let bits = argument.split(separator: "|").map(String.init)
+            if bits.count == 2, let idx = Int(bits[0]), let side = MergeSide(rawValue: bits[1]) {
+                if parts[0] == "mergeaccept" {
+                    store.mergeSession?.acceptSide(side, chunk: idx)
+                } else {
+                    store.mergeSession?.ignoreSide(side, chunk: idx)
+                }
+            }
+        case "mergeresolve":
+            let bits = argument.split(separator: "|").map(String.init)
+            if bits.count == 2, let idx = Int(bits[0]) {
+                let choice: ConflictResolutionChoice?
+                switch bits[1] {
+                case "left": choice = .acceptLeft
+                case "right": choice = .acceptRight
+                case "bothLR": choice = .acceptBothLeftFirst
+                case "bothRL": choice = .acceptBothRightFirst
+                case "base": choice = .keepBase
+                default: choice = nil
+                }
+                if let choice { store.mergeSession?.resolveConflict(idx, choice: choice) }
+            }
+        case "mergeundo": store.mergeSession?.undo()
+        case "mergeredo": store.mergeSession?.redo()
+        case "mergeapply": store.mergeSession?.applyCurrentFile(force: argument != "confirm")
+        case "mergeclose": store.closeMergeSession(rememberDismissal: true)
+        case "mergestate":
+            let session = store.mergeSession
+            let doc = session?.currentDocument
+            let filesList = session?.files.map { "\($0.path):\($0.isResolved ? "ok" : "open")" } ?? []
+            let titlesText = doc.map { "\($0.titles.left)|\($0.titles.center)|\($0.titles.right)" } ?? "-"
+            FileHandle.standardError.write(Data("merge: open=\(session != nil) file=\(session?.selectedPath ?? "-") files=\(filesList) chunks=\(doc?.chunks.count ?? -1) unresolvedConflicts=\(doc?.unresolvedConflictCount ?? -1) unresolvedNonConflicts=\(doc?.unresolvedNonConflictCount ?? -1) canUndo=\(session?.canUndo ?? false) canRedo=\(session?.canRedo ?? false) titles=\(titlesText) toast=\(store.toast ?? "-")\n".utf8))
         case "opstate":
             if let project = store.currentProject {
                 let s = project.status

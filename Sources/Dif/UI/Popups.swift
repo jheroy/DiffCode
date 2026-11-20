@@ -1657,6 +1657,15 @@ struct SettingsView: View {
                         .labelsHidden()
                         .frame(width: UI.s(240))
                     }
+                    row(L("Auto-open 3-way merge on conflicts", "遇到冲突时自动打开三方合并")) {
+                        Toggle("", isOn: Binding(
+                            get: { settings.autoOpenThreeWayMerge },
+                            set: { settings.autoOpenThreeWayMerge = $0; settings.save() }
+                        ))
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .labelsHidden()
+                    }
                     if !AppEnvironment.isAppStore {
                         aiCommitSection(settings: settings)
                     }

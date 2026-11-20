@@ -127,6 +127,12 @@ final class Project: Identifiable {
     @ObservationIgnored private(set) var gitDirectory: URL?
     /// What the left side shows for a file in conflict.
     var conflictBase: ConflictBase = .head
+    /// Conflict signature dismissed by the user so background refreshes do not repeatedly re-open 3-way merge.
+    @ObservationIgnored var dismissedConflictSignature: String?
+    /// Most recently observed conflict signature from `status`.
+    @ObservationIgnored var lastConflictSignature: String?
+    /// Tracks whether `hasLoaded` was already true before the most recent `refresh()` completed.
+    @ObservationIgnored var hadLoadedBeforeLastRefresh = false
     /// The merge message put in the box, so that it goes again if the merge is abandoned rather than committed.
     @ObservationIgnored private var prefilledMessage: String?
 
@@ -626,6 +632,9 @@ final class Project: Identifiable {
                     self.prefilledMessage = nil
                 }
                 if fresh != self.status { self.status = fresh }
+                if fresh.conflictCount == 0 {
+                    self.dismissedConflictSignature = nil
+                }
                 // Ticks of files that are no longer changed mean nothing, and must not come back if the file changes again.
                 let paths = Set(fresh.changes.map(\.path))
                 if self.commitOverrides.keys.contains(where: { !paths.contains($0) }) {
@@ -638,6 +647,7 @@ final class Project: Identifiable {
             } catch {
                 self.errorMessage = error.localizedDescription
             }
+            self.hadLoadedBeforeLastRefresh = self.hasLoaded
             self.hasLoaded = true
             self.isRefreshing = false
             self.lastRefresh = Date()

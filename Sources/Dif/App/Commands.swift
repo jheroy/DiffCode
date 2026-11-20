@@ -198,9 +198,13 @@ extension AppStore {
             AppCommand(id: "nav.forward", title: L("Navigate Forward", "前进"), symbol: "chevron.right", group: .navigate,
                        key: "]", modifiers: .command) { [weak self] in self?.navigateForward() },
             AppCommand(id: "nav.nextDiff", title: L("Next Difference", "下一处差异"), symbol: "arrow.down", group: .navigate,
-                       key: KeyLabel.function(7), separatorBefore: true) { viewer.stepDifference(1) },
+                       key: KeyLabel.function(7), separatorBefore: true) { [weak self] in
+                if let merge = self?.mergeSession { merge.stepConflict(1) } else { viewer.stepDifference(1) }
+            },
             AppCommand(id: "nav.prevDiff", title: L("Previous Difference", "上一处差异"), symbol: "arrow.up", group: .navigate,
-                       key: KeyLabel.function(7), modifiers: .shift) { viewer.stepDifference(-1) },
+                       key: KeyLabel.function(7), modifiers: .shift) { [weak self] in
+                if let merge = self?.mergeSession { merge.stepConflict(-1) } else { viewer.stepDifference(-1) }
+            },
             // In the IDE these keys mean "next tab" wherever you are; with a terminal focused they walk the terminals.
             AppCommand(id: "nav.nextFile", title: L("Compare Next File", "下一个文件"), symbol: "arrow.right.doc.on.clipboard", group: .navigate,
                        key: "]", modifiers: [.command, .shift]) { [weak self] in
@@ -248,8 +252,11 @@ extension AppStore {
             AppCommand(id: "git.stashes", title: L("Stashes…", "Stash 列表…"), symbol: "tray.full", group: .git) { [weak self] in
                 self?.showStashes()
             },
-            AppCommand(id: "git.continue", title: L("Continue Merge / Rebase", "继续合并 / 变基"), symbol: "play.circle", group: .git,
-                       separatorBefore: true) { [weak self] in
+            AppCommand(id: "git.resolveConflicts", title: L("Resolve Conflicts (3-Way Merge)…", "解决冲突（三方合并）…"), symbol: "arrow.triangle.merge",
+                       group: .git, separatorBefore: true) { [weak self] in
+                self?.openThreeWayMerge()
+            },
+            AppCommand(id: "git.continue", title: L("Continue Merge / Rebase", "继续合并 / 变基"), symbol: "play.circle", group: .git) { [weak self] in
                 self?.continueOperation()
             },
             AppCommand(id: "git.abort", title: L("Abort Merge / Rebase…", "中止合并 / 变基…"), symbol: "xmark.octagon", group: .git) { [weak self] in

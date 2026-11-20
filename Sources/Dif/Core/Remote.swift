@@ -197,6 +197,11 @@ extension Git {
         _ = try await run(["--literal-pathspecs", "add", "--"] + paths, in: dir)
     }
 
+    /// Resolves a delete/modify or both-deleted conflict by removing the path from the index and working tree.
+    static func removeResolved(_ paths: [String], in dir: URL) async throws {
+        _ = try await run(["--literal-pathspecs", "rm", "-f", "-q", "--ignore-unmatch", "--"] + paths, in: dir)
+    }
+
     /// Resolves a file in conflict by taking one side whole.
     static func takeSide(_ side: ConflictSide, path: String, in dir: URL) async throws {
         _ = try await run(["--literal-pathspecs", "checkout", side.flag, "--", path], in: dir)

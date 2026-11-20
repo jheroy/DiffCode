@@ -198,13 +198,22 @@ extension AppStore {
             } catch {
                 guard let self else { return }
                 self.afterBranchesChanged(project)
-                var request = DialogRequest(style: .caution, symbol: "exclamationmark.triangle",
-                                            title: L("Checked out \(title) · some of your changes clash with it", "已检出 \(title) · 部分本地改动与它冲突"),
-                                            message: L("The clashing files are marked as conflicts in the Changes list: resolve them there. Your changes also stay in git's stash (stash@{0}) until you drop it.",
-                                                       "冲突的文件已在变更列表中标出，请在那里解决。你的改动也仍保存在 git 的 stash（stash@{0}）里，直到你删除它。"),
-                                            confirmTitle: L("OK", "好"), cancelTitle: nil)
-                request.output = error.localizedDescription
-                self.ask(request)
+                let clashes = (try? await Git.runString(["diff", "--name-only", "--diff-filter=U"], in: project.url)) ?? ""
+                if self.settings.autoOpenThreeWayMerge, !clashes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    self.handleConflictsDetected(
+                        in: project,
+                        title: L("Checked out \(title) · some of your changes clash with it", "已检出 \(title) · 部分本地改动与它冲突"),
+                        note: L("Your changes also stay in git's stash (stash@{0}) until you drop it.", "你的改动也仍保存在 git 的 stash（stash@{0}）里，直到你删除它。")
+                    )
+                } else {
+                    var request = DialogRequest(style: .caution, symbol: "exclamationmark.triangle",
+                                                title: L("Checked out \(title) · some of your changes clash with it", "已检出 \(title) · 部分本地改动与它冲突"),
+                                                message: L("The clashing files are marked as conflicts in the Changes list: resolve them there. Your changes also stay in git's stash (stash@{0}) until you drop it.",
+                                                           "冲突的文件已在变更列表中标出，请在那里解决。你的改动也仍保存在 git 的 stash（stash@{0}）里，直到你删除它。"),
+                                                confirmTitle: L("OK", "好"), cancelTitle: nil)
+                    request.output = error.localizedDescription
+                    self.ask(request)
+                }
             }
         }
     }
@@ -263,8 +272,9 @@ extension AppStore {
                 self.afterBranchesChanged(project)
                 if !clashes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     // The pull went through, but putting the local changes back clashed with it.
-                    self.showConflictsNotice(L("Pulled · your local changes clash with what came in", "已拉取 · 本地改动与拉下来的内容冲突"),
-                                             note: L("Your changes also stay in git's stash until you drop it.", "你的改动也仍保存在 git 的 stash 里，直到你删除它。"))
+                    self.handleConflictsDetected(in: project,
+                                                 title: L("Pulled · your local changes clash with what came in", "已拉取 · 本地改动与拉下来的内容冲突"),
+                                                 note: L("Your changes also stay in git's stash until you drop it.", "你的改动也仍保存在 git 的 stash 里，直到你删除它。"))
                 } else if before == after {
                     self.showToast(L("Already up to date with \(upstream)", "已是最新，与 \(upstream) 一致"))
                 } else {
@@ -283,7 +293,7 @@ extension AppStore {
                             || message.contains("commit or stash them") || message.contains("commit your changes or stash them") {
                     self.offerAutostashPull(upstream, mode: mode, in: project, error: error)
                 } else if let directory = project.gitDirectory, Git.operation(in: directory) != nil {
-                    self.showConflictsNotice(L("The pull stopped at conflicts", "拉取在冲突处停下了"), note: nil)
+                    self.handleConflictsDetected(in: project, title: L("The pull stopped at conflicts", "拉取在冲突处停下了"), note: nil)
                 } else {
                     self.showFailure(L("Pull failed", "拉取失败"), error, note: self.remoteNote(error))
                 }
@@ -499,7 +509,7 @@ extension AppStore {
                 if let directory = project.gitDirectory, Git.operation(in: directory) != nil,
                    let clashes = try? await Git.runString(["diff", "--name-only", "--diff-filter=U"], in: project.url),
                    !clashes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    self.showConflictsNotice(L("Stopped at more conflicts", "又在冲突处停下了"), note: nil)
+                    self.handleConflictsDetected(in: project, title: L("Stopped at more conflicts", "又在冲突处停下了"), note: nil)
                 } else {
                     self.showFailure(L("Could not continue the \(operation.command)", "无法继续 \(operation.command)"), error)
                 }

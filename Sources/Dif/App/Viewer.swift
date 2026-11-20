@@ -111,6 +111,7 @@ final class ViewerModel: CodeCanvasDelegate {
     /// The base the document on screen was loaded against.
     @ObservationIgnored var loadedStamp: String?
     @ObservationIgnored var onFileWritten: ((URL) -> Void)?
+    @ObservationIgnored var onCodeFontChanged: (() -> Void)?
     @ObservationIgnored var observers: [NSObjectProtocol] = []
 
     // Annotate (see ViewerAnnotate.swift).
@@ -967,6 +968,7 @@ final class ViewerModel: CodeCanvasDelegate {
     /// Draws the code in the font Settings asks for now.
     func applyCodeFont() {
         container?.canvas.codeFont = CodeFont.current(settings)
+        onCodeFontChanged?()
     }
 
     func focusCanvas() {

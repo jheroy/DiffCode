@@ -146,6 +146,23 @@ private struct ConflictBar: View {
             .help(L("What the left side shows: HEAD’s version, the common ancestor, or the incoming one", "左侧显示的版本：HEAD 的、共同祖先的，或传入的"))
             Spacer(minLength: 8)
             Button {
+                store.openThreeWayMerge(in: project, focusing: path)
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.triangle.merge")
+                        .font(.ui(size: 10.5, weight: .semibold))
+                    Text(L("3-Way Merge…", "三方合并…"))
+                        .font(.ui(size: 11.5, weight: .semibold))
+                }
+                .foregroundStyle(Color.white)
+                .padding(.horizontal, 10)
+                .frame(height: UI.s(24))
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.difAccent))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .fixedSize()
+            Button {
                 store.markResolved(path, in: project)
             } label: {
                 Text(L("Mark as Resolved", "标记为已解决"))

@@ -51,6 +51,11 @@ struct RootView: View {
             }
             .padding(IslandStyle.outerPadding)
 
+            if let session = store.mergeSession {
+                ThreeWayMergeView(session: session)
+                    .zIndex(5)
+            }
+
             if let popup = store.popup {
                 PopupLayer(popup: popup)
                     .transition(.opacity.animation(.easeOut(duration: 0.1)))
