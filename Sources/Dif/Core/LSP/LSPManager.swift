@@ -98,6 +98,19 @@ actor LSPManager {
         return servers[key]?.openDocuments[normalized]
     }
 
+    /// Returns captured trailing stderr output for the server currently owning `uri`, if running.
+    func recentStderr(forURI uri: String) async -> String? {
+        let normalized = LSPURI.normalize(uri)
+        guard let key = documentToServer[normalized],
+              let server = servers[key] else { return nil }
+        return await server.transport.recentStderr()
+    }
+
+    /// Convenience `fileURL` overload for `recentStderr`.
+    func recentStderr(forFileURL fileURL: URL) async -> String? {
+        await recentStderr(forURI: LSPURI.uri(from: fileURL))
+    }
+
     // MARK: - Workspace Queries (UI Helpers)
 
     /// Returns all workspace / member roots associated with `fileURL` (including all `go.work` repos).
@@ -667,10 +680,14 @@ actor LSPManager {
         }
 
         let configSettings = descriptor.configurationSettings
+        let effectiveEnvironment = LSPServerRegistry.mergedEnvironment(
+            base: resolved.environment,
+            defaults: descriptor.extraEnvironment
+        )
         let transport = LSPTransport(
             executable: resolved.executablePath,
             arguments: resolved.arguments,
-            environment: resolved.environment,
+            environment: effectiveEnvironment,
             workingDirectory: workspace.rootURL,
             onNotification: nil,
             onServerRequest: { method, params in

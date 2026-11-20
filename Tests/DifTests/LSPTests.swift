@@ -389,7 +389,10 @@ final class LSPTests: XCTestCase {
 
     func testServerRegistryMappingsAndPythonFallbackPriority() throws {
         XCTAssertEqual(LSPServerRegistry.descriptor(for: .go)?.candidates.first?.executableName, "gopls")
-        XCTAssertEqual(LSPServerRegistry.descriptor(for: .go)?.candidates.first?.arguments, ["serve"])
+        XCTAssertEqual(
+            LSPServerRegistry.descriptor(for: .go)?.candidates.first?.arguments,
+            ["-remote=auto", "-remote.listen.timeout=2m"]
+        )
         XCTAssertEqual(LSPServerRegistry.descriptor(for: .go)?.initializationOptions?["semanticTokens"]?.boolValue, true)
 
         XCTAssertEqual(LSPServerRegistry.descriptor(for: .rust)?.candidates.first?.executableName, "rust-analyzer")
@@ -417,6 +420,100 @@ final class LSPTests: XCTestCase {
             LSPServerRegistry.resolveServer(for: LSPServerRegistry.python, searchPaths: [binDir.path], environment: [:])
         )
         XCTAssertEqual(secondResolved.executablePath, basedpyright.path)
+    }
+
+    func testGoplsLightweightDescriptorConfiguration() throws {
+        let goDesc = LSPServerRegistry.go
+        let cmd = try XCTUnwrap(goDesc.candidates.first)
+        XCTAssertEqual(cmd.executableName, "gopls")
+        XCTAssertEqual(cmd.arguments, ["-remote=auto", "-remote.listen.timeout=2m"])
+        XCTAssertEqual(goDesc.extraEnvironment, ["GOGC": "50", "GOMEMLIMIT": "1GiB"])
+        XCTAssertEqual(goDesc.initializationOptions, goDesc.configurationSettings)
+
+        for label in ["initializationOptions", "configurationSettings"] {
+            let settings = try XCTUnwrap(
+                label == "initializationOptions" ? goDesc.initializationOptions : goDesc.configurationSettings,
+                "Missing \(label) on gopls descriptor"
+            )
+            XCTAssertEqual(settings["semanticTokens"]?.boolValue, true)
+            XCTAssertEqual(settings["diagnosticsTrigger"]?.stringValue, "Save")
+            XCTAssertEqual(settings["staticcheck"]?.boolValue, false)
+            XCTAssertEqual(settings["vulncheck"]?.stringValue, "Off")
+            XCTAssertEqual(settings["analysisProgressReporting"]?.boolValue, false)
+            XCTAssertEqual(settings["completeFunctionCalls"]?.boolValue, false)
+            XCTAssertEqual(settings["experimentalPostfixCompletions"]?.boolValue, false)
+            XCTAssertEqual(settings["hoverKind"]?.stringValue, "NoDocumentation")
+            XCTAssertEqual(settings["linksInHover"]?.boolValue, false)
+            XCTAssertEqual(settings["hints"]?.objectValue, [:])
+
+            let codelenses = try XCTUnwrap(settings["codelenses"]?.objectValue)
+            for lens in ["generate", "regenerate_cgo", "run_govulncheck", "tidy", "upgrade_dependency", "vendor"] {
+                XCTAssertEqual(codelenses[lens]?.boolValue, false, "Expected codelens \(lens) disabled")
+            }
+
+            let analyses = try XCTUnwrap(settings["analyses"]?.objectValue)
+            XCTAssertFalse(analyses.isEmpty, "Expected explicit disabled analyzers map")
+            XCTAssertNil(analyses["none"], "gopls does not support analyses.none; analyzers must be disabled explicitly")
+            for (name, val) in analyses {
+                XCTAssertEqual(val.boolValue, false, "Expected analyzer \(name) to be false")
+            }
+            for key in ["printf", "unreachable", "unusedparams", "unusedvariable", "modernize", "nilness", "copylocks"] {
+                XCTAssertEqual(analyses[key]?.boolValue, false, "Expected default-on analyzer \(key) disabled")
+            }
+
+            let filters = try XCTUnwrap(settings["directoryFilters"]?.arrayValue).compactMap(\.stringValue)
+            XCTAssertEqual(filters, ["-**/node_modules", "-**/.git", "-**/dist", "-**/build", "-**/testdata"])
+            XCTAssertFalse(filters.contains(where: { $0.contains("vendor") }), "Do not exclude vendor directories")
+        }
+    }
+
+    func testServerEnvironmentMergeRespectsUserOverrides() throws {
+        // Direct merge helper: injects missing defaults and preserves user overrides.
+        let defaults = ["GOGC": "50", "GOMEMLIMIT": "1GiB"]
+        let mergedEmpty = LSPServerRegistry.mergedEnvironment(base: ["PATH": "/usr/bin"], defaults: defaults)
+        XCTAssertEqual(mergedEmpty["PATH"], "/usr/bin")
+        XCTAssertEqual(mergedEmpty["GOGC"], "50")
+        XCTAssertEqual(mergedEmpty["GOMEMLIMIT"], "1GiB")
+
+        let mergedOverride = LSPServerRegistry.mergedEnvironment(
+            base: ["PATH": "/usr/bin", "GOGC": "200", "GOMEMLIMIT": "4GiB"],
+            defaults: defaults
+        )
+        XCTAssertEqual(mergedOverride["GOGC"], "200")
+        XCTAssertEqual(mergedOverride["GOMEMLIMIT"], "4GiB")
+
+        let mergedPartial = LSPServerRegistry.mergedEnvironment(
+            base: ["GOGC": "off"],
+            defaults: defaults
+        )
+        XCTAssertEqual(mergedPartial["GOGC"], "off")
+        XCTAssertEqual(mergedPartial["GOMEMLIMIT"], "1GiB")
+
+        // Verify resolveServer(for: .go) merges extraEnvironment while preserving caller overrides.
+        let binDir = try makeTempDir(prefix: "dif-gopls-env")
+        let fakeGopls = binDir.appendingPathComponent("gopls")
+        try writeFile(fakeGopls, contents: "#!/bin/sh\nexit 0\n", executable: true)
+
+        let resolvedDefaults = try XCTUnwrap(
+            LSPServerRegistry.resolveServer(
+                for: LSPServerRegistry.go,
+                searchPaths: [binDir.path],
+                environment: ["PATH": binDir.path]
+            )
+        )
+        XCTAssertEqual(resolvedDefaults.arguments, ["-remote=auto", "-remote.listen.timeout=2m"])
+        XCTAssertEqual(resolvedDefaults.environment["GOGC"], "50")
+        XCTAssertEqual(resolvedDefaults.environment["GOMEMLIMIT"], "1GiB")
+
+        let resolvedUserOverride = try XCTUnwrap(
+            LSPServerRegistry.resolveServer(
+                for: LSPServerRegistry.go,
+                searchPaths: [binDir.path],
+                environment: ["PATH": binDir.path, "GOGC": "100"]
+            )
+        )
+        XCTAssertEqual(resolvedUserOverride.environment["GOGC"], "100")
+        XCTAssertEqual(resolvedUserOverride.environment["GOMEMLIMIT"], "1GiB")
     }
 
     func testParseMarkedNullDelimitedEnvIgnoresBannerNoise() {
@@ -682,7 +779,6 @@ final class LSPTests: XCTestCase {
               LSPBinaryLocator.resolve(executable: "go") != nil else {
             throw XCTSkip("gopls or go toolchain not installed in PATH")
         }
-        _ = goplsResolved
 
         let root = try makeTempDir(prefix: "dif-real-gopls")
         let repoA = root.appendingPathComponent("repoA", isDirectory: true)
@@ -791,9 +887,80 @@ final class LSPTests: XCTestCase {
             "Expected gopls references(includeDeclaration: true) to include cross-repo call site in repoA/main.go:5, got: \(refsWithDecl)"
         )
 
+        // 5. Verify gopls launched in -remote=auto lightweight mode with zero flag/option errors on stderr
+        let stderr = await manager.recentStderr(forFileURL: mainURL) ?? ""
+        let lowerStderr = stderr.lowercased()
+        XCTAssertFalse(lowerStderr.contains("flag provided but not defined"), "Unexpected gopls flag error on stderr: \(stderr)")
+        XCTAssertFalse(lowerStderr.contains("invalid settings"), "Unexpected gopls invalid settings on stderr: \(stderr)")
+        XCTAssertFalse(lowerStderr.contains("unexpected setting"), "Unexpected gopls option warning on stderr: \(stderr)")
+        XCTAssertFalse(lowerStderr.contains("unknown"), "Unexpected gopls unknown-option message on stderr: \(stderr)")
+
         await manager.shutdownAll()
         let remaining = await manager.runningServerCount()
         XCTAssertEqual(remaining, 0)
+
+        // 6. Verify direct LSPTransport handshake with gopls lightweight options produces zero Invalid settings notifications
+        final class NotificationCollector: @unchecked Sendable {
+            private let lock = NSLock()
+            private var messages: [(type: Int, message: String)] = []
+            func append(type: Int, message: String) {
+                lock.lock()
+                messages.append((type, message))
+                lock.unlock()
+            }
+            func snapshot() -> [(type: Int, message: String)] {
+                lock.lock()
+                defer { lock.unlock() }
+                return messages
+            }
+        }
+        let notifications = NotificationCollector()
+        let directTransport = LSPTransport(
+            executable: goplsResolved.executablePath,
+            arguments: goplsResolved.arguments,
+            environment: goplsResolved.environment,
+            workingDirectory: root,
+            onNotification: { method, params in
+                if method == "window/showMessage",
+                   let msg = params?["message"]?.stringValue {
+                    let msgType = params?["type"]?.intValue ?? 3
+                    notifications.append(type: msgType, message: msg)
+                }
+            },
+            onServerRequest: { method, params in
+                LSPTransport.defaultServerRequestResponse(
+                    method: method,
+                    params: params,
+                    configurationSettings: LSPServerRegistry.go.configurationSettings
+                )
+            }
+        )
+        try await directTransport.start()
+        var directInitParams: [String: JSONValue] = [
+            "processId": .int(Int(ProcessInfo.processInfo.processIdentifier)),
+            "rootUri": .string(LSPURI.uri(from: root)),
+            "workspaceFolders": .array([
+                .object(["uri": .string(LSPURI.uri(from: root)), "name": .string(root.lastPathComponent)]),
+            ]),
+            "capabilities": .object([
+                "workspace": .object(["workspaceFolders": .bool(true), "configuration": .bool(true)]),
+            ]),
+        ]
+        if let initOptions = LSPServerRegistry.go.initializationOptions {
+            directInitParams["initializationOptions"] = initOptions
+        }
+        _ = try await directTransport.request(method: "initialize", params: .object(directInitParams), timeout: .seconds(15))
+        try await directTransport.notify(method: "initialized", params: .object([:]))
+        try await Task.sleep(for: .milliseconds(300))
+
+        let directStderr = await directTransport.recentStderr()
+        XCTAssertFalse(directStderr.lowercased().contains("flag provided but not defined"), "Unexpected direct stderr: \(directStderr)")
+        XCTAssertFalse(directStderr.lowercased().contains("unexpected setting"), "Unexpected direct stderr: \(directStderr)")
+        let errorMessages = notifications.snapshot().filter { entry in
+            entry.type <= 2 || entry.message.localizedCaseInsensitiveContains("invalid settings") || entry.message.localizedCaseInsensitiveContains("unexpected setting")
+        }
+        XCTAssertTrue(errorMessages.isEmpty, "gopls reported settings warnings/errors: \(errorMessages)")
+        await directTransport.shutdown()
     }
 
     // MARK: - 8. Mock LSP Server textDocument/references (Dedup, includeDeclaration, Null/Empty, Gating)

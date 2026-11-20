@@ -24,6 +24,28 @@ struct LSPServerDescriptor: Sendable, Equatable, Hashable {
     let initializationOptions: JSONValue?
     /// Optional configuration payload returned for server-to-client `workspace/configuration` requests.
     let configurationSettings: JSONValue?
+    /// Default environment variables injected when launching the server if not already set in the user's environment.
+    let extraEnvironment: [String: String]
+
+    init(
+        id: String,
+        languageNames: [String],
+        languageIDs: [String],
+        candidates: [LSPServerCommand],
+        defaultLanguageID: String,
+        initializationOptions: JSONValue?,
+        configurationSettings: JSONValue?,
+        extraEnvironment: [String: String] = [:]
+    ) {
+        self.id = id
+        self.languageNames = languageNames
+        self.languageIDs = languageIDs
+        self.candidates = candidates
+        self.defaultLanguageID = defaultLanguageID
+        self.initializationOptions = initializationOptions
+        self.configurationSettings = configurationSettings
+        self.extraEnvironment = extraEnvironment
+    }
 }
 
 /// A resolved, ready-to-launch LSP server binary and environment.
@@ -36,15 +58,113 @@ struct LSPResolvedServer: Sendable, Equatable, Hashable {
 
 /// Built-in mapping from DiffCode `LanguageSpec` names / LSP language IDs to language servers.
 enum LSPServerRegistry {
+    /// Lightweight `gopls` settings tailored for DiffCode: keeps semantic highlighting, definition,
+    /// references, and `go.work` cross-repo navigation intact while disabling unused diagnostics,
+    /// analyzers, codelenses, inlay hints, hover docs, and completion extras to minimize RAM/CPU.
+    private static let goplsLightweightSettings: JSONValue = .object([
+        // gopls disables semantic tokens unless `semanticTokens: true` is explicitly requested.
+        "semanticTokens": .bool(true),
+        // Avoid workspace-wide diagnostics on every keystroke; only run on save.
+        "diagnosticsTrigger": .string("Save"),
+        "staticcheck": .bool(false),
+        "vulncheck": .string("Off"),
+        "analysisProgressReporting": .bool(false),
+        "completeFunctionCalls": .bool(false),
+        "experimentalPostfixCompletions": .bool(false),
+        "hoverKind": .string("NoDocumentation"),
+        "linksInHover": .bool(false),
+        "hints": .object([:]),
+        "codelenses": .object([
+            "generate": .bool(false),
+            "regenerate_cgo": .bool(false),
+            "run_govulncheck": .bool(false),
+            "tidy": .bool(false),
+            "upgrade_dependency": .bool(false),
+            "vendor": .bool(false),
+        ]),
+        // Explicitly disable all default-on gopls analyzers (`analyses: {"none": true}` is not supported by gopls).
+        "analyses": .object([
+            "appends": .bool(false),
+            "asmdecl": .bool(false),
+            "assign": .bool(false),
+            "atomic": .bool(false),
+            "atomicalign": .bool(false),
+            "bools": .bool(false),
+            "buildtag": .bool(false),
+            "cgocall": .bool(false),
+            "composites": .bool(false),
+            "copylocks": .bool(false),
+            "deepequalerrors": .bool(false),
+            "defers": .bool(false),
+            "deprecated": .bool(false),
+            "directive": .bool(false),
+            "embed": .bool(false),
+            "errorsas": .bool(false),
+            "fillreturns": .bool(false),
+            "framepointer": .bool(false),
+            "gofix": .bool(false),
+            "hostport": .bool(false),
+            "httpresponse": .bool(false),
+            "ifaceassert": .bool(false),
+            "infertypeargs": .bool(false),
+            "loopclosure": .bool(false),
+            "lostcancel": .bool(false),
+            "maprange": .bool(false),
+            "modernize": .bool(false),
+            "nilfunc": .bool(false),
+            "nilness": .bool(false),
+            "nonewvars": .bool(false),
+            "noresultvalues": .bool(false),
+            "printf": .bool(false),
+            "recursiveiter": .bool(false),
+            "shift": .bool(false),
+            "sigchanyzer": .bool(false),
+            "simplifycompositelit": .bool(false),
+            "simplifyrange": .bool(false),
+            "simplifyslice": .bool(false),
+            "slog": .bool(false),
+            "sortslice": .bool(false),
+            "stdmethods": .bool(false),
+            "stdversion": .bool(false),
+            "stringintconv": .bool(false),
+            "structtag": .bool(false),
+            "testinggoroutine": .bool(false),
+            "tests": .bool(false),
+            "timeformat": .bool(false),
+            "unmarshal": .bool(false),
+            "unreachable": .bool(false),
+            "unsafeptr": .bool(false),
+            "unusedfunc": .bool(false),
+            "unusedparams": .bool(false),
+            "unusedresult": .bool(false),
+            "unusedvariable": .bool(false),
+            "unusedwrite": .bool(false),
+            "waitgroup": .bool(false),
+            "yield": .bool(false),
+        ]),
+        "directoryFilters": .array([
+            .string("-**/node_modules"),
+            .string("-**/.git"),
+            .string("-**/dist"),
+            .string("-**/build"),
+            .string("-**/testdata"),
+        ]),
+    ])
+
     static let go = LSPServerDescriptor(
         id: "go",
         languageNames: ["Go"],
         languageIDs: ["go", "gomod", "gowork"],
-        candidates: [LSPServerCommand(executableName: "gopls", arguments: ["serve"])],
+        // Shared daemon mode (`-remote=auto` must precede subcommand; default subcommand is `serve`).
+        // `-remote.listen.timeout=2m` ensures the shared daemon exits promptly once all clients disconnect.
+        candidates: [LSPServerCommand(executableName: "gopls", arguments: ["-remote=auto", "-remote.listen.timeout=2m"])],
         defaultLanguageID: "go",
-        // gopls disables semantic tokens unless `semanticTokens: true` is explicitly requested.
-        initializationOptions: .object(["semanticTokens": .bool(true)]),
-        configurationSettings: .object(["semanticTokens": .bool(true)])
+        initializationOptions: goplsLightweightSettings,
+        configurationSettings: goplsLightweightSettings,
+        extraEnvironment: [
+            "GOGC": "50",
+            "GOMEMLIMIT": "1GiB",
+        ]
     )
 
     static let rust = LSPServerDescriptor(
@@ -141,21 +261,35 @@ enum LSPServerRegistry {
         }
     }
 
+    /// Merges default environment variables into `base` without overriding keys already present in `base`.
+    static func mergedEnvironment(
+        base: [String: String],
+        defaults: [String: String]
+    ) -> [String: String] {
+        guard !defaults.isEmpty else { return base }
+        var merged = base
+        for (key, value) in defaults where merged[key] == nil {
+            merged[key] = value
+        }
+        return merged
+    }
+
     /// Resolves the first installed server binary for `descriptor`, or `nil` if none is installed.
     static func resolveServer(
         for descriptor: LSPServerDescriptor,
         searchPaths: [String]? = nil,
         environment: [String: String]? = nil
     ) -> LSPResolvedServer? {
-        let env = environment ?? LSPBinaryLocator.environment()
-        let paths = searchPaths ?? LSPBinaryLocator.searchPaths(from: env)
+        let baseEnv = environment ?? LSPBinaryLocator.environment()
+        let paths = searchPaths ?? LSPBinaryLocator.searchPaths(from: baseEnv)
+        let effectiveEnv = mergedEnvironment(base: baseEnv, defaults: descriptor.extraEnvironment)
         for candidate in descriptor.candidates {
             if let binary = LSPBinaryLocator.resolve(executable: candidate.executableName, searchPaths: paths) {
                 return LSPResolvedServer(
                     descriptor: descriptor,
                     executablePath: binary,
                     arguments: candidate.arguments,
-                    environment: env
+                    environment: effectiveEnv
                 )
             }
         }
