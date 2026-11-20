@@ -166,6 +166,7 @@ final class DiffDocument {
     enum Content {
         case text
         case image(old: Data?, new: Data?)
+        case spreadsheet(XLSXWorkbook, fileURL: URL?)
         case message(title: String, detail: String)
     }
 
@@ -886,7 +887,12 @@ struct DiffRequest: Equatable {
 
 enum DiffLoader {
     static let maxTextBytes = 12 * 1024 * 1024
+    static let maxSpreadsheetBytes = 80 * 1024 * 1024
     static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "heic", "ico", "icns", "pdf"]
+
+    static func isSpreadsheetPath(_ path: String) -> Bool {
+        path.lowercased().hasSuffix(".xlsx")
+    }
 
     private static let scratch: URL = {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("dif-\(ProcessInfo.processInfo.processIdentifier)")
@@ -908,6 +914,55 @@ enum DiffLoader {
         return doc
     }
 
+    private static func buildSpreadsheet(_ request: DiffRequest) async -> DiffDocument {
+        let root = request.root
+        let data: Data?
+
+        switch request.source {
+        case .file, .externalFile:
+            data = readWorktree(root, request.path)
+        case .worktree:
+            if request.kind == .deleted {
+                data = nil
+            } else {
+                data = readWorktree(root, request.path)
+            }
+        case .commit(let hash, let parent):
+            if request.kind != .deleted,
+               let newBlob = await Git.blob(rev: hash, path: request.path, in: root) {
+                data = newBlob
+            } else if let parent,
+                      let oldBlob = await Git.blob(rev: parent, path: request.oldPath ?? request.path, in: root) {
+                data = oldBlob
+            } else {
+                data = nil
+            }
+        }
+
+        guard let spreadsheetData = data else {
+            return .message(L("File deleted", "文件已删除"), detail: request.displayPath)
+        }
+        if spreadsheetData.count > maxSpreadsheetBytes {
+            return .message(L("File too large to display", "文件过大，无法显示"), detail: spreadsheetData.count.byteSizeString)
+        }
+
+        do {
+            let workbook = try await Task.detached(priority: .userInitiated) {
+                try XLSXReader.parse(data: spreadsheetData)
+            }.value
+            return DiffDocument(
+                left: .empty,
+                right: .empty,
+                hunks: [],
+                language: .plain,
+                content: .spreadsheet(workbook, fileURL: request.isLiveFile ? request.fileURL : nil),
+                isPlainFile: true
+            )
+        } catch {
+            return .message(L("Unable to open spreadsheet", "无法打开表格文件"), detail: error.localizedDescription)
+        }
+    }
+
     private static func readWorktree(_ root: URL, _ path: String) -> Data? {
         let url = root.appendingPathComponent(path)
         var isDir: ObjCBool = false
@@ -916,6 +971,10 @@ enum DiffLoader {
     }
 
     private static func build(_ request: DiffRequest) async -> DiffDocument {
+        if Self.isSpreadsheetPath(request.path) {
+            return await buildSpreadsheet(request)
+        }
+
         let root = request.root
         let language = LanguageSpec.detect(path: request.path)
         let ext = (request.path as NSString).pathExtension.lowercased()

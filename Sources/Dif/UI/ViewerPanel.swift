@@ -65,6 +65,13 @@ struct ViewerPanel: View {
             switch doc.content {
             case .image(let old, let new):
                 ImageDiffView(old: old, new: new, leftTitle: doc.leftTitle, rightTitle: doc.rightTitle).background(Color.difWindow)
+            case .spreadsheet(let workbook, _):
+                EmptyListState(
+                    symbol: "tablecells",
+                    title: L("Spreadsheet", "表格"),
+                    detail: "\(workbook.sheets.count) \(L("sheets", "个工作表"))"
+                )
+                .background(Color.difWindow)
             case .message(let title, let detail):
                 EmptyListState(symbol: "doc.questionmark", title: title, detail: detail).background(Color.difWindow)
             case .text:
