@@ -33,6 +33,8 @@ struct PopupLayer: View {
                     ResizablePopup(spec: .findInPath) { FindInPathView() }
                 case .references:
                     ResizablePopup(spec: .references) { ReferencesPopupView() }
+                case .fileSymbols:
+                    ResizablePopup(spec: .fileSymbols) { FileSymbolsPopupView() }
                 case .goToLine, .keymap, .settings:
                     Group {
                         switch popup {
@@ -318,9 +320,19 @@ enum Attr {
 @MainActor
 enum FuzzyHighlight {
     /// Emphasises the characters the fuzzy matcher landed on. `positions` are byte offsets into the full path.
-    static func text(_ text: String, positions: [Int], offset: Int, base: Color, size: CGFloat = 13) -> AttributedString {
+    static func text(
+        _ text: String,
+        positions: [Int],
+        offset: Int,
+        base: Color,
+        size: CGFloat = 13,
+        weight: Font.Weight = .regular
+    ) -> AttributedString {
         var result = AttributedString(text)
         result[Attr.Foreground.self] = base
+        if weight != .regular {
+            result[Attr.Font.self] = .ui(size: size, weight: weight)
+        }
         guard !positions.isEmpty else { return result }
         let utf8 = text.utf8
         for position in positions {
@@ -1023,6 +1035,284 @@ private struct ReferenceCodePreviewView: View {
     }
 }
 
+// MARK: - File Structure / Symbols Picker (⌘R)
+
+struct FileSymbolsPopupView: View {
+    @Environment(AppStore.self) private var store
+    @AppStorage("popupSplit.fileSymbols") private var splitRatio: Double = 0.45
+
+    var body: some View {
+        @Bindable var model = store.fileSymbols
+        VStack(spacing: 0) {
+            // Header: outline icon + filename + count badge + kind filter pills + search field + close button
+            HStack(spacing: 10) {
+                Image(systemName: "list.bullet.indent")
+                    .font(.ui(size: 13.5, weight: .medium))
+                    .foregroundStyle(Color.difAccent)
+
+                Text(model.title)
+                    .font(.ui(size: 13.5, weight: .semibold))
+                    .foregroundStyle(Color.difText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(1)
+
+                Text(countLabel(model))
+                    .font(.ui(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(Color.difText2)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(Color.difChip))
+
+                Spacer(minLength: 8)
+
+                HStack(spacing: 2) {
+                    ForEach(FileSymbolFilter.allCases, id: \.self) { filter in
+                        ScopeTab(title: filter.title, isSelected: model.kindFilter == filter) {
+                            model.kindFilter = filter
+                        }
+                    }
+                }
+
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.ui(size: 11))
+                        .foregroundStyle(Color.difText3)
+                    SearchField(
+                        text: $model.filterQuery,
+                        placeholder: L("Filter symbols…", "搜索函数 / 结构体…"),
+                        font: .systemFont(ofSize: 12.5 * UI.scale),
+                        focusToken: model.focusToken,
+                        onMove: { model.move($0) },
+                        onSubmit: { model.activate() },
+                        onCancel: { store.dismissPopup() },
+                        onTab: { model.cycleFilter($0 ? -1 : 1) }
+                    )
+                    .frame(width: UI.s(185), height: UI.s(20))
+                    if !model.filterQuery.isEmpty {
+                        Button {
+                            model.filterQuery = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.ui(size: 11))
+                                .foregroundStyle(Color.difText3)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .frame(height: UI.s(26))
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.difChip))
+
+                Button {
+                    store.dismissPopup()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.ui(size: 11, weight: .semibold))
+                        .foregroundStyle(Color.difText2)
+                        .frame(width: UI.s(24), height: UI.s(24))
+                        .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.difChip))
+                }
+                .buttonStyle(.plain)
+                .help(L("Close (Esc)", "关闭 (Esc)"))
+            }
+            .padding(.horizontal, 14)
+            .frame(height: UI.s(46))
+
+            Rectangle().fill(Color.difHairline).frame(height: 1)
+
+            GeometryReader { geo in
+                let previewHeaderHeight = UI.s(28)
+                let availableHeight = max(144, geo.size.height - previewHeaderHeight - 1)
+                let listHeight = PopupResizeGeometry.splitListHeight(
+                    availableHeight: availableHeight,
+                    ratio: splitRatio
+                )
+
+                VStack(spacing: 0) {
+                    // Top section: scrollable symbol list
+                    if model.filteredItems.isEmpty {
+                        VStack(spacing: 6) {
+                            Text(model.allItems.isEmpty
+                                 ? L("No symbols found in this file", "当前文件中未找到符号")
+                                 : L("No matching symbols", "没有匹配的符号"))
+                                .font(.ui(size: 12.5))
+                                .foregroundStyle(Color.difText3)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: listHeight)
+                    } else {
+                        ScrollViewReader { proxy in
+                            ScrollView {
+                                LazyVStack(spacing: 0) {
+                                    ForEach(Array(model.filteredItems.enumerated()), id: \.element.id) { index, item in
+                                        FileSymbolRow(
+                                            item: item,
+                                            positions: model.positions(for: item),
+                                            isSelected: index == model.selectedIndex
+                                        )
+                                        .id(item.id)
+                                        .contentShape(Rectangle())
+                                        .onTapGesture {
+                                            model.select(index)
+                                            if (NSApp.currentEvent?.clickCount ?? 1) >= 2 {
+                                                model.activate(index)
+                                            }
+                                        }
+                                    }
+                                }
+                                .padding(.vertical, 4)
+                            }
+                            .frame(height: listHeight)
+                            .onAppear {
+                                if let id = model.selectedItem?.id {
+                                    proxy.scrollTo(id, anchor: .center)
+                                }
+                            }
+                            .onChange(of: model.selectedIndex) { _, _ in
+                                if let id = model.selectedItem?.id {
+                                    proxy.scrollTo(id)
+                                }
+                            }
+                            .onChange(of: model.filteredItems.first?.id) { _, _ in
+                                if let id = model.selectedItem?.id {
+                                    proxy.scrollTo(id, anchor: .top)
+                                }
+                            }
+                        }
+                    }
+
+                    PopupSplitDivider(availableHeight: availableHeight, ratio: $splitRatio)
+
+                    // Preview sub-header with filename : lineNumber and Jump button
+                    HStack(spacing: 8) {
+                        if let item = model.selectedItem {
+                            FileIcon(path: model.displayPath, size: 11.5)
+                            Text("\(model.title) : \(item.lineNumber)")
+                                .font(.ui(size: 11.5, design: .monospaced))
+                                .foregroundStyle(Color.difText2)
+                                .lineLimit(1)
+                                .truncationMode(.head)
+                            Text(item.kind.label)
+                                .font(.ui(size: 10, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(item.kind.accentColor)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 1.5)
+                                .background(Capsule().fill(item.kind.accentColor.opacity(0.14)))
+                        }
+                        Spacer(minLength: 8)
+                        if model.selectedItem != nil {
+                            Button {
+                                model.activate()
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Text(L("Jump", "跳转"))
+                                        .font(.ui(size: 11, weight: .semibold))
+                                    Text("⏎")
+                                        .font(.ui(size: 10.5, weight: .medium))
+                                }
+                                .foregroundStyle(Color.difAccent)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.difAccent.opacity(0.14)))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .frame(height: previewHeaderHeight)
+                    .background(Color.difPanel.opacity(0.65))
+
+                    // Bottom section: syntax-highlighted code context preview
+                    ReferenceCodePreviewView(
+                        context: model.previewContext,
+                        isLoading: false,
+                        settings: store.settings
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+
+            Rectangle().fill(Color.difHairline).frame(height: 1)
+
+            // Footer hints
+            HStack(spacing: 14) {
+                Hint(keys: "↑↓", text: L("Preview", "预览"))
+                Hint(keys: "⏎", text: L("or Double-Click Jump", "或双击跳转"))
+                Hint(keys: "Esc", text: L("Close", "关闭"))
+                Spacer()
+                Hint(keys: "⇥", text: L("Filter", "切换分类"))
+            }
+            .padding(.horizontal, 14)
+            .frame(height: UI.s(30))
+        }
+    }
+
+    private func countLabel(_ model: FileSymbolsModel) -> String {
+        let isFiltered = !model.filterQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || model.kindFilter != .all
+        if !isFiltered {
+            return "\(model.allItems.count)"
+        }
+        return "\(model.filteredItems.count) / \(model.allItems.count)"
+    }
+}
+
+private struct FileSymbolRow: View {
+    var item: FileSymbolItem
+    var positions: [Int]
+    var isSelected: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(item.kind.badge)
+                .font(.ui(size: 10.5, weight: .bold, design: .rounded))
+                .foregroundStyle(item.kind.accentColor)
+                .frame(width: UI.s(18), height: UI.s(18))
+                .background(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(item.kind.accentColor.opacity(0.16))
+                )
+
+            Text(FuzzyHighlight.text(
+                item.name,
+                positions: positions,
+                offset: 0,
+                base: item.isExported ? Color.difText : Color.difText.opacity(0.88),
+                size: 12.5,
+                weight: item.isExported ? .semibold : .regular
+            ))
+            .font(.ui(size: 12.5, weight: item.isExported ? .semibold : .regular))
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .layoutPriority(1)
+
+            if !item.detail.isEmpty {
+                Text(item.detail)
+                    .font(.code(11.5))
+                    .foregroundStyle(Color.difText3)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+
+            Spacer(minLength: 8)
+
+            Text(":\(item.lineNumber)")
+                .font(.ui(size: 11, design: .monospaced))
+                .foregroundStyle(Color.difText3)
+                .frame(minWidth: 40, alignment: .trailing)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: UI.s(26))
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(isSelected ? Color.difSelection : Color.clear)
+                .padding(.horizontal, 6)
+        )
+        .help("\(item.kind.label) \(item.name)\(item.detail.isEmpty ? "" : " \(item.detail)") (:\(item.lineNumber))")
+    }
+}
+
 // MARK: - Go to line
 
 struct GoToLineView: View {
@@ -1112,6 +1402,7 @@ struct KeymapView: View {
             shortcutRow(L("Next / Previous Occurrence", "下一个 / 上一个匹配"), "⌘G / ⇧⌘G")
             shortcutRow(L("Expand / Shrink Selection", "扩大 / 缩小选区"), "⌘. / ⌘;")
             shortcutRow(L("Find in Files (Secondary)", "在文件中查找（备用）"), "⇧⌘F")
+            shortcutRow(L("File Structure", "文件结构"), "⌘R / ⌘F12")
             shortcutRow(L("Back to the File List", "回到文件列表"), "Esc / ⌘H")
             shortcutRow(L("Zoom Text", "缩放文字"), L("Pinch", "双指捏合"))
             if AppEnvironment.hasLSP {

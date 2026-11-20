@@ -12,6 +12,8 @@ enum Popup: Equatable {
     case gitGraph
     /// LSP references / multiple definitions picker with code preview.
     case references
+    /// Current file structure / symbols outline with fuzzy filtering and code preview.
+    case fileSymbols
     /// A question or notice (`AppStore.dialog`).
     case dialog
 }
@@ -34,6 +36,7 @@ final class AppStore {
     let terminals = TerminalManager()
     let gitGraph = GitGraphModel()
     let references = ReferencesPickerModel()
+    let fileSymbols = FileSymbolsModel()
     /// Where each project's branch sits in the sidebar, in window coordinates: ⌥⌘B opens the graph under it.
     @ObservationIgnored var branchLabelFrames: [UUID: CGRect] = [:]
 
@@ -121,6 +124,7 @@ final class AppStore {
         terminals.store = self
         gitGraph.store = self
         references.store = self
+        fileSymbols.store = self
     }
 
     var currentProject: Project? {
@@ -1019,6 +1023,7 @@ final class AppStore {
         }
         if popup == .gitGraph, kind != .gitGraph { gitGraph.release() }
         if popup == .references, kind != .references { references.release() }
+        if popup == .fileSymbols, kind != .fileSymbols { fileSymbols.release() }
         popup = kind
     }
 
@@ -1027,6 +1032,7 @@ final class AppStore {
         let unanswered = popup == .dialog ? dialog : nil
         if popup == .gitGraph { gitGraph.release() }
         if popup == .references { references.release() }
+        if popup == .fileSymbols { fileSymbols.release() }
         dialog = nil
         popup = nil
         if restoreFocus {
@@ -1057,6 +1063,16 @@ final class AppStore {
         let selected = viewer.container?.canvas.selectedText()
         finder.prepare(seed: selected.flatMap { $0.contains("\n") || $0.isEmpty ? nil : $0 })
         present(.findInPath)
+    }
+
+    func showFileSymbols() {
+        if popup == .fileSymbols {
+            dismissPopup()
+            return
+        }
+        guard viewer.isTextDocument else { return }
+        fileSymbols.prepare()
+        present(.fileSymbols)
     }
 
     func showToast(_ text: String, action: ToastAction? = nil) {

@@ -82,8 +82,7 @@ extension AppStore {
             // File
             AppCommand(id: "project.add", title: L("Add Project…", "添加项目…"), symbol: "plus.rectangle.on.folder", group: .file,
                        key: "n", modifiers: .command) { [weak self] in self?.presentAddProject() },
-            AppCommand(id: "git.refresh", title: L("Refresh", "刷新"), symbol: "arrow.clockwise", group: .file,
-                       key: "r", modifiers: .command) { [weak self] in self?.refreshCurrent() },
+            AppCommand(id: "git.refresh", title: L("Refresh", "刷新"), symbol: "arrow.clockwise", group: .file) { [weak self] in self?.refreshCurrent() },
             // Edits are written on their own a moment after typing stops; this writes them now.
             AppCommand(id: "file.save", title: L("Save", "保存"), symbol: "square.and.arrow.down", group: .file,
                        key: "s", modifiers: .command) { viewer.saveNow() },
@@ -173,6 +172,8 @@ extension AppStore {
                        key: "a", modifiers: [.command, .shift]) { [weak self] in self?.showQuickOpen(.actions) },
             AppCommand(id: "nav.recent", title: L("Recent Files", "最近的文件"), symbol: "clock", group: .navigate,
                        key: "e", modifiers: .command) { [weak self] in self?.showQuickOpen(.recent) },
+            AppCommand(id: "nav.fileSymbols", title: L("File Structure…", "文件结构…"), symbol: "list.bullet.indent", group: .navigate,
+                       key: "r", modifiers: .command) { [weak self] in self?.showFileSymbols() },
             AppCommand(id: "nav.line", title: L("Go to Line…", "跳转到行…"), symbol: "arrow.right.to.line", group: .navigate) { [weak self] in
                 guard let self, self.viewer.isTextDocument else { return }
                 self.present(.goToLine)

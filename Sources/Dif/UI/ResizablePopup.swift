@@ -28,6 +28,15 @@ struct PopupSizeSpec: Equatable, Sendable {
         userDefaultsKey: "popupSize.references"
     )
 
+    static let fileSymbols = PopupSizeSpec(
+        defaultSize: CGSize(width: 840, height: 540),
+        minSize: CGSize(width: 560, height: 340),
+        topPadding: 56,
+        horizontalMargin: 48,
+        bottomMargin: 32,
+        userDefaultsKey: "popupSize.fileSymbols"
+    )
+
     static let findInPath = PopupSizeSpec(
         defaultSize: CGSize(width: 900, height: 640),
         minSize: CGSize(width: 600, height: 380),

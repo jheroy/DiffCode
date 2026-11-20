@@ -320,6 +320,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return true
         }
 
+        // File Structure secondary: ⌘F12 (alongside ⌘R in Navigate menu, matching GoLand macOS copy.xml).
+        if mods == .command, event.keyCode == 111 || chars == KeyLabel.function(12) {
+            store.showFileSymbols()
+            return true
+        }
+
         // Toggle Terminal secondary: ⌥F12 (alongside ⌘T in View menu).
         if AppEnvironment.hasTerminal, store.popup == nil,
            mods == .option, event.keyCode == 111 || chars == KeyLabel.function(12) {
