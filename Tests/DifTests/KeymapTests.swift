@@ -50,6 +50,14 @@ final class KeymapTests: XCTestCase {
         XCTAssertEqual(findInPath?.key, "f")
         XCTAssertEqual(findInPath?.modifiers, .command)
 
+        let fileSymbols = command("nav.fileSymbols")
+        XCTAssertEqual(fileSymbols?.key, "r")
+        XCTAssertEqual(fileSymbols?.modifiers, .command)
+
+        let gitRefresh = command("git.refresh")
+        XCTAssertNotNil(gitRefresh)
+        XCTAssertTrue(gitRefresh?.key.isEmpty == true, "git.refresh should not collide with ⌘R (File Structure)")
+
         let terminal = command("view.terminal")
         XCTAssertEqual(terminal?.key, "t")
         XCTAssertEqual(terminal?.modifiers, .command)
