@@ -27,6 +27,48 @@ final class ExcelSheetIndexTests: XCTestCase {
         ])
     }
 
+    private func makeLoadableWorkbookData(sheets: [String]) -> Data {
+        var entries: [(String, Data)] = []
+        var sheetTags = ""
+        var relTags = ""
+        for (idx, name) in sheets.enumerated() {
+            let n = idx + 1
+            let escaped = name
+                .replacingOccurrences(of: "&", with: "&amp;")
+                .replacingOccurrences(of: "<", with: "&lt;")
+                .replacingOccurrences(of: ">", with: "&gt;")
+                .replacingOccurrences(of: "\"", with: "&quot;")
+            sheetTags += #"<sheet name="\#(escaped)" sheetId="\#(n)" r:id="rId\#(n)"/>"#
+            relTags += #"<Relationship Id="rId\#(n)" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet\#(n).xml"/>"#
+            let sheetXML = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+              <sheetData>
+                <row r="1"><c r="A1" t="inlineStr"><is><t>Header</t></is></c></row>
+                <row r="2"><c r="A2" t="inlineStr"><is><t>\(escaped)</t></is></c></row>
+              </sheetData>
+            </worksheet>
+            """
+            entries.append(("xl/worksheets/sheet\(n).xml", Data(sheetXML.utf8)))
+        }
+        let wbXML = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+                  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+          <sheets>\(sheetTags)</sheets>
+        </workbook>
+        """
+        let relsXML = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+          \(relTags)
+        </Relationships>
+        """
+        entries.append(("xl/workbook.xml", Data(wbXML.utf8)))
+        entries.append(("xl/_rels/workbook.xml.rels", Data(relsXML.utf8)))
+        return XLSXZipArchive.create(entries: entries)
+    }
+
     private func withTempDir(_ body: (URL) async throws -> Void) async throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ExcelSheetIndexTests-\(UUID().uuidString)")
@@ -212,6 +254,114 @@ final class ExcelSheetIndexTests: XCTestCase {
                 if case .excelSheet = $0 { return true }
                 return false
             })
+        }
+    }
+
+    @MainActor
+    func testAppStoreQuickOpenExcelSheetSetsPendingSheetAndOpensWorkbook() async throws {
+        try await withTempDir { dir in
+            let configDir = dir.appendingPathComponent("config")
+            try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
+
+            let billingPath = "config/Billing.xlsx"
+            let otherPath = "config/Other.xlsx"
+            let billingURL = dir.appendingPathComponent(billingPath)
+            let otherURL = dir.appendingPathComponent(otherPath)
+            try makeLoadableWorkbookData(sheets: ["IAPMonthlyCard", "StarterPack"]).write(to: billingURL)
+            try makeLoadableWorkbookData(sheets: ["StarterPack", "ExtraSheet"]).write(to: otherURL)
+
+            let store = AppStore.shared
+            let prevProjects = store.projects
+            let prevSelectedProjectID = store.selectedProjectID
+            let prevPopup = store.popup
+            let prevRecent = store.recent
+            let billingKey = store.viewer.excelSessionKey(for: billingURL)
+            let otherKey = store.viewer.excelSessionKey(for: otherURL)
+            defer {
+                store.viewer.clear()
+                store.viewer.excelSessions.removeValue(forKey: billingKey)
+                store.viewer.excelSessions.removeValue(forKey: otherKey)
+                store.quickOpen.filesProviderForTesting = nil
+                store.quickOpen.query = ""
+                store.quickOpen.items = []
+                store.projects = prevProjects
+                store.selectedProjectID = prevSelectedProjectID
+                store.popup = prevPopup
+                store.recent = prevRecent
+            }
+
+            store.viewer.clear()
+            let project = Project(url: dir)
+            store.projects = [project]
+            store.selectedProjectID = project.id
+
+            let sampleFiles = [otherPath, billingPath]
+            store.quickOpen.filesProviderForTesting = { _ in sampleFiles }
+
+            // First open Other.xlsx (which also has a sheet named "StarterPack") so switching to Billing.xlsx
+            // proves an already-loaded workbook with a matching sheet name does not drop pendingExcelSheet.
+            store.openFile(in: project, path: otherPath, line: nil)
+            await store.viewer.loadTask?.value
+            XCTAssertTrue(store.viewer.isSpreadsheet)
+
+            store.popup = .quickOpen
+            store.quickOpen.prepare(scope: .files)
+            store.quickOpen.query = "starter"
+            let foundBillingStarter = await waitUntil {
+                store.quickOpen.items.contains {
+                    if case .excelSheet(let pid, let path, let sheet, _) = $0 {
+                        return pid == project.id && path == billingPath && sheet == "StarterPack"
+                    }
+                    return false
+                }
+            }
+            XCTAssertTrue(foundBillingStarter, "Expected Billing.xlsx StarterPack in QuickOpen")
+
+            guard let targetIndex = store.quickOpen.items.firstIndex(where: {
+                if case .excelSheet(_, let path, let sheet, _) = $0 {
+                    return path == billingPath && sheet == "StarterPack"
+                }
+                return false
+            }) else {
+                XCTFail("Expected StarterPack sheet item for Billing.xlsx")
+                return
+            }
+
+            store.quickOpen.activate(targetIndex)
+            XCTAssertNil(store.popup)
+            XCTAssertEqual(store.viewer.request?.root, project.url)
+            XCTAssertEqual(store.viewer.request?.path, billingPath)
+            XCTAssertEqual(store.viewer.pendingExcelSheet, "StarterPack")
+
+            await store.viewer.loadTask?.value
+            XCTAssertTrue(store.viewer.isSpreadsheet)
+            XCTAssertNil(store.viewer.pendingExcelSheet)
+            XCTAssertEqual(store.viewer.activeExcelSession?.activeSheetName, "StarterPack")
+
+            // Activating another sheet on the already-open workbook switches immediately.
+            store.quickOpen.query = "monthly"
+            let foundMonthly = await waitUntil {
+                store.quickOpen.items.contains {
+                    if case .excelSheet(_, let path, let sheet, _) = $0 {
+                        return path == billingPath && sheet == "IAPMonthlyCard"
+                    }
+                    return false
+                }
+            }
+            XCTAssertTrue(foundMonthly)
+            guard let monthlyIndex = store.quickOpen.items.firstIndex(where: {
+                if case .excelSheet(_, let path, let sheet, _) = $0 {
+                    return path == billingPath && sheet == "IAPMonthlyCard"
+                }
+                return false
+            }) else {
+                XCTFail("Expected IAPMonthlyCard item")
+                return
+            }
+
+            store.quickOpen.activate(monthlyIndex)
+            XCTAssertEqual(store.viewer.activeExcelSession?.activeSheetName, "IAPMonthlyCard")
+            XCTAssertNil(store.viewer.pendingExcelSheet)
         }
     }
 }

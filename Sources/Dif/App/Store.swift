@@ -120,6 +120,12 @@ final class AppStore {
             self?.recordJumpOrigin(from: previousRequest, line0Based: line, column: col)
         }
         quickOpen.store = self
+        quickOpen.onOpenExcelSheet = { [weak self] project, path, sheetName in
+            guard let self else { return }
+            self.openFile(in: project, path: path, line: nil)
+            self.viewer.selectExcelSheet(sheetName)
+            self.viewer.focusCanvas()
+        }
         finder.store = self
         terminals.store = self
         gitGraph.store = self

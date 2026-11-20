@@ -76,7 +76,7 @@ final class QuickOpenModel {
     @ObservationIgnored var filesProviderForTesting: (@MainActor (Project) async -> [String])?
     /// Test hook: incremented on every `update()` invocation so tests can verify no duplicate calls in `prepare()`.
     @ObservationIgnored private(set) var updateCallCountForTesting = 0
-    /// Callback invoked when activating an `.excelSheet` match; defaults to opening the `.xlsx` file.
+    /// Callback invoked when activating an `.excelSheet` match; defaults to opening the `.xlsx` file and selecting the sheet.
     @ObservationIgnored var onOpenExcelSheet: ((Project, String, String) -> Void)?
     /// The branches and tags offered for comparing, read as the picker opens.
     @ObservationIgnored private var refs: [GitRef]?
@@ -379,6 +379,7 @@ final class QuickOpenModel {
                 onOpenExcelSheet(project, path, sheetName)
             } else {
                 store.openFile(in: project, path: path, line: nil)
+                store.viewer.selectExcelSheet(sheetName)
                 store.viewer.focusCanvas()
             }
         case .action(let command):
