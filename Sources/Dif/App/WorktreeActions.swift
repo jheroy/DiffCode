@@ -174,6 +174,8 @@ extension AppStore {
     }
 
     /// Asks for confirmation before removing a linked work tree from Git and deleting its folder from disk.
+    /// Offers an optional checkbox to also delete its local branch, and shows a second destructive confirmation
+    /// whenever uncommitted changes or unmerged commits on the branch to be deleted are detected.
     func confirmDeleteWorktree(_ project: Project) {
         // Never allow deleting a main repository via Delete Worktree.
         guard project.worktreeOf != nil, !project.needsAccess, !gitMissing else { return }
@@ -191,51 +193,194 @@ extension AppStore {
                 return
             }
 
-            let fresh = try? await Git.status(in: project.url, gitDirectory: project.gitDirectory)
-            let changes = fresh?.changes ?? project.changes
-            let branchLabel = fresh?.branch ?? project.branchLabel
-            let isDirty = !changes.isEmpty
+            let worktreeExists = FileManager.default.fileExists(atPath: project.url.path)
+            async let worktreeBranchTask = Worktree.currentBranch(in: project.url)
+            async let mainBranchTask = Worktree.currentBranch(in: parentURL)
+            let liveWorktreeBranch = await worktreeBranchTask
+            let worktreeBranch = worktreeExists ? liveWorktreeBranch : project.status.branch
+            let mainBranch = await mainBranchTask
 
-            var request: DialogRequest
-            if isDirty {
-                let countText = changes.count == 1
-                    ? L("1 uncommitted change", "1 处未提交的改动")
-                    : L("\(changes.count) uncommitted changes", "\(changes.count) 处未提交的改动")
-                request = DialogRequest(
-                    style: .destructive,
-                    symbol: "trash",
-                    title: L("Delete work tree “\(project.name)”?", "删除工作树“\(project.name)”？"),
-                    message: L("This work tree on “\(branchLabel)” has \(countText). Force deleting permanently discards those changes and deletes its folder from disk.\n\n\(project.url.path)",
-                               "位于“\(branchLabel)”分支的该工作树有 \(countText)。强制删除会永久丢弃这些改动并从磁盘移除该目录。\n\n\(project.url.path)"),
-                    confirmTitle: L("Force Delete", "强制删除")
+            // Only offer branch deletion for a local branch checked out in this work tree
+            // that is not currently checked out in the main repository.
+            let deletableBranch: String? = {
+                guard let branch = worktreeBranch, !branch.isEmpty, branch != mainBranch else { return nil }
+                return branch
+            }()
+
+            let message: String
+            if deletableBranch != nil {
+                message = L(
+                    "This removes the work tree and deletes its folder from disk. You can also choose to delete its local branch below.\n\n\(project.url.path)",
+                    "这将移除该工作树并从磁盘删除其目录。你也可以在下方选择是否同时删除对应本地分支。\n\n\(project.url.path)"
                 )
-                (request.items, request.hiddenCount) = DialogRequest.files(changes, limit: 5)
-                request.option = .init(
-                    title: L("Force delete and discard uncommitted changes", "强制删除并丢弃未提交的改动"),
-                    isOn: false,
-                    required: true
-                )
-                request.onAnswer = { [weak self] answer in
-                    self?.performDeleteWorktree(project, parentURL: parentURL, parentProject: parentProject, force: answer.option)
-                }
             } else {
-                request = DialogRequest(
-                    style: .destructive,
-                    symbol: "trash",
-                    title: L("Delete work tree “\(project.name)”?", "删除工作树“\(project.name)”？"),
-                    message: L("This removes the work tree and deletes its folder from disk. Branch “\(branchLabel)” is kept in Git.\n\n\(project.url.path)",
-                               "这将移除该工作树并从磁盘删除其目录。分支“\(branchLabel)”会保留在 Git 中。\n\n\(project.url.path)"),
-                    confirmTitle: L("Delete Worktree", "删除工作树")
+                message = L(
+                    "This removes the work tree and deletes its folder from disk.\n\n\(project.url.path)",
+                    "这将移除该工作树并从磁盘删除其目录。\n\n\(project.url.path)"
                 )
-                request.onConfirm = { [weak self] in
-                    self?.performDeleteWorktree(project, parentURL: parentURL, parentProject: parentProject, force: false)
-                }
+            }
+
+            var request = DialogRequest(
+                style: .destructive,
+                symbol: "trash",
+                title: L("Delete work tree “\(project.name)”?", "删除工作树“\(project.name)”？"),
+                message: message,
+                confirmTitle: L("Delete Worktree", "删除工作树")
+            )
+            if let deletableBranch {
+                request.option = .init(
+                    title: L("Also delete branch \"\(deletableBranch)\"", "同时删除分支「\(deletableBranch)」"),
+                    isOn: false,
+                    required: false
+                )
+            }
+            request.onAnswer = { [weak self] answer in
+                let branchToDelete = answer.option ? deletableBranch : nil
+                self?.handleDeleteWorktreeConfirmation(
+                    project,
+                    parentURL: parentURL,
+                    parentProject: parentProject,
+                    worktreeBranch: worktreeBranch,
+                    deleteBranch: branchToDelete
+                )
             }
             self.ask(request)
         }
     }
 
-    private func performDeleteWorktree(_ project: Project, parentURL: URL, parentProject: Project?, force: Bool) {
+    /// Inspects the live work tree and branch state after the first confirmation and either removes immediately
+    /// (when safe) or presents a second destructive confirmation detailing every detected risk.
+    private func handleDeleteWorktreeConfirmation(
+        _ project: Project,
+        parentURL: URL,
+        parentProject: Project?,
+        worktreeBranch: String?,
+        deleteBranch: String?
+    ) {
+        guard project.worktreeOf != nil, Self.canonicalPath(parentURL) != Self.canonicalPath(project.url) else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let inspection = await Worktree.inspectRemoval(
+                worktreeURL: project.url,
+                repoRoot: parentURL,
+                branchName: deleteBranch ?? worktreeBranch
+            )
+            if inspection.requiresForceConfirmation(deleteBranch: deleteBranch != nil) {
+                let changes: [FileChange]
+                if inspection.hasUncommittedChanges {
+                    changes = (try? await Git.status(in: project.url, gitDirectory: project.gitDirectory))?.changes
+                        ?? project.changes
+                } else {
+                    changes = []
+                }
+                self.presentForceDeleteWorktreeConfirmation(
+                    project,
+                    parentURL: parentURL,
+                    parentProject: parentProject,
+                    inspection: inspection,
+                    deleteBranch: deleteBranch,
+                    changes: changes
+                )
+            } else {
+                self.performDeleteWorktree(
+                    project,
+                    parentURL: parentURL,
+                    parentProject: parentProject,
+                    forceWorktree: false,
+                    deleteBranch: deleteBranch,
+                    forceBranch: false
+                )
+            }
+        }
+    }
+
+    private func presentForceDeleteWorktreeConfirmation(
+        _ project: Project,
+        parentURL: URL,
+        parentProject: Project?,
+        inspection: WorktreeRemovalInspection,
+        deleteBranch: String?,
+        changes: [FileChange]
+    ) {
+        let hasDirty = inspection.hasUncommittedChanges
+        let hasUnmerged = deleteBranch != nil && inspection.hasUnmergedCommits
+
+        var warnings: [String] = []
+        if hasDirty {
+            let count = inspection.uncommittedChangeCount
+            warnings.append(L(
+                count == 1
+                    ? "This work tree still has 1 uncommitted change, which will be permanently lost after force deletion."
+                    : "This work tree still has \(count) uncommitted changes, which will be permanently lost after force deletion.",
+                "该 Worktree 仍有 \(count) 项未提交变更，强制删除后将永久丢失。"
+            ))
+        }
+        if hasUnmerged, let branch = deleteBranch {
+            let count = inspection.unmergedCommitCount
+            warnings.append(L(
+                count == 1
+                    ? "Branch \"\(branch)\" contains 1 unmerged commit, which may be unrecoverable after force deletion."
+                    : "Branch \"\(branch)\" contains \(count) unmerged commits, which may be unrecoverable after force deletion.",
+                "分支「\(branch)」包含 \(count) 个未合并提交，强制删除后这些提交可能无法找回。"
+            ))
+        }
+
+        let title: String
+        if hasDirty && hasUnmerged {
+            title = L("Confirm force deletion of “\(project.name)”?", "确认强制删除“\(project.name)”？")
+        } else if hasDirty {
+            title = L("“\(project.name)” has uncommitted changes", "“\(project.name)”包含未提交变更")
+        } else if let branch = deleteBranch {
+            title = L("Branch “\(branch)” has unmerged commits", "分支「\(branch)」包含未合并提交")
+        } else {
+            title = L("Confirm force deletion of “\(project.name)”?", "确认强制删除“\(project.name)”？")
+        }
+
+        let message: String
+        if let branch = deleteBranch {
+            message = L(
+                "Force deleting work tree “\(project.name)” and branch \"\(branch)\" cannot be undone.\n\n\(project.url.path)",
+                "强制删除工作树“\(project.name)”及分支「\(branch)」后无法撤销，请再次确认。\n\n\(project.url.path)"
+            )
+        } else {
+            message = L(
+                "Force deleting work tree “\(project.name)” will permanently discard local changes and remove its folder from disk.\n\n\(project.url.path)",
+                "强制删除工作树“\(project.name)”将永久丢弃本地变更并从磁盘移除该目录，请再次确认。\n\n\(project.url.path)"
+            )
+        }
+
+        var request = DialogRequest(
+            style: .destructive,
+            symbol: "exclamationmark.triangle",
+            title: title,
+            message: message,
+            confirmTitle: L("Force Delete", "强制删除")
+        )
+        request.warnings = warnings
+        if hasDirty && !changes.isEmpty {
+            (request.items, request.hiddenCount) = DialogRequest.files(changes, limit: 5)
+        }
+        request.onConfirm = { [weak self] in
+            self?.performDeleteWorktree(
+                project,
+                parentURL: parentURL,
+                parentProject: parentProject,
+                forceWorktree: hasDirty,
+                deleteBranch: deleteBranch,
+                forceBranch: hasUnmerged
+            )
+        }
+        ask(request)
+    }
+
+    private func performDeleteWorktree(
+        _ project: Project,
+        parentURL: URL,
+        parentProject: Project?,
+        forceWorktree: Bool,
+        deleteBranch: String?,
+        forceBranch: Bool
+    ) {
         guard project.worktreeOf != nil, Self.canonicalPath(parentURL) != Self.canonicalPath(project.url) else { return }
         // Release the file watcher before git removes the directory.
         project.stopWatching()
@@ -243,25 +388,79 @@ extension AppStore {
         let owner = parentProject ?? project
         runActivity(L("Deleting work tree…", "正在删除工作树…"), in: owner) { [weak self] in
             do {
-                try await Git.removeWorktree(in: parentURL, at: project.url, force: force)
+                try await Worktree.remove(
+                    worktreeURL: project.url,
+                    repoRoot: parentURL,
+                    forceWorktree: forceWorktree,
+                    deleteBranch: deleteBranch,
+                    forceBranch: forceBranch
+                )
                 guard let self else { return }
                 let name = project.name
-                self.remove(project)
-                if let parentProject, self.projects.contains(where: { $0.id == parentProject.id }) {
-                    self.syncWorktrees(of: parentProject, force: true)
-                    self.afterBranchesChanged(parentProject)
+                self.finishRemovedWorktree(project, parentProject: parentProject)
+                if let branch = deleteBranch {
+                    self.showToast(L("Deleted work tree \(name) and branch \(branch)",
+                                     "已删除工作树 \(name) 及分支「\(branch)」"))
+                } else {
+                    self.showToast(L("Deleted work tree \(name)", "已删除工作树 \(name)"))
                 }
-                self.showToast(L("Deleted work tree \(name)", "已删除工作树 \(name)"))
+            } catch let removalError as Worktree.RemovalError {
+                guard let self else { return }
+                switch removalError.stage {
+                case .worktree:
+                    project.startWatching()
+                    project.refresh()
+                    if !forceWorktree, let failure = removalError.underlying as? Git.Failure,
+                       Git.worktreeRemoveNeedsForce(failure.message) {
+                        self.offerForceDeleteWorktree(
+                            project,
+                            parentURL: parentURL,
+                            parentProject: parentProject,
+                            deleteBranch: deleteBranch,
+                            forceBranch: forceBranch,
+                            error: failure
+                        )
+                    } else {
+                        self.showFailure(
+                            L("Could not delete work tree “\(project.name)”", "无法删除工作树“\(project.name)”"),
+                            removalError.underlying
+                        )
+                    }
+                case .branch(let branch):
+                    // The work tree itself was already removed; still remove it from the sidebar and refresh.
+                    let name = project.name
+                    self.finishRemovedWorktree(project, parentProject: parentProject)
+                    if !forceBranch, let failure = removalError.underlying as? Git.Failure,
+                       Git.isNotFullyMerged(failure.message) {
+                        self.offerForceDeleteBranchAfterWorktreeRemoval(
+                            worktreeName: name,
+                            branch: branch,
+                            parentURL: parentURL,
+                            parentProject: parentProject,
+                            error: failure
+                        )
+                    } else {
+                        self.showFailure(
+                            L("Deleted work tree “\(name)”, but could not delete branch \"\(branch)\"",
+                              "已删除工作树“\(name)”，但无法删除分支「\(branch)」"),
+                            removalError.underlying
+                        )
+                    }
+                }
             } catch {
                 guard let self else { return }
                 project.startWatching()
                 project.refresh()
-                if !force, let failure = error as? Git.Failure, Git.worktreeRemoveNeedsForce(failure.message) {
-                    self.offerForceDeleteWorktree(project, parentURL: parentURL, parentProject: parentProject, error: failure)
-                } else {
-                    self.showFailure(L("Could not delete work tree “\(project.name)”", "无法删除工作树“\(project.name)”"), error)
-                }
+                self.showFailure(L("Could not delete work tree “\(project.name)”", "无法删除工作树“\(project.name)”"), error)
             }
+        }
+    }
+
+    private func finishRemovedWorktree(_ project: Project, parentProject: Project?) {
+        remove(project)
+        if let parentProject, projects.contains(where: { $0.id == parentProject.id }) {
+            syncWorktrees(of: parentProject, force: true)
+            afterBranchesChanged(parentProject)
         }
     }
 
@@ -269,6 +468,8 @@ extension AppStore {
         _ project: Project,
         parentURL: URL,
         parentProject: Project?,
+        deleteBranch: String?,
+        forceBranch: Bool,
         error: Git.Failure
     ) {
         var request = DialogRequest(
@@ -281,9 +482,66 @@ extension AppStore {
         )
         request.output = error.message
         request.onConfirm = { [weak self] in
-            self?.performDeleteWorktree(project, parentURL: parentURL, parentProject: parentProject, force: true)
+            self?.performDeleteWorktree(
+                project,
+                parentURL: parentURL,
+                parentProject: parentProject,
+                forceWorktree: true,
+                deleteBranch: deleteBranch,
+                forceBranch: forceBranch
+            )
         }
         ask(request)
+    }
+
+    private func offerForceDeleteBranchAfterWorktreeRemoval(
+        worktreeName: String,
+        branch: String,
+        parentURL: URL,
+        parentProject: Project?,
+        error: Git.Failure
+    ) {
+        var request = DialogRequest(
+            style: .destructive,
+            symbol: "exclamationmark.triangle",
+            title: L("Branch “\(branch)” is not fully merged", "分支「\(branch)」尚未完全合并"),
+            message: L("Work tree “\(worktreeName)” was deleted, but Git refused to delete branch \"\(branch)\" because it is not fully merged. Force delete this branch anyway?",
+                       "工作树“\(worktreeName)”已删除，但 Git 拒绝安全删除分支「\(branch)」，因为它尚未完全合并。要强制删除该分支吗？"),
+            confirmTitle: L("Force Delete", "强制删除")
+        )
+        request.output = error.message
+        request.onConfirm = { [weak self] in
+            self?.forceDeleteBranchAfterWorktreeRemoval(branch, parentURL: parentURL, parentProject: parentProject)
+        }
+        ask(request)
+    }
+
+    private func forceDeleteBranchAfterWorktreeRemoval(
+        _ branch: String,
+        parentURL: URL,
+        parentProject: Project?
+    ) {
+        let perform: @MainActor () async -> Void = { [weak self] in
+            do {
+                try await Git.deleteBranch(branch, force: true, in: parentURL)
+                guard let self else { return }
+                if let parentProject, self.projects.contains(where: { $0.id == parentProject.id }) {
+                    self.afterBranchesChanged(parentProject)
+                }
+                self.showToast(L("Deleted branch \(branch)", "已删除分支「\(branch)」"))
+            } catch {
+                guard let self else { return }
+                if let parentProject, self.projects.contains(where: { $0.id == parentProject.id }) {
+                    self.afterBranchesChanged(parentProject)
+                }
+                self.showFailure(L("Could not delete branch \"\(branch)\"", "无法删除分支「\(branch)」"), error)
+            }
+        }
+        if let parentProject, projects.contains(where: { $0.id == parentProject.id }) {
+            runActivity(L("Deleting branch \(branch)…", "正在删除分支「\(branch)」…"), in: parentProject, perform)
+        } else {
+            Task { @MainActor in await perform() }
+        }
     }
 
     private func requestWorktreeFolderAccess(_ folder: URL) async -> Bool {

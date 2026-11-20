@@ -173,6 +173,8 @@ struct DialogRequest {
     var symbol: String
     var title: String
     var message = ""
+    /// Multi-line risk/warning callouts rendered in a tinted callout box above items and options.
+    var warnings: [String] = []
     var items: [Item] = []
     /// Items left out of the list: "…and 12 more".
     var hiddenCount = 0

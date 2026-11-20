@@ -1,5 +1,198 @@
 import Foundation
 
+/// Risk summary inspected before removing a linked Git work tree (and optionally its local branch).
+struct WorktreeRemovalInspection: Equatable, Sendable {
+    /// Staged, unstaged, and untracked entries inside the work tree directory.
+    var uncommittedChangeCount: Int
+    /// Local branch currently checked out in the work tree, or `nil` when detached HEAD.
+    var branchName: String?
+    /// Commits reachable from `branchName` that are not contained in any other local branch,
+    /// its configured upstream, or the main repository's HEAD.
+    var unmergedCommitCount: Int
+
+    var hasUncommittedChanges: Bool { uncommittedChangeCount > 0 }
+    var hasUnmergedCommits: Bool { unmergedCommitCount > 0 }
+
+    /// Whether proceeding with removal requires a destructive second confirmation.
+    func requiresForceConfirmation(deleteBranch: Bool) -> Bool {
+        hasUncommittedChanges || (deleteBranch && hasUnmergedCommits)
+    }
+}
+
+/// High-level work tree removal inspection and execution helpers built on `Git.run`.
+enum Worktree {
+    /// Structured error distinguishing work tree removal failure from post-removal branch deletion failure.
+    struct RemovalError: Error, LocalizedError, Sendable {
+        enum Stage: Equatable, Sendable {
+            case worktree
+            case branch(String)
+        }
+
+        let stage: Stage
+        let underlying: Error
+
+        var worktreeRemoved: Bool {
+            if case .branch = stage { return true }
+            return false
+        }
+
+        var errorDescription: String? { underlying.localizedDescription }
+    }
+
+    /// Inspects a linked work tree for uncommitted changes and unmerged commits on its local branch.
+    static func inspectRemoval(
+        worktreeURL: URL,
+        repoRoot: URL,
+        branchName: String? = nil
+    ) async -> WorktreeRemovalInspection {
+        async let uncommittedTask = countUncommittedChanges(in: worktreeURL)
+        async let branchTask = resolveWorktreeBranch(explicit: branchName, worktreeURL: worktreeURL)
+        let resolvedBranch = await branchTask
+        let unmergedCount: Int
+        if let resolvedBranch {
+            unmergedCount = await countUnmergedCommits(branch: resolvedBranch, in: repoRoot)
+        } else {
+            unmergedCount = 0
+        }
+        return WorktreeRemovalInspection(
+            uncommittedChangeCount: await uncommittedTask,
+            branchName: resolvedBranch,
+            unmergedCommitCount: unmergedCount
+        )
+    }
+
+    /// Removes a linked work tree and, when requested, deletes its local branch afterwards.
+    ///
+    /// Git refuses to delete a branch that is still checked out in a work tree, so the work tree is always
+    /// removed first. If removing the work tree succeeds but deleting the branch fails, throws
+    /// `RemovalError(stage: .branch(branch), underlying:)`.
+    static func remove(
+        worktreeURL: URL,
+        repoRoot: URL,
+        forceWorktree: Bool = false,
+        deleteBranch branchName: String? = nil,
+        forceBranch: Bool = false
+    ) async throws {
+        do {
+            try await Git.removeWorktree(in: repoRoot, at: worktreeURL, force: forceWorktree)
+        } catch {
+            throw RemovalError(stage: .worktree, underlying: error)
+        }
+        if let branch = normalizedBranchName(branchName) {
+            do {
+                try await Git.deleteBranch(branch, force: forceBranch, in: repoRoot)
+            } catch {
+                throw RemovalError(stage: .branch(branch), underlying: error)
+            }
+        }
+    }
+
+    /// Local branch currently checked out in `dir`, or `nil` when detached HEAD or unavailable.
+    static func currentBranch(in dir: URL) async -> String? {
+        guard FileManager.default.fileExists(atPath: dir.path),
+              let out = try? await Git.runString(["symbolic-ref", "--quiet", "--short", "HEAD"], in: dir) else {
+            return nil
+        }
+        return normalizedBranchName(out)
+    }
+
+    /// Parses `git status --porcelain=v1 -z` output into the number of uncommitted entries.
+    static func countPorcelainV1ZChanges(_ data: Data) -> Int {
+        let tokens = data.split(separator: 0, omittingEmptySubsequences: true)
+        var count = 0
+        var i = 0
+        while i < tokens.count {
+            let token = tokens[i]
+            i += 1
+            // Each porcelain v1 entry begins with "XY <path>".
+            guard token.count >= 3 else { continue }
+            let x = token[token.startIndex]
+            let y = token[token.index(after: token.startIndex)]
+            if x == UInt8(ascii: "!") && y == UInt8(ascii: "!") { continue }
+            count += 1
+            // Renames and copies in `-z` mode emit an extra NUL-terminated source path.
+            if x == UInt8(ascii: "R") || x == UInt8(ascii: "C")
+                || y == UInt8(ascii: "R") || y == UInt8(ascii: "C") {
+                i += 1
+            }
+        }
+        return count
+    }
+
+    private static func normalizedBranchName(_ raw: String?) -> String? {
+        guard var trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        if trimmed.hasPrefix("refs/heads/") {
+            trimmed = String(trimmed.dropFirst("refs/heads/".count))
+        }
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("-") else { return nil }
+        return trimmed
+    }
+
+    private static func countUncommittedChanges(in worktreeURL: URL) async -> Int {
+        guard FileManager.default.fileExists(atPath: worktreeURL.path),
+              let data = try? await Git.run(["status", "--porcelain=v1", "-z", "--untracked-files=all"], in: worktreeURL) else {
+            return 0
+        }
+        return countPorcelainV1ZChanges(data)
+    }
+
+    private static func resolveWorktreeBranch(explicit: String?, worktreeURL: URL) async -> String? {
+        if let normalized = normalizedBranchName(explicit) {
+            return normalized
+        }
+        return await currentBranch(in: worktreeURL)
+    }
+
+    private static func countUnmergedCommits(branch: String, in repoRoot: URL) async -> Int {
+        let fullRef = "refs/heads/\(branch)"
+        guard let branchOID = try? await Git.runString(["rev-parse", "--verify", "--quiet", fullRef], in: repoRoot)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !branchOID.isEmpty else {
+            return 0
+        }
+
+        // Exclude every commit already reachable from:
+        // 1. Any other local branch (`--exclude=<branch> --branches`),
+        // 2. The branch's configured upstream ref (if still present),
+        // 3. The main repository's HEAD (if valid and not pointing to this branch itself).
+        var args = ["rev-list", "--count", fullRef, "--not", "--exclude=\(branch)", "--branches"]
+
+        if let upstreamOutput = try? await Git.runString(
+            ["for-each-ref", "--format=%(refname)\t%(upstream)", fullRef],
+            in: repoRoot
+        ) {
+            for line in upstreamOutput.split(separator: "\n", omittingEmptySubsequences: true) {
+                let parts = line.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
+                guard parts.count == 2, String(parts[0]) == fullRef else { continue }
+                let upstreamRef = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !upstreamRef.isEmpty,
+                   let upstreamOID = try? await Git.runString(
+                       ["rev-parse", "--verify", "--quiet", upstreamRef],
+                       in: repoRoot
+                   ).trimmingCharacters(in: .whitespacesAndNewlines),
+                   !upstreamOID.isEmpty {
+                    args.append(upstreamOID)
+                }
+                break
+            }
+        }
+
+        let mainHeadRef = (try? await Git.runString(["symbolic-ref", "--quiet", "HEAD"], in: repoRoot))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if mainHeadRef != fullRef,
+           let mainHeadOID = try? await Git.runString(["rev-parse", "--verify", "--quiet", "HEAD"], in: repoRoot)
+               .trimmingCharacters(in: .whitespacesAndNewlines),
+           !mainHeadOID.isEmpty {
+            args.append(mainHeadOID)
+        }
+
+        guard let out = try? await Git.runString(args, in: repoRoot) else { return 0 }
+        return Int(out.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+    }
+}
+
 /// Creating, removing and pruning Git work trees, plus naming helpers for new work tree directories.
 extension Git {
     /// Adds a linked work tree at `path` for `repoDir`.

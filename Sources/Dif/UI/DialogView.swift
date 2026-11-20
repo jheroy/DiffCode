@@ -43,6 +43,36 @@ struct DialogView: View {
             .padding(.horizontal, 20)
             .padding(.top, 20)
 
+            if !request.warnings.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(request.warnings.enumerated()), id: \.offset) { _, warning in
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.ui(size: 11.5, weight: .semibold))
+                                .foregroundStyle(tint)
+                                .padding(.top, 1.5)
+                            Text(warning)
+                                .font(.ui(size: 12))
+                                .foregroundStyle(Color.difText)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .fill(tint.opacity(0.10))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                        .strokeBorder(tint.opacity(0.28), lineWidth: 1)
+                )
+                .padding(.horizontal, 20)
+                .padding(.top, 14)
+            }
+
             if !request.items.isEmpty {
                 VStack(spacing: 0) {
                     ForEach(Array(request.items.enumerated()), id: \.offset) { index, item in
@@ -77,7 +107,9 @@ struct DialogView: View {
             }
 
             if let input = request.input {
-                let problem = text.isEmpty ? nil : input.problem(text.trimmingCharacters(in: .whitespaces))
+                let trimmed = text.trimmingCharacters(in: .whitespaces)
+                let unchangedInitial = !input.text.isEmpty && trimmed == input.text
+                let problem = (text.isEmpty || unchangedInitial) ? nil : input.problem(trimmed)
                 VStack(alignment: .leading, spacing: 5) {
                     TextField(input.placeholder, text: $text)
                         .textFieldStyle(.plain)
@@ -121,6 +153,7 @@ struct DialogView: View {
                     Text(option.title)
                         .font(.ui(size: 12.5))
                         .foregroundStyle(Color.difText)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .toggleStyle(.checkbox)
                 .padding(.horizontal, 20)
