@@ -123,6 +123,12 @@ final class Settings {
     var terminalFontFamily: String?
     var unified: Bool
     var ignoreWhitespace: Bool
+    /// Semantic diff toggles (used by semantic diff engine & viewer toolbar).
+    var ignoreComments: Bool
+    var normalizeJSON: Bool
+    var detectMoves: Bool
+    var detectRenames: Bool
+    var collapseUnchanged: Bool
     var flatList: Bool
     var sidebarWidth: Double
     var listWidth: Double
@@ -242,6 +248,11 @@ final class Settings {
         terminalFontFamily = defaults.string(forKey: "terminalFontFamily").flatMap { $0.isEmpty ? nil : $0 }
         unified = defaults.bool(forKey: "unified")
         ignoreWhitespace = defaults.bool(forKey: "ignoreWhitespace")
+        ignoreComments = defaults.bool(forKey: "ignoreComments")
+        normalizeJSON = defaults.bool(forKey: "normalizeJSON")
+        detectMoves = defaults.object(forKey: "detectMoves") as? Bool ?? true
+        detectRenames = defaults.object(forKey: "detectRenames") as? Bool ?? true
+        collapseUnchanged = defaults.bool(forKey: "collapseUnchanged")
         flatList = defaults.bool(forKey: "flatList")
         let sidebar = defaults.object(forKey: "sidebarWidth") as? Double ?? 240
         sidebarWidth = min(Self.sidebarRange.upperBound, max(Self.sidebarRange.lowerBound, sidebar))
@@ -280,6 +291,11 @@ final class Settings {
         defaults.set(terminalFontFamily, forKey: "terminalFontFamily")
         defaults.set(unified, forKey: "unified")
         defaults.set(ignoreWhitespace, forKey: "ignoreWhitespace")
+        defaults.set(ignoreComments, forKey: "ignoreComments")
+        defaults.set(normalizeJSON, forKey: "normalizeJSON")
+        defaults.set(detectMoves, forKey: "detectMoves")
+        defaults.set(detectRenames, forKey: "detectRenames")
+        defaults.set(collapseUnchanged, forKey: "collapseUnchanged")
         defaults.set(flatList, forKey: "flatList")
         defaults.set(sidebarWidth, forKey: "sidebarWidth")
         defaults.set(listWidth, forKey: "listWidth")

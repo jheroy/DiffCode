@@ -26,6 +26,16 @@ final class ViewerModel: CodeCanvasDelegate {
     @ObservationIgnored private var activeLineDiffLocation: (side: Side, line: Int)?
     /// Conflicts left in the file on screen, when it is one git is merging.
     var conflictCount = 0
+    /// Segments temporarily expanded while `collapseUnchanged` is enabled (cleared on file switch or reload).
+    var expandedFoldSegments: Set<Int> = []
+    /// Hunk indices included by the active AI group filter, or `nil` when showing the full diff.
+    var highlightedGroupHunks: Set<Int>?
+    /// Group filter that was applied to the currently loaded/loading document.
+    @ObservationIgnored private var loadedGroupHunks: Set<Int>?
+    /// Raw hunk focus requested right before a group filter update arrives for the same file.
+    @ObservationIgnored private var pendingRawHunkFocus: (path: String, rawIndex: Int, at: Date)?
+    /// Symbols in the current file whose span overlaps at least one diff hunk.
+    var changedSymbols: [ChangedFileSymbol] = []
     /// How long the last `git blame` took, for the debug hooks.
     @ObservationIgnored var blameMilliseconds: Double = 0
 
@@ -186,8 +196,37 @@ final class ViewerModel: CodeCanvasDelegate {
     /// Not a file in conflict: its conflicts have buttons of their own, which take a whole conflict at a time.
     var canRevertHunks: Bool {
         guard let request, let doc = document, !isLoading, request.isAgainstHead, case .text = doc.content,
-              !doc.isPlainFile, !doc.hunks.isEmpty else { return false }
+              !doc.isPlainFile, !doc.isJSONNormalized, !doc.isGroupFiltered, !doc.hunks.isEmpty else { return false }
         return request.kind == .modified || request.kind == .renamed
+    }
+
+    var isJSONDocument: Bool {
+        guard let request else { return false }
+        return SemanticDiff.isJSONFile(language: document?.language ?? .plain, path: request.path)
+    }
+
+    var movedPairCount: Int {
+        guard let doc = document, case .text = doc.content else { return 0 }
+        return doc.hunks.reduce(0) { $0 + ($1.moveInfo?.role == .source ? 1 : 0) }
+    }
+
+    var activeFoldRegions: [DiffFoldRegion] {
+        guard let doc = document, case .text = doc.content, !doc.isPlainFile, !doc.isAddedOnly,
+              settings?.collapseUnchanged == true else { return [] }
+        return doc.displayMap(expandedSegments: expandedFoldSegments, collapseEnabled: true).foldRegions
+    }
+
+    var activeFoldRegionCount: Int { activeFoldRegions.count }
+
+    var hiddenFoldLineCount: Int {
+        activeFoldRegions.reduce(0) { $0 + $1.hiddenLineCount }
+    }
+
+    var canCollapseUnchanged: Bool {
+        guard let doc = document, case .text = doc.content, !doc.isPlainFile, !doc.isAddedOnly, !doc.hunks.isEmpty else {
+            return false
+        }
+        return !doc.displayMap(expandedSegments: [], collapseEnabled: true).foldRegions.isEmpty
     }
 
     // MARK: Canvas attachment
@@ -257,6 +296,7 @@ final class ViewerModel: CodeCanvasDelegate {
         }
         container.onUserScroll = { [weak self] in self?.detachedFromFocus = true }
         container.show(document, mode: canvasMode, preserveScroll: false)
+        container.canvas.setFolding(enabled: settings.collapseUnchanged, expandedSegments: expandedFoldSegments)
         container.canvas.showsRevertButtons = canRevertHunks
         container.canvas.editor = editor
         container.canvas.isLSPEnabled = isCurrentDocumentLSPEnabled
@@ -395,6 +435,10 @@ final class ViewerModel: CodeCanvasDelegate {
         document = nil
         activeLineDiffLocation = nil
         lineDiffSnapshot = nil
+        expandedFoldSegments = []
+        changedSymbols = []
+        loadedGroupHunks = nil
+        pendingRawHunkFocus = nil
         isLoading = false
         hunkCount = 0
         focusedHunk = nil
@@ -461,6 +505,10 @@ final class ViewerModel: CodeCanvasDelegate {
 
         let preservedLineDiffLocation = preserveScroll ? activeLineDiffLocation : nil
         endEditing()
+        if let settings {
+            doc.semanticOptions.collapseUnchanged = settings.collapseUnchanged
+        }
+        expandedFoldSegments = []
         document = doc
         activeLineDiffLocation = preservedLineDiffLocation
         isLoading = false
@@ -602,6 +650,7 @@ final class ViewerModel: CodeCanvasDelegate {
         if resetVimToNormal && container.canvas.vimModeEnabled {
             container.canvas.vimEngine.resetToNormal(switchInputSource: true)
         }
+        ensureLineVisible(index, side: .right)
         container.canvas.placeCaret(line: index, column: targetCol)
         if resetVimToNormal && container.canvas.vimModeEnabled {
             container.canvas.reportVimStateIfNeeded(force: true)
@@ -729,6 +778,182 @@ final class ViewerModel: CodeCanvasDelegate {
         guard var request else { return }
         request.ignoreWhitespace = settings.ignoreWhitespace
         load(request, line: nil, preserveScroll: true)
+    }
+
+    // MARK: SemanticDiff controls & folding
+
+    func toggleIgnoreComments() {
+        settings.ignoreComments.toggle()
+        settings.save()
+        syncSemanticOptions()
+    }
+
+    func toggleNormalizeJSON() {
+        settings.normalizeJSON.toggle()
+        settings.save()
+        syncSemanticOptions()
+    }
+
+    func toggleDetectMoves() {
+        settings.detectMoves.toggle()
+        settings.save()
+        syncSemanticOptions()
+    }
+
+    func toggleDetectRenames() {
+        settings.detectRenames.toggle()
+        settings.save()
+        syncSemanticOptions()
+    }
+
+    func toggleCollapseUnchanged() {
+        settings.collapseUnchanged.toggle()
+        settings.save()
+        syncSemanticOptions()
+    }
+
+    /// Reconciles the open request/document with `settings.semanticDiffOptions`.
+    /// Folding toggles update the canvas immediately without reloading; structural diff options reload the diff.
+    func syncSemanticOptions() {
+        guard let settings else { return }
+        let desired = settings.semanticDiffOptions
+        guard var current = request else { return }
+        guard current.semantic != desired else { return }
+
+        let onlyCollapseChanged =
+            current.semantic.ignoreComments == desired.ignoreComments
+            && current.semantic.normalizeJSON == desired.normalizeJSON
+            && current.semantic.detectMoves == desired.detectMoves
+            && current.semantic.detectRenames == desired.detectRenames
+
+        current.semantic = desired
+        if onlyCollapseChanged {
+            self.request = current
+            document?.semanticOptions.collapseUnchanged = desired.collapseUnchanged
+            expandedFoldSegments = []
+            container?.canvas.setFolding(enabled: desired.collapseUnchanged, expandedSegments: expandedFoldSegments)
+        } else {
+            load(current, line: nil, preserveScroll: true)
+        }
+    }
+
+    func toggleFoldSegment(_ segmentIndex: Int) {
+        if expandedFoldSegments.contains(segmentIndex) {
+            expandedFoldSegments.remove(segmentIndex)
+        } else {
+            expandedFoldSegments.insert(segmentIndex)
+        }
+        container?.canvas.setFolding(enabled: settings?.collapseUnchanged ?? false, expandedSegments: expandedFoldSegments)
+    }
+
+    func expandFoldSegment(_ segmentIndex: Int) {
+        guard expandedFoldSegments.insert(segmentIndex).inserted else { return }
+        container?.canvas.setFolding(enabled: settings?.collapseUnchanged ?? false, expandedSegments: expandedFoldSegments)
+    }
+
+    func expandAllFolds() {
+        guard let doc = document else { return }
+        let allRegions = doc.displayMap(expandedSegments: [], collapseEnabled: true).foldRegions
+        guard !allRegions.isEmpty else { return }
+        expandedFoldSegments.formUnion(allRegions.map(\.segmentIndex))
+        container?.canvas.setFolding(enabled: settings?.collapseUnchanged ?? false, expandedSegments: expandedFoldSegments)
+    }
+
+    func collapseAllFolds() {
+        guard !expandedFoldSegments.isEmpty || settings?.collapseUnchanged != true else { return }
+        if let settings, !settings.collapseUnchanged {
+            settings.collapseUnchanged = true
+            settings.save()
+            request?.semantic.collapseUnchanged = true
+            document?.semanticOptions.collapseUnchanged = true
+        }
+        expandedFoldSegments = []
+        container?.canvas.setFolding(enabled: true, expandedSegments: expandedFoldSegments)
+    }
+
+    private func ensureLineVisible(_ line: Int, side: Side) {
+        guard settings?.collapseUnchanged == true, let doc = document else { return }
+        let map = doc.displayMap(expandedSegments: expandedFoldSegments, collapseEnabled: true)
+        if let region = map.foldRegion(containingLine: line, side: side) {
+            expandFoldSegment(region.segmentIndex)
+        }
+    }
+
+    func jumpToMoveCounterpart(forHunk hunkIndex: Int) {
+        guard let doc = document, doc.hunks.indices.contains(hunkIndex),
+              let move = doc.hunks[hunkIndex].moveInfo,
+              doc.hunks.indices.contains(move.counterpartHunkIndex) else { return }
+        let target = move.counterpartHunkIndex
+        focusFilteredHunk(target, animated: true)
+    }
+
+    func stepMovedHunk() {
+        guard let doc = document else { return }
+        let movedIndices = doc.hunks.indices.filter { doc.hunks[$0].moveInfo != nil }
+        guard !movedIndices.isEmpty else { return }
+        if let current = focusedHunk, let pos = movedIndices.firstIndex(of: current) {
+            let next = movedIndices[(pos + 1) % movedIndices.count]
+            focusFilteredHunk(next, animated: true)
+        } else {
+            focusFilteredHunk(movedIndices[0], animated: true)
+        }
+    }
+
+    func jumpToRenameGroup(_ group: RenameGroup) {
+        guard let first = group.hunkIndices.first else { return }
+        focusFilteredHunk(first, animated: true)
+    }
+
+    func setHighlightedGroupHunks(_ hunks: Set<Int>?) {
+        guard highlightedGroupHunks != hunks || (request != nil && loadedGroupHunks != hunks) else { return }
+        highlightedGroupHunks = hunks
+        guard let req = request else { return }
+        guard loadedGroupHunks != hunks else { return }
+
+        // Fast synchronous in-memory re-filtering when switching between AI groups on the same unmodified loaded text file.
+        let hasInlineEdits = (editor?.hasEdits ?? false) || (editor?.isDirty ?? false) || (editor?.version ?? 0) > 0
+        if let newSet = hunks, !isLoading, !hasInlineEdits,
+           let doc = document, case .text = doc.content, !doc.isPlainFile,
+           let baseline = doc.groupFilterBaseline {
+            saveEdits()
+            loadTask?.cancel()
+            loadedGroupHunks = newSet
+            let filteredDoc = DiffLoader.buildGroupFiltered(
+                baseline: baseline,
+                includedGroupHunks: newSet,
+                language: doc.language,
+                semanticOptions: settings?.semanticDiffOptions ?? req.semantic,
+                ignoreWhitespace: req.ignoreWhitespace,
+                leftTitle: doc.leftTitle,
+                rightTitle: doc.rightTitle
+            )
+            apply(filteredDoc, preserveScroll: false)
+            return
+        }
+
+        // Switching back to full editable diff (`nil`), or re-filtering while a load is in flight.
+        load(req, line: pendingLine, column: pendingColumn, preserveScroll: hunks == nil)
+    }
+
+    func refreshChangedSymbols(for doc: DiffDocument? = nil) {
+        let targetDoc = doc ?? document
+        guard let targetDoc, case .text = targetDoc.content, !targetDoc.isPlainFile,
+              !targetDoc.hunks.isEmpty, targetDoc.language.family != .plain,
+              targetDoc.right.lines.count <= 20_000 else {
+            if !changedSymbols.isEmpty { changedSymbols = [] }
+            return
+        }
+        let symbols = FileSymbolExtractor.extract(lines: targetDoc.right.lines, language: targetDoc.language)
+        let changed = FileSymbolExtractor.changedSymbols(symbols: symbols, hunks: targetDoc.hunks, side: .right)
+        if changedSymbols != changed { changedSymbols = changed }
+    }
+
+    func jumpToChangedSymbol(_ item: ChangedFileSymbol) {
+        reveal(line: item.symbol.lineNumber, column: item.symbol.column)
+        if let firstHunk = item.hunkIndices.first, let doc = document, doc.hunks.indices.contains(firstHunk) {
+            focusedHunk = firstHunk
+            container?.canvas.focusedHunk = firstHunk
+        }
     }
 
     func changeFontSize(by delta: Double) {
@@ -866,6 +1091,7 @@ final class ViewerModel: CodeCanvasDelegate {
 
     private func revealMatch(_ match: SearchMatch, center: Bool = false) {
         guard let container else { return }
+        ensureLineVisible(match.line, side: match.side)
         let row = container.canvas.row(forLine: match.line, side: match.side)
         if center {
             container.scroll(toRow: row, fraction: 0.5, animated: false)
@@ -967,6 +1193,14 @@ final class ViewerModel: CodeCanvasDelegate {
         onRecordJump?(origin.row, origin.column)
     }
 
+    func canvas(_ canvas: CodeCanvasView, jumpToMoveCounterpart hunkIndex: Int) {
+        jumpToMoveCounterpart(forHunk: hunkIndex)
+    }
+
+    func canvas(_ canvas: CodeCanvasView, expandFoldSegment segmentIndex: Int) {
+        expandFoldSegment(segmentIndex)
+    }
+
     func canvas(_ canvas: CodeCanvasView, performVimAction action: VimAction, line: Int, column: Int) {
         switch action {
         case .openFind:
@@ -1000,7 +1234,7 @@ final class ViewerModel: CodeCanvasDelegate {
             canvas.redoTyping()
         case .readOnlyNotice:
             onToast?(readOnlyReason ?? L("Read-only file", "只读文件"))
-        case .goToDefinition, .findReferences, .goToFile, .searchEverywhere, .findAction,
+        case .goToDefinition, .findReferences, .goToFile, .goToSymbol, .searchEverywhere, .findAction,
              .gitPull, .gitPush, .toggleGitGraph, .toggleMaximizeViewer, .locateInTree,
              .toggleFileTree, .navigateBack, .navigateForward, .focusLeftPane, .focusRightPane, .quit:
             onVimAction?(action, line, column)
@@ -1013,5 +1247,18 @@ final class ViewerModel: CodeCanvasDelegate {
             changeFontSize(by: magnification > 0 ? 1 : -1)
             magnification = 0
         }
+    }
+}
+
+extension Settings {
+    /// Bridges the 5 persisted SemanticDiff preference switches into `SemanticDiffOptions`.
+    var semanticDiffOptions: SemanticDiffOptions {
+        SemanticDiffOptions(
+            ignoreComments: ignoreComments,
+            normalizeJSON: normalizeJSON,
+            detectMoves: detectMoves,
+            detectRenames: detectRenames,
+            collapseUnchanged: collapseUnchanged
+        )
     }
 }

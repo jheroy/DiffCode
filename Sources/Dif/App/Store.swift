@@ -122,7 +122,10 @@ final class AppStore {
         viewer.contextMenuProvider = { [weak self] in self?.viewerContextMenu() }
         viewer.onRevertHunk = { [weak self] index in self?.rollbackHunk(index) }
         viewer.onToggleCommitHunk = { [weak self] index in self?.toggleCommitHunk(index) }
-        viewer.onDocumentChanged = { [weak self] in self?.viewerDocumentChanged() }
+        viewer.onDocumentChanged = { [weak self] in
+            self?.viewerDocumentChanged()
+            self?.applyPendingGroupHunkFocus()
+        }
         // A save shows in the Changes list straight away, without waiting for the file watcher.
         viewer.onFileWritten = { [weak self] root in self?.projects.first { $0.url == root }?.refresh() }
         viewer.onOpenAnnotation = { [weak self] entry in self?.openAnnotation(entry) }

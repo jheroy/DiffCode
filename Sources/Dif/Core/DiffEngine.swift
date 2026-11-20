@@ -120,8 +120,8 @@ struct EditInfo {
     var readOnlyReason: String?
 }
 
-struct Hunk: Equatable {
-    enum Kind { case added, deleted, modified }
+struct Hunk: Equatable, Sendable {
+    enum Kind: Equatable, Hashable, Sendable { case added, deleted, modified }
 
     var leftStart: Int
     var leftCount: Int
@@ -130,6 +130,8 @@ struct Hunk: Equatable {
     /// Changed character ranges (UTF-16) per line of the hunk, for word-level highlighting.
     var leftInline: [[Range<Int>]] = []
     var rightInline: [[Range<Int>]] = []
+    /// Populated when intra-file move detection pairs this hunk with a counterpart hunk.
+    var moveInfo: HunkMoveInfo? = nil
 
     var kind: Kind {
         if leftCount == 0 { return .added }
@@ -141,7 +143,7 @@ struct Hunk: Equatable {
 /// A run of lines that scrolls as a unit. Unchanged runs have equal counts on both sides;
 /// a hunk occupies `max(leftCount, rightCount)` virtual lines so the shorter side scrolls
 /// proportionally slower and the two panes stay aligned without padding.
-struct Segment {
+struct Segment: Equatable, Sendable {
     var virtualStart: Int
     var leftStart: Int
     var leftCount: Int
@@ -160,7 +162,18 @@ struct UnifiedRow {
     var hunk: Int32
 }
 
-enum Side: Int { case left = 0, right = 1 }
+enum Side: Int, Hashable, Sendable { case left = 0, right = 1 }
+
+/// Cached raw unfiltered lines and 0-based raw hunks (matching `AIHunkGrouper`) so switching
+/// between AI groups on the same file re-filters in memory without re-reading disk or spawning git.
+struct GroupFilterBaseline {
+    var oldLines: [String]?
+    var newLines: [String]?
+    var rawHunks: [Hunk]
+    var rightSpans: [[SyntaxSpan]]
+    var shouldHighlight: Bool
+    var hasWorktreeFile: Bool
+}
 
 final class DiffDocument {
     enum Content {
@@ -185,6 +198,23 @@ final class DiffDocument {
     var loadMilliseconds: Double = 0
     /// Set when the right side is a file in the working tree: how to write it back, or why it cannot be.
     var editing: EditInfo?
+    /// Active SemanticDiff options used to build this document.
+    var semanticOptions: SemanticDiffOptions = .disabled
+    /// True when both sides were canonically normalized as JSON (right side is read-only).
+    var isJSONNormalized: Bool = false
+    /// True when this document is filtered to show only one AI group's hunks (read-only view).
+    var isGroupFiltered: Bool = false
+    /// Maps original 0-based raw hunk indices to their 0-based indices in this filtered document's `hunks`.
+    var groupHunkIndexMap: [Int: Int] = [:]
+    /// Cached unfiltered baseline lines & raw hunks so switching AI groups on the same file is instantaneous.
+    var groupFilterBaseline: GroupFilterBaseline?
+    /// Comment-only hunks hidden when `semanticOptions.ignoreComments == true`.
+    private(set) var hiddenCommentHunks: [Hunk] = []
+    /// Number of comment-only hunks hidden from `hunks` by `ignoreComments`.
+    var hiddenCommentHunkCount: Int { hiddenCommentHunks.count }
+    /// Cross-hunk identifier rename groups detected when `semanticOptions.detectRenames == true`.
+    private(set) var renameGroups: [RenameGroup] = []
+    private var renameIndex: SemanticRenameIndex = .empty
 
     private var unifiedCache: [UnifiedRow]?
     var unifiedRows: [UnifiedRow] {
@@ -203,47 +233,164 @@ final class DiffDocument {
     }
 
     init(left: TextBuffer, right: TextBuffer, hunks: [Hunk], language: LanguageSpec,
-         content: Content = .text, isPlainFile: Bool = false) {
+         content: Content = .text, isPlainFile: Bool = false, hiddenCommentHunks: [Hunk] = []) {
         self.left = left
         self.right = right
         self.language = language
         self.content = content
         self.isPlainFile = isPlainFile
-        (self.hunks, segments, virtualLineCount) = Self.layout(hunks, leftCount: left.lines.count, rightCount: right.lines.count)
+        (self.hunks, self.hiddenCommentHunks, segments, virtualLineCount) = Self.layout(
+            hunks,
+            hiddenCommentHunks: hiddenCommentHunks,
+            leftCount: left.lines.count,
+            rightCount: right.lines.count
+        )
     }
 
     /// New hunks for the same two sides, e.g. after the right side was edited (its buffer is shared, so it already has the new lines).
-    func setHunks(_ hunks: [Hunk]) {
-        (self.hunks, segments, virtualLineCount) = Self.layout(hunks, leftCount: left.lines.count, rightCount: right.lines.count)
+    func setHunks(_ hunks: [Hunk], hiddenCommentHunks: [Hunk] = []) {
+        (self.hunks, self.hiddenCommentHunks, segments, virtualLineCount) = Self.layout(
+            hunks,
+            hiddenCommentHunks: hiddenCommentHunks,
+            leftCount: left.lines.count,
+            rightCount: right.lines.count
+        )
+        groupFilterBaseline = nil
         unifiedCache = nil
     }
 
-    private static func layout(_ hunks: [Hunk], leftCount: Int, rightCount: Int) -> ([Hunk], [Segment], Int) {
-        // Clamp defensively: the file may have changed between reading it and diffing it.
+    /// Stores detected cross-hunk rename groups and rebuilds the O(1) lookup index.
+    func setRenameGroups(_ groups: [RenameGroup]) {
+        renameGroups = groups
+        renameIndex = SemanticRenameIndex(groups: groups)
+    }
+
+    /// O(1) lookup of rename palette color index for a specific inline diff span.
+    func renameColorIndex(hunkIndex: Int, side: Side, lineIndex: Int, range: Range<Int>) -> Int? {
+        renameIndex.colorIndex(hunkIndex: hunkIndex, side: side, lineIndex: lineIndex, range: range)
+    }
+
+    /// O(1) lookup of rename palette color index for an `(oldName, newName)` pair.
+    func renameColorIndex(oldName: String, newName: String) -> Int? {
+        renameIndex.colorIndex(oldName: oldName, newName: newName)
+    }
+
+    /// O(1) lookup of the `RenameGroup` for an `(oldName, newName)` pair.
+    func renameGroup(for oldName: String, newName: String) -> RenameGroup? {
+        renameIndex.group(oldName: oldName, newName: newName)
+    }
+
+    /// O(1) lookup of all rename highlight spans on `lineIndex` of `side`.
+    func renameOccurrences(side: Side, lineIndex: Int) -> [RenameOccurrence] {
+        renameIndex.occurrences(side: side, lineIndex: lineIndex)
+    }
+
+    /// Builds a `DiffDisplayMap` for this document using its `semanticOptions` folding parameters.
+    func displayMap(expandedSegments: Set<Int> = [], collapseEnabled: Bool? = nil) -> DiffDisplayMap {
+        DiffDisplayMap(
+            document: self,
+            expandedSegments: expandedSegments,
+            collapseEnabled: collapseEnabled ?? semanticOptions.collapseUnchanged,
+            contextLines: semanticOptions.collapseContextLines,
+            minHiddenLines: semanticOptions.collapseMinHiddenLines
+        )
+    }
+
+    private static func layout(
+        _ hunks: [Hunk],
+        hiddenCommentHunks: [Hunk] = [],
+        leftCount: Int,
+        rightCount: Int
+    ) -> ([Hunk], [Hunk], [Segment], Int) {
+        if hiddenCommentHunks.isEmpty {
+            // Fast path identical to standard diff layout.
+            var clean: [Hunk] = []
+            var lpos = 0, rpos = 0
+            for var h in hunks {
+                h.leftStart = min(max(h.leftStart, lpos), leftCount)
+                h.rightStart = min(max(h.rightStart, rpos), rightCount)
+                h.leftCount = max(0, min(h.leftCount, leftCount - h.leftStart))
+                h.rightCount = max(0, min(h.rightCount, rightCount - h.rightStart))
+                if h.leftCount == 0 && h.rightCount == 0 { continue }
+                clean.append(h)
+                lpos = h.leftStart + h.leftCount
+                rpos = h.rightStart + h.rightCount
+            }
+
+            var segs: [Segment] = []
+            var v = 0
+            lpos = 0; rpos = 0
+            for (index, h) in clean.enumerated() {
+                let gapL = h.leftStart - lpos, gapR = h.rightStart - rpos
+                if gapL > 0 || gapR > 0 {
+                    segs.append(Segment(virtualStart: v, leftStart: lpos, leftCount: gapL, rightStart: rpos, rightCount: gapR, hunk: -1))
+                    v += max(gapL, gapR)
+                }
+                segs.append(Segment(virtualStart: v, leftStart: h.leftStart, leftCount: h.leftCount,
+                                    rightStart: h.rightStart, rightCount: h.rightCount, hunk: index))
+                v += max(h.leftCount, h.rightCount)
+                lpos = h.leftStart + h.leftCount
+                rpos = h.rightStart + h.rightCount
+            }
+            let tailL = leftCount - lpos, tailR = rightCount - rpos
+            if tailL > 0 || tailR > 0 {
+                segs.append(Segment(virtualStart: v, leftStart: lpos, leftCount: tailL, rightStart: rpos, rightCount: tailR, hunk: -1))
+                v += max(tailL, tailR)
+            }
+            return (clean, [], segs, v)
+        }
+
+        // Interleave visible hunks and hidden comment-only hunks (as `hunk: -1` segments)
+        // so surrounding identical code keeps exact 1:1 alignment on both sides.
+        struct CombinedEntry {
+            var hunk: Hunk
+            var isHidden: Bool
+        }
+        var combined: [CombinedEntry] = []
+        combined.reserveCapacity(hunks.count + hiddenCommentHunks.count)
+        for h in hunks { combined.append(CombinedEntry(hunk: h, isHidden: false)) }
+        for h in hiddenCommentHunks { combined.append(CombinedEntry(hunk: h, isHidden: true)) }
+        combined.sort { lhs, rhs in
+            if lhs.hunk.leftStart != rhs.hunk.leftStart { return lhs.hunk.leftStart < rhs.hunk.leftStart }
+            if lhs.hunk.rightStart != rhs.hunk.rightStart { return lhs.hunk.rightStart < rhs.hunk.rightStart }
+            return !lhs.isHidden && rhs.isHidden
+        }
+
         var clean: [Hunk] = []
+        var cleanHidden: [Hunk] = []
+        var clampedEntries: [CombinedEntry] = []
         var lpos = 0, rpos = 0
-        for var h in hunks {
-            h.leftStart = min(max(h.leftStart, lpos), leftCount)
-            h.rightStart = min(max(h.rightStart, rpos), rightCount)
-            h.leftCount = max(0, min(h.leftCount, leftCount - h.leftStart))
-            h.rightCount = max(0, min(h.rightCount, rightCount - h.rightStart))
-            if h.leftCount == 0 && h.rightCount == 0 { continue }
-            clean.append(h)
-            lpos = h.leftStart + h.leftCount
-            rpos = h.rightStart + h.rightCount
+        for var entry in combined {
+            entry.hunk.leftStart = min(max(entry.hunk.leftStart, lpos), leftCount)
+            entry.hunk.rightStart = min(max(entry.hunk.rightStart, rpos), rightCount)
+            entry.hunk.leftCount = max(0, min(entry.hunk.leftCount, leftCount - entry.hunk.leftStart))
+            entry.hunk.rightCount = max(0, min(entry.hunk.rightCount, rightCount - entry.hunk.rightStart))
+            if entry.hunk.leftCount == 0 && entry.hunk.rightCount == 0 { continue }
+            if entry.isHidden {
+                cleanHidden.append(entry.hunk)
+            } else {
+                clean.append(entry.hunk)
+            }
+            clampedEntries.append(entry)
+            lpos = entry.hunk.leftStart + entry.hunk.leftCount
+            rpos = entry.hunk.rightStart + entry.hunk.rightCount
         }
 
         var segs: [Segment] = []
         var v = 0
+        var visibleIndex = 0
         lpos = 0; rpos = 0
-        for (index, h) in clean.enumerated() {
+        for entry in clampedEntries {
+            let h = entry.hunk
             let gapL = h.leftStart - lpos, gapR = h.rightStart - rpos
             if gapL > 0 || gapR > 0 {
                 segs.append(Segment(virtualStart: v, leftStart: lpos, leftCount: gapL, rightStart: rpos, rightCount: gapR, hunk: -1))
                 v += max(gapL, gapR)
             }
+            let hunkTag = entry.isHidden ? -1 : visibleIndex
+            if !entry.isHidden { visibleIndex += 1 }
             segs.append(Segment(virtualStart: v, leftStart: h.leftStart, leftCount: h.leftCount,
-                                rightStart: h.rightStart, rightCount: h.rightCount, hunk: index))
+                                rightStart: h.rightStart, rightCount: h.rightCount, hunk: hunkTag))
             v += max(h.leftCount, h.rightCount)
             lpos = h.leftStart + h.leftCount
             rpos = h.rightStart + h.rightCount
@@ -253,7 +400,7 @@ final class DiffDocument {
             segs.append(Segment(virtualStart: v, leftStart: lpos, leftCount: tailL, rightStart: rpos, rightCount: tailR, hunk: -1))
             v += max(tailL, tailR)
         }
-        return (clean, segs, v)
+        return (clean, cleanHidden, segs, v)
     }
 
     static func message(_ title: String, detail: String = "") -> DiffDocument {
@@ -309,12 +456,18 @@ final class DiffDocument {
         rows.reserveCapacity(virtualLineCount + hunks.count * 4)
         for s in segments {
             if s.hunk < 0 {
-                for k in 0..<min(s.leftCount, s.rightCount) {
+                let common = min(s.leftCount, s.rightCount)
+                for k in 0..<common {
                     rows.append(UnifiedRow(kind: .context, left: Int32(s.leftStart + k), right: Int32(s.rightStart + k), hunk: -1))
                 }
-                // Only an empty file's one blank line has no partner on the left; it still needs a row to type on.
-                for k in s.leftCount..<max(s.leftCount, s.rightCount) {
-                    rows.append(UnifiedRow(kind: .context, left: -1, right: Int32(s.rightStart + k), hunk: -1))
+                if s.leftCount < s.rightCount {
+                    for k in common..<s.rightCount {
+                        rows.append(UnifiedRow(kind: .context, left: -1, right: Int32(s.rightStart + k), hunk: -1))
+                    }
+                } else if s.rightCount < s.leftCount {
+                    for k in common..<s.leftCount {
+                        rows.append(UnifiedRow(kind: .context, left: Int32(s.leftStart + k), right: -1, hunk: -1))
+                    }
                 }
             } else {
                 for k in 0..<s.leftCount {
@@ -844,6 +997,7 @@ struct DiffRequest: Equatable {
     var kind: FileChange.Kind?
     var source: Source
     var ignoreWhitespace = false
+    var semantic: SemanticDiffOptions = .default
 
     /// A local change as the Changes list has it: the working tree against HEAD, not against another commit.
     var isAgainstHead: Bool {
@@ -907,9 +1061,9 @@ enum DiffLoader {
         try? FileManager.default.removeItem(at: scratch)
     }
 
-    static func load(_ request: DiffRequest) async -> DiffDocument {
+    static func load(_ request: DiffRequest, includedGroupHunks: Set<Int>? = nil) async -> DiffDocument {
         let started = DispatchTime.now()
-        let doc = await build(request)
+        let doc = await build(request, includedGroupHunks: includedGroupHunks)
         doc.loadMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000
         return doc
     }
@@ -970,7 +1124,7 @@ enum DiffLoader {
         return try? Data(contentsOf: url, options: .mappedIfSafe)
     }
 
-    private static func build(_ request: DiffRequest) async -> DiffDocument {
+    private static func build(_ request: DiffRequest, includedGroupHunks: Set<Int>? = nil) async -> DiffDocument {
         if Self.isSpreadsheetPath(request.path) {
             return await buildSpreadsheet(request)
         }
@@ -1059,8 +1213,20 @@ enum DiffLoader {
                                    detail: max(oldData?.count ?? 0, newData?.count ?? 0).byteSizeString))
         }
 
-        // Decode and highlight both sides in parallel. The working tree side is read so that it can be edited.
-        let (oldBytes, newBytes) = (oldData, newData)
+        // Optional JSON semantic normalization (pretty-printed, sorted keys). Silently falls back on parse failure.
+        // Disabled while filtering an AI group so raw 0-based hunk indices match AIHunkGrouper verbatim.
+        let semanticOptions = request.semantic
+        let isGroupFilterActive = includedGroupHunks != nil
+        let jsonResult: (old: Data?, new: Data?, normalized: Bool)
+        if !isGroupFilterActive && semanticOptions.normalizeJSON && SemanticDiff.isJSONFile(language: language, path: request.path) {
+            jsonResult = SemanticDiff.normalizeJSONPair(old: oldData, new: newData)
+        } else {
+            jsonResult = (oldData, newData, false)
+        }
+        let isJSONNormalized = jsonResult.normalized
+        let oldBytes = jsonResult.old
+        let newBytes = jsonResult.new
+
         var worktreeURL: URL?
         if case .worktree = request.source, newBytes != nil { worktreeURL = root.appendingPathComponent(request.path) }
         let url = worktreeURL
@@ -1116,17 +1282,20 @@ enum DiffLoader {
         // Decode and highlight both sides in parallel. The working tree side is read so that it can be edited
         // (except in JSON normalized view, where the right side stays read-only to avoid overwriting raw formatting).
         async let leftBuffer: TextBuffer = makeBuffer(oldBytes, language)
-        async let rightSide: (TextBuffer, EditInfo?) = makeRightSide(newBytes, language, worktree: url, base: oldBytes)
+        async let rightSide: (TextBuffer, EditInfo?) = isJSONNormalized
+            ? (await makeBuffer(newBytes, language),
+               url != nil ? EditInfo(readOnlyReason: L("JSON normalized view · read-only", "JSON 语义归一化视图 · 只读")) : nil)
+            : await makeRightSide(newBytes, language, worktree: url, base: oldBytes)
         async let rawHunks: [Hunk]? = computeHunks(old: oldBytes, new: newBytes, ignoreWhitespace: request.ignoreWhitespace)
         let left = await leftBuffer
         let (right, editing) = await rightSide
 
         var hunks: [Hunk]
-        if oldData == nil {
+        if oldBytes == nil {
             // A new file: every line is added. An empty one has nothing to show, though it has a line to type on.
-            hunks = (newData?.isEmpty ?? true) ? [] : [Hunk(leftStart: 0, leftCount: 0, rightStart: 0, rightCount: right.lines.count)]
+            hunks = (newBytes?.isEmpty ?? true) ? [] : [Hunk(leftStart: 0, leftCount: 0, rightStart: 0, rightCount: right.lines.count)]
             _ = await rawHunks
-        } else if newData == nil {
+        } else if newBytes == nil {
             hunks = left.lines.isEmpty ? [] : [Hunk(leftStart: 0, leftCount: left.lines.count, rightStart: 0, rightCount: 0)]
             _ = await rawHunks
         } else if let computed = await rawHunks {
@@ -1134,12 +1303,295 @@ enum DiffLoader {
         } else {
             return finish(.message(L("Could not compute diff", "无法计算差异"), detail: request.path))
         }
+
+        let processed = applySemanticPostProcessing(
+            hunks: hunks,
+            left: left,
+            right: right,
+            language: language,
+            options: semanticOptions,
+            bothSidesExist: oldBytes != nil && newBytes != nil
+        )
+
+        let doc = DiffDocument(
+            left: left,
+            right: right,
+            hunks: processed.hunks,
+            language: language,
+            hiddenCommentHunks: processed.hiddenCommentHunks
+        )
+        doc.semanticOptions = semanticOptions
+        doc.isJSONNormalized = isJSONNormalized
+        doc.setRenameGroups(processed.renameGroups)
+        doc.editing = editing
+        if !isJSONNormalized && !request.ignoreWhitespace {
+            doc.groupFilterBaseline = GroupFilterBaseline(
+                oldLines: oldBytes != nil ? left.lines : nil,
+                newLines: newBytes != nil ? right.lines : nil,
+                rawHunks: hunks,
+                rightSpans: right.spans,
+                shouldHighlight: max(oldBytes?.count ?? 0, newBytes?.count ?? 0) <= 4 * 1024 * 1024,
+                hasWorktreeFile: url != nil
+            )
+        }
+        doc.note = note(
+            hunks: doc.hunks,
+            old: oldData,
+            new: newData,
+            ignoreWhitespace: request.ignoreWhitespace,
+            hiddenCommentHunkCount: doc.hiddenCommentHunkCount,
+            isJSONNormalized: isJSONNormalized
+        )
+        return finish(doc)
+    }
+
+    /// Builds a read-only, content-level AI group-filtered `DiffDocument` synchronously from an
+    /// already-loaded `GroupFilterBaseline` (zero disk I/O or git subprocesses).
+    static func buildGroupFiltered(
+        baseline: GroupFilterBaseline,
+        includedGroupHunks: Set<Int>,
+        language: LanguageSpec,
+        semanticOptions: SemanticDiffOptions,
+        ignoreWhitespace: Bool,
+        leftTitle: String,
+        rightTitle: String
+    ) -> DiffDocument {
+        let left: TextBuffer
+        let right: TextBuffer
+        var filteredHunks: [Hunk]
+        var rawToFiltered: [Int: Int]
+        let bothSidesExist: Bool
+
+        if let oldLines = baseline.oldLines, let newLines = baseline.newLines {
+            let result = SemanticDiff.applyGroupHunkFilter(
+                oldLines: oldLines,
+                newLines: newLines,
+                rawHunks: baseline.rawHunks,
+                includedHunkIndices: includedGroupHunks
+            )
+            left = TextBuffer(lines: result.filteredOldLines)
+            if baseline.shouldHighlight {
+                left.spans = Highlighter.highlight(left.lines, language: language)
+            }
+            right = TextBuffer(lines: newLines)
+            if baseline.rightSpans.count == newLines.count {
+                right.spans = baseline.rightSpans
+            } else if baseline.shouldHighlight {
+                right.spans = Highlighter.highlight(newLines, language: language)
+            }
+            filteredHunks = result.filteredHunks
+            rawToFiltered = result.rawToFilteredIndex
+            bothSidesExist = true
+        } else if let newLines = baseline.newLines {
+            // Added / untracked file: single raw hunk at index 0.
+            right = TextBuffer(lines: newLines)
+            if baseline.rightSpans.count == newLines.count {
+                right.spans = baseline.rightSpans
+            } else if baseline.shouldHighlight {
+                right.spans = Highlighter.highlight(newLines, language: language)
+            }
+            if !newLines.isEmpty && includedGroupHunks.contains(0) {
+                left = .empty
+                filteredHunks = [Hunk(leftStart: 0, leftCount: 0, rightStart: 0, rightCount: newLines.count)]
+                rawToFiltered = [0: 0]
+                bothSidesExist = false
+            } else {
+                left = TextBuffer(lines: newLines)
+                left.spans = right.spans
+                filteredHunks = []
+                rawToFiltered = [:]
+                bothSidesExist = true
+            }
+        } else if let oldLines = baseline.oldLines {
+            // Deleted file: single raw hunk at index 0.
+            right = .empty
+            if !oldLines.isEmpty && includedGroupHunks.contains(0) {
+                left = TextBuffer(lines: oldLines)
+                if baseline.shouldHighlight {
+                    left.spans = Highlighter.highlight(oldLines, language: language)
+                }
+                filteredHunks = [Hunk(leftStart: 0, leftCount: oldLines.count, rightStart: 0, rightCount: 0)]
+                rawToFiltered = [0: 0]
+            } else {
+                left = .empty
+                filteredHunks = []
+                rawToFiltered = [:]
+            }
+            bothSidesExist = false
+        } else {
+            left = .empty
+            right = .empty
+            filteredHunks = []
+            rawToFiltered = [:]
+            bothSidesExist = false
+        }
+
+        // Apply ignore-whitespace filtering on kept hunks while preserving raw -> filtered index mapping.
+        if ignoreWhitespace && bothSidesExist && !filteredHunks.isEmpty {
+            var kept: [Hunk] = []
+            var oldFilteredToNewFiltered: [Int: Int] = [:]
+            for (idx, h) in filteredHunks.enumerated() {
+                if !isWhitespaceOnlyHunk(h, leftLines: left.lines, rightLines: right.lines) {
+                    oldFilteredToNewFiltered[idx] = kept.count
+                    kept.append(h)
+                }
+            }
+            filteredHunks = kept
+            var remapped: [Int: Int] = [:]
+            for (rawIdx, oldFIdx) in rawToFiltered {
+                if let newFIdx = oldFilteredToNewFiltered[oldFIdx] {
+                    remapped[rawIdx] = newFIdx
+                }
+            }
+            rawToFiltered = remapped
+        }
+
+        let processed = applySemanticPostProcessingWithMapping(
+            hunks: filteredHunks,
+            left: left,
+            right: right,
+            language: language,
+            options: semanticOptions,
+            bothSidesExist: bothSidesExist
+        )
+
+        var inputToFinal: [Int: Int] = [:]
+        inputToFinal.reserveCapacity(processed.keptInputIndices.count)
+        for (finalIdx, inputIdx) in processed.keptInputIndices.enumerated() {
+            // Preserve the first sub-hunk index when `detectMoves` splits one input hunk into multiple sub-hunks.
+            if inputToFinal[inputIdx] == nil {
+                inputToFinal[inputIdx] = finalIdx
+            }
+        }
+        var finalRawToFiltered: [Int: Int] = [:]
+        finalRawToFiltered.reserveCapacity(rawToFiltered.count)
+        for (rawIdx, filteredIdx) in rawToFiltered {
+            if let finalIdx = inputToFinal[filteredIdx] {
+                finalRawToFiltered[rawIdx] = finalIdx
+            }
+        }
+
+        let doc = DiffDocument(
+            left: left,
+            right: right,
+            hunks: processed.hunks,
+            language: language,
+            hiddenCommentHunks: processed.hiddenCommentHunks
+        )
+        doc.leftTitle = leftTitle
+        doc.rightTitle = rightTitle
+        doc.semanticOptions = semanticOptions
+        doc.isJSONNormalized = false
+        doc.isGroupFiltered = true
+        doc.groupHunkIndexMap = finalRawToFiltered
+        doc.groupFilterBaseline = baseline
+        doc.setRenameGroups(processed.renameGroups)
+        if baseline.hasWorktreeFile {
+            doc.editing = EditInfo(readOnlyReason: L("Group view · read-only", "分组视图 · 只读"))
+        }
+        doc.note = note(
+            hunks: doc.hunks,
+            old: nil,
+            new: nil,
+            ignoreWhitespace: ignoreWhitespace,
+            hiddenCommentHunkCount: doc.hiddenCommentHunkCount,
+            isJSONNormalized: false,
+            isGroupFiltered: true
+        )
+        return doc
+    }
+
+    private static func isWhitespaceOnlyHunk(_ hunk: Hunk, leftLines: [String], rightLines: [String]) -> Bool {
+        guard hunk.leftCount == hunk.rightCount,
+              hunk.leftStart >= 0, hunk.rightStart >= 0,
+              hunk.leftStart + hunk.leftCount <= leftLines.count,
+              hunk.rightStart + hunk.rightCount <= rightLines.count else {
+            return false
+        }
+        for offset in 0..<hunk.leftCount {
+            let l = leftLines[hunk.leftStart + offset].utf8.filter { $0 != 32 && $0 != 9 && $0 != 13 }
+            let r = rightLines[hunk.rightStart + offset].utf8.filter { $0 != 32 && $0 != 9 && $0 != 13 }
+            if l != r { return false }
+        }
+        return true
+    }
+
+    /// Runs comment-only hunk filtering, inline word highlights, intra-file move detection,
+    /// and cross-hunk rename detection on raw line hunks without modifying the underlying buffers.
+    static func applySemanticPostProcessing(
+        hunks rawHunks: [Hunk],
+        left: TextBuffer,
+        right: TextBuffer,
+        language: LanguageSpec,
+        options: SemanticDiffOptions,
+        bothSidesExist: Bool = true
+    ) -> (hunks: [Hunk], hiddenCommentHunks: [Hunk], renameGroups: [RenameGroup]) {
+        let result = applySemanticPostProcessingWithMapping(
+            hunks: rawHunks,
+            left: left,
+            right: right,
+            language: language,
+            options: options,
+            bothSidesExist: bothSidesExist
+        )
+        return (result.hunks, result.hiddenCommentHunks, result.renameGroups)
+    }
+
+    private static func applySemanticPostProcessingWithMapping(
+        hunks rawHunks: [Hunk],
+        left: TextBuffer,
+        right: TextBuffer,
+        language: LanguageSpec,
+        options: SemanticDiffOptions,
+        bothSidesExist: Bool = true
+    ) -> (hunks: [Hunk], hiddenCommentHunks: [Hunk], renameGroups: [RenameGroup], keptInputIndices: [Int]) {
+        var hunks = rawHunks
+        var hiddenCommentHunks: [Hunk] = []
+        var keptInputIndices = Array(rawHunks.indices)
+
+        if options.ignoreComments && bothSidesExist && !hunks.isEmpty {
+            let leftSpans = left.spans.count == left.lines.count
+                ? left.spans
+                : Highlighter.highlight(left.lines, language: language)
+            let rightSpans = right.spans.count == right.lines.count
+                ? right.spans
+                : Highlighter.highlight(right.lines, language: language)
+            var kept: [Hunk] = []
+            var keptIndices: [Int] = []
+            kept.reserveCapacity(hunks.count)
+            keptIndices.reserveCapacity(hunks.count)
+            for (idx, hunk) in hunks.enumerated() {
+                if SemanticDiff.isCommentOnlyHunk(
+                    hunk,
+                    leftLines: left.lines,
+                    rightLines: right.lines,
+                    leftSpans: leftSpans,
+                    rightSpans: rightSpans
+                ) {
+                    hiddenCommentHunks.append(hunk)
+                } else {
+                    kept.append(hunk)
+                    keptIndices.append(idx)
+                }
+            }
+            hunks = kept
+            keptInputIndices = keptIndices
+        }
+
         addInlineHighlights(&hunks, left: left.lines, right: right.lines)
 
-        let doc = DiffDocument(left: left, right: right, hunks: hunks, language: language)
-        doc.editing = editing
-        doc.note = note(hunks: hunks, old: oldData, new: newData, ignoreWhitespace: request.ignoreWhitespace)
-        return finish(doc)
+        if options.detectMoves && hunks.count >= 2 {
+            let postToPre = SemanticDiff.detectMoves(in: &hunks, leftLines: left.lines, rightLines: right.lines, language: language)
+            if postToPre.count == hunks.count {
+                keptInputIndices = postToPre.map { keptInputIndices[$0] }
+            }
+        }
+
+        let renameGroups: [RenameGroup] = options.detectRenames
+            ? SemanticDiff.detectRenames(hunks: hunks, leftLines: left.lines, rightLines: right.lines, language: language)
+            : []
+
+        return (hunks, hiddenCommentHunks, renameGroups, keptInputIndices)
     }
 
     /// Word-level highlights for the changed lines of each modified hunk (left alone above 200 lines a side).
@@ -1157,9 +1609,24 @@ enum DiffLoader {
 
     /// Said over a diff with no differences in it, when both sides exist. The lines can be the same while the bytes
     /// are not: line endings git converts (`core.autocrlf`), or the same text in another encoding.
-    static func note(hunks: [Hunk], old: Data?, new: Data?, ignoreWhitespace: Bool) -> String? {
-        guard hunks.isEmpty, let old, let new else { return nil }
+    static func note(
+        hunks: [Hunk],
+        old: Data?,
+        new: Data?,
+        ignoreWhitespace: Bool,
+        hiddenCommentHunkCount: Int = 0,
+        isJSONNormalized: Bool = false,
+        isGroupFiltered: Bool = false
+    ) -> String? {
+        guard hunks.isEmpty else { return nil }
+        if isGroupFiltered {
+            if hiddenCommentHunkCount > 0 { return L("Only comments differ", "仅注释不同") }
+            return L("No changes in this group", "当前分组在此文件中没有改动")
+        }
+        guard let old, let new else { return nil }
         if old == new { return L("Contents are identical", "内容完全相同") }
+        if hiddenCommentHunkCount > 0 { return L("Only comments differ", "仅注释不同") }
+        if isJSONNormalized { return L("JSON structures are semantically identical", "JSON 语义结构完全一致") }
         return ignoreWhitespace ? L("Only whitespace differs", "仅空白字符不同")
                                 : L("Only line endings or encoding differ", "仅换行符或编码不同")
     }

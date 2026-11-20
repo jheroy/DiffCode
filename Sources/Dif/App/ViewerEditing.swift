@@ -287,9 +287,27 @@ extension ViewerModel {
             } else {
                 return
             }
-            DiffLoader.addInlineHighlights(&hunks, left: doc.left.lines, right: doc.right.lines)
-            self.container?.canvas.hunksDidChange { doc.setHunks(hunks) }
-            doc.note = DiffLoader.note(hunks: doc.hunks, old: base, new: data, ignoreWhitespace: ignoreWhitespace)
+            let semanticOptions = self.request?.semantic ?? doc.semanticOptions
+            let processed = DiffLoader.applySemanticPostProcessing(
+                hunks: hunks,
+                left: doc.left,
+                right: doc.right,
+                language: doc.language,
+                options: semanticOptions,
+                bothSidesExist: base != nil
+            )
+            self.container?.canvas.hunksDidChange {
+                doc.setHunks(processed.hunks, hiddenCommentHunks: processed.hiddenCommentHunks)
+                doc.setRenameGroups(processed.renameGroups)
+            }
+            doc.note = DiffLoader.note(
+                hunks: doc.hunks,
+                old: base,
+                new: data,
+                ignoreWhitespace: ignoreWhitespace,
+                hiddenCommentHunkCount: doc.hiddenCommentHunkCount,
+                isJSONNormalized: doc.isJSONNormalized
+            )
             if self.hunkCount != doc.hunks.count { self.hunkCount = doc.hunks.count }
             if let focused = self.focusedHunk, focused >= doc.hunks.count {
                 self.focusedHunk = nil
