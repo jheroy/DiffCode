@@ -234,6 +234,30 @@ private struct QuickOpenRow: View {
                 if let kind {
                     Text(kind.letter).font(.ui(size: 10.5, weight: .bold, design: .rounded)).foregroundStyle(Color.status(kind))
                 }
+            case .excelSheet(let projectID, let path, let sheetName, let positions):
+                Image(systemName: "tablecells")
+                    .font(.ui(size: 12.5))
+                    .foregroundStyle(Color.difAdded)
+                    .frame(width: UI.s(18))
+                Text(FuzzyHighlight.text(sheetName, positions: positions, offset: 0, base: Color.difText))
+                    .font(.ui(size: 13))
+                    .lineLimit(1)
+                    .layoutPriority(1)
+                Text("(\(path))")
+                    .font(.ui(size: 11.5))
+                    .foregroundStyle(Color.difText3)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+                Spacer(minLength: 6)
+                if projectID != store.selectedProjectID, let owner = store.project(projectID) {
+                    Text(owner.name).font(.ui(size: 10.5)).foregroundStyle(Color.difText3)
+                }
+                Text(L("Sheet", "工作表"))
+                    .font(.ui(size: 10, weight: .semibold))
+                    .foregroundStyle(Color.difAdded)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1.5)
+                    .background(Capsule().fill(Color.difAdded.opacity(0.14)))
             case .action(let command):
                 Image(systemName: command.symbol)
                     .font(.ui(size: 12))

@@ -30,6 +30,7 @@ final class QuickOpenModel {
 
     enum Item: Identifiable {
         case file(projectID: UUID, path: String, positions: [Int], kind: FileChange.Kind?)
+        case excelSheet(projectID: UUID, path: String, sheetName: String, positions: [Int])
         case action(AppCommand)
         /// A branch or tag to compare with; `positions` are the matched characters of its short name.
         case ref(GitRef, positions: [Int])
@@ -43,6 +44,7 @@ final class QuickOpenModel {
         var id: String {
             switch self {
             case .file(let project, let path, _, _): return "f:\(project.uuidString):\(path)"
+            case .excelSheet(let project, let path, let sheetName, _): return "x:\(project.uuidString):\(path):\(sheetName)"
             case .action(let command): return "a:" + command.id
             case .ref(let ref, _): return "r:" + ref.name
             case .revision(let text): return "v:" + text
@@ -74,6 +76,8 @@ final class QuickOpenModel {
     @ObservationIgnored var filesProviderForTesting: (@MainActor (Project) async -> [String])?
     /// Test hook: incremented on every `update()` invocation so tests can verify no duplicate calls in `prepare()`.
     @ObservationIgnored private(set) var updateCallCountForTesting = 0
+    /// Callback invoked when activating an `.excelSheet` match; defaults to opening the `.xlsx` file.
+    @ObservationIgnored var onOpenExcelSheet: ((Project, String, String) -> Void)?
     /// The branches and tags offered for comparing, read as the picker opens.
     @ObservationIgnored private var refs: [GitRef]?
     /// The stash list, read as it opens.
@@ -189,20 +193,89 @@ final class QuickOpenModel {
                 files = await project.files()
             }
             guard let self, !Task.isCancelled, !cancelFlag.isCancelled, self.searchGeneration == generation else { return }
-            let ranked = await withTaskCancellationHandler {
-                await Task.detached(priority: .userInitiated) {
+            let currentScope = self.scope
+            let xlsxFiles = (currentScope == .all || currentScope == .files)
+                ? files.filter { ExcelSheetIndex.isIndexableSpreadsheetPath($0) }
+                : []
+            let mergedItems: [Item] = await withTaskCancellationHandler {
+                async let fileRankedTask = Task.detached(priority: .userInitiated) {
                     Fuzzy.rank(query: text, in: files, limit: 80, isCancelled: { cancelFlag.isCancelled })
                 }.value
+                async let sheetEntriesTask: [ExcelSheetEntry] = xlsxFiles.isEmpty
+                    ? []
+                    : await ExcelSheetIndex.shared.entries(in: project.url, files: xlsxFiles)
+                let (fileRanked, sheetEntries) = await (fileRankedTask, sheetEntriesTask)
+                guard !Task.isCancelled, !cancelFlag.isCancelled else { return [] }
+
+                let sheetRanked: [(entry: ExcelSheetEntry, score: Int, positions: [Int])]
+                if sheetEntries.isEmpty {
+                    sheetRanked = []
+                } else {
+                    sheetRanked = await Task.detached(priority: .userInitiated) {
+                        ExcelSheetIndex.rankSheets(query: text, in: sheetEntries, limit: 40, isCancelled: { cancelFlag.isCancelled })
+                    }.value
+                }
+                guard !Task.isCancelled, !cancelFlag.isCancelled else { return [] }
+                return Self.mergeRankedItems(
+                    projectID: projectID,
+                    fileRanked: fileRanked,
+                    sheetRanked: sheetRanked,
+                    changeKinds: changeKinds
+                )
             } onCancel: {
                 cancelFlag.cancel()
             }
             guard !Task.isCancelled, !cancelFlag.isCancelled, self.searchGeneration == generation else { return }
             self.isIndexing = false
-            var list: [Item] = ranked.map { .file(projectID: projectID, path: $0.path, positions: $0.positions, kind: changeKinds[$0.path]) }
+            var list = mergedItems
             if self.scope == .all { list += actions }
             self.items = list
             self.selected = 0
         }
+    }
+
+    private static func mergeRankedItems(
+        projectID: UUID,
+        fileRanked: [Fuzzy.Ranked],
+        sheetRanked: [(entry: ExcelSheetEntry, score: Int, positions: [Int])],
+        changeKinds: [String: FileChange.Kind],
+        limit: Int = 80
+    ) -> [Item] {
+        if sheetRanked.isEmpty {
+            return fileRanked.map { .file(projectID: projectID, path: $0.path, positions: $0.positions, kind: changeKinds[$0.path]) }
+        }
+        struct ScoredItem {
+            let score: Int
+            let order: Int
+            let item: Item
+        }
+        var combined: [ScoredItem] = []
+        combined.reserveCapacity(fileRanked.count + sheetRanked.count)
+        for (index, ranked) in fileRanked.enumerated() {
+            combined.append(ScoredItem(
+                score: ranked.score,
+                order: index,
+                item: .file(projectID: projectID, path: ranked.path, positions: ranked.positions, kind: changeKinds[ranked.path])
+            ))
+        }
+        let fileCount = fileRanked.count
+        for (index, ranked) in sheetRanked.enumerated() {
+            combined.append(ScoredItem(
+                score: ranked.score,
+                order: fileCount + index,
+                item: .excelSheet(
+                    projectID: projectID,
+                    path: ranked.entry.path,
+                    sheetName: ranked.entry.sheetName,
+                    positions: ranked.positions
+                )
+            ))
+        }
+        combined.sort {
+            if $0.score != $1.score { return $0.score > $1.score }
+            return $0.order < $1.order
+        }
+        return Array(combined.prefix(limit).map(\.item))
     }
 
     /// The picker of what to compare with: local branches first (the current one at the top), then remote ones and
@@ -299,6 +372,15 @@ final class QuickOpenModel {
             store.dismissPopup(restoreFocus: false)
             store.openFile(in: project, path: path, line: line)
             store.viewer.focusCanvas()
+        case .excelSheet(let projectID, let path, let sheetName, _):
+            guard let project = store.project(projectID) else { return }
+            store.dismissPopup(restoreFocus: false)
+            if let onOpenExcelSheet {
+                onOpenExcelSheet(project, path, sheetName)
+            } else {
+                store.openFile(in: project, path: path, line: nil)
+                store.viewer.focusCanvas()
+            }
         case .action(let command):
             store.dismissPopup()
             command.action()
