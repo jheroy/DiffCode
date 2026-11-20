@@ -66,6 +66,10 @@ protocol CodeCanvasDelegate: AnyObject {
     func canvas(_ canvas: CodeCanvasView, performVimAction action: VimAction, line: Int, column: Int)
     /// Records a jump origin (0-based right-pane line & UTF-16 column) before a Vim jump motion or distant click.
     func canvas(_ canvas: CodeCanvasView, recordJumpOrigin origin: TextPosition)
+    /// The move badge on change `hunkIndex` was clicked: jump to its paired counterpart hunk.
+    func canvas(_ canvas: CodeCanvasView, jumpToMoveCounterpart hunkIndex: Int)
+    /// A collapsed unchanged-code fold bar was clicked: expand `segmentIndex`.
+    func canvas(_ canvas: CodeCanvasView, expandFoldSegment segmentIndex: Int)
 }
 
 // MARK: - Layers
@@ -128,7 +132,7 @@ private final class RectGroup {
         self.z = z
     }
 
-    func set(_ rects: [CGRect], color: CGColor, radius: CGFloat = 0) {
+    func set(_ rects: [CGRect], color: CGColor, radius: CGFloat = 0, borderColor: CGColor? = nil, borderWidth: CGFloat = 0) {
         for (i, rect) in rects.enumerated() {
             let layer: CALayer
             if i < layers.count {
@@ -142,6 +146,8 @@ private final class RectGroup {
             layer.frame = rect
             layer.backgroundColor = color
             layer.cornerRadius = radius > 0 ? min(radius, rect.width / 2) : 0
+            layer.borderColor = borderColor
+            layer.borderWidth = borderWidth
         }
         if layers.count > rects.count {
             for layer in layers[rects.count...] { layer.removeFromSuperlayer() }
@@ -163,13 +169,18 @@ private final class Pane {
     let band = StillLayer()
     let text = StillLayer()
     let focus = StillLayer()
+    /// 4 colour buckets: modified (0), added (1), deleted (2), moved (3).
     let lines: [RectGroup]
     /// Pales the bands of lines that stay out of the commit.
     let excluded: RectGroup
     let marks: [RectGroup]
     let focusedTop: RectGroup
     let focusedBottom: RectGroup
+    /// Subtle frame + tint highlighting both ends of a hovered move connector pair.
+    let moveHighlight: RectGroup
     let words: [RectGroup]
+    /// Cross-hunk identifier rename highlights (6 coordinated palette slots).
+    let renames: [RectGroup]
     let hits: RectGroup
     let currentHit: RectGroup
     let selection: RectGroup
@@ -184,12 +195,14 @@ private final class Pane {
     init(side: Side) {
         self.side = side
         let band = self.band, text = self.text
-        lines = (0..<3).map { _ in RectGroup(host: band, z: 0) }
+        lines = (0..<4).map { _ in RectGroup(host: band, z: 0) }
         excluded = RectGroup(host: band, z: 0.5)
-        marks = (0..<3).map { _ in RectGroup(host: band, z: 1) }
+        marks = (0..<4).map { _ in RectGroup(host: band, z: 1) }
         focusedTop = RectGroup(host: band, z: 1.5)
         focusedBottom = RectGroup(host: band, z: 1.5)
-        words = (0..<3).map { _ in RectGroup(host: text, z: 0) }
+        moveHighlight = RectGroup(host: band, z: 1.55)
+        words = (0..<4).map { _ in RectGroup(host: text, z: 0) }
+        renames = (0..<RenameGroup.paletteCount).map { _ in RectGroup(host: text, z: 0.6) }
         hits = RectGroup(host: text, z: 1)
         currentHit = RectGroup(host: text, z: 2)
         selection = RectGroup(host: text, z: 3)
@@ -220,7 +233,8 @@ private final class Pane {
     }
 
     func clearDecor() {
-        (lines + marks + words + [excluded, focusedTop, focusedBottom, hits, currentHit, selection]).forEach { $0.clear() }
+        (lines + marks + words + renames
+            + [excluded, focusedTop, focusedBottom, moveHighlight, hits, currentHit, selection]).forEach { $0.clear() }
         focus.isHidden = true
         decorRows = 0..<0
     }
@@ -323,6 +337,125 @@ final class CodeCanvasView: NSView {
     /// A line to tint, e.g. the target of "go to line" or a search hit.
     var focusLine: (side: Side, line: Int)? {
         didSet { invalidate(.decor) }
+    }
+
+    // MARK: SemanticDiff folding, move connectors & move badges
+
+    private enum PaneDisplayRow: Equatable {
+        case line(side: Side, line: Int)
+        case foldBar(DiffFoldRegion)
+    }
+
+    private enum UnifiedDisplayRow {
+        case unified(UnifiedRow)
+        case foldBar(DiffFoldRegion)
+    }
+
+    private struct FoldedSegment {
+        var segmentIndex: Int
+        var virtualStart: Int
+        var leftRowStart: Int
+        var leftRowCount: Int
+        var rightRowStart: Int
+        var rightRowCount: Int
+        var leftLineStart: Int
+        var leftLineCount: Int
+        var rightLineStart: Int
+        var rightLineCount: Int
+        var hunk: Int
+        var foldRegion: DiffFoldRegion?
+        var leftFoldRow: Int?
+        var rightFoldRow: Int?
+        var span: Int { max(leftRowCount, rightRowCount) }
+    }
+
+    private(set) var collapseUnchanged: Bool = false
+    private(set) var expandedFoldSegments: Set<Int> = []
+    private var isFoldingActive: Bool = false
+    private var foldedSegments: [FoldedSegment] = []
+    private var foldedVirtualLineCount: Int = 0
+    private var leftPaneRows: [PaneDisplayRow] = []
+    private var rightPaneRows: [PaneDisplayRow] = []
+    private var unifiedDisplayRows: [UnifiedDisplayRow] = []
+    private var hunkLeftDisplayStart: [Int] = []
+    private var hunkRightDisplayStart: [Int] = []
+
+    private var foldBarLayers: [StillLayer] = []
+    private var foldBarHits: [(rect: CGRect, segmentIndex: Int)] = []
+    private var foldBarGlyphs: [String: CGImage] = [:]
+    private var hoveredFoldSegment: Int? {
+        didSet { if hoveredFoldSegment != oldValue { invalidate(.scroll) } }
+    }
+    private var pressedFoldSegment: Int?
+
+    private struct MovePair {
+        var pairID: Int
+        var sourceHunk: Int
+        var targetHunk: Int
+    }
+
+    private struct MoveConnectorHit {
+        var pairID: Int
+        var sourceHunk: Int
+        var targetHunk: Int
+        var bothVisible: Bool
+        var clickSourceHunk: Int
+        var fillPath: CGPath
+        var spineSamples: [CGPoint]
+        var bounds: CGRect
+    }
+
+    private final class MoveConnectorLayerSet {
+        let fill = StillShapeLayer()
+        let stroke = StillShapeLayer()
+
+        init(host: CALayer) {
+            fill.strokeColor = nil
+            fill.zPosition = 0.2
+
+            stroke.fillColor = nil
+            stroke.lineCap = .round
+            stroke.lineJoin = .round
+            stroke.zPosition = 1.2
+
+            host.addSublayer(fill)
+            host.addSublayer(stroke)
+        }
+
+        func setHidden(_ hidden: Bool) {
+            fill.isHidden = hidden
+            stroke.isHidden = hidden
+        }
+
+        func setZOffset(_ offset: CGFloat) {
+            fill.zPosition = 0.2 + offset * 0.4
+            stroke.zPosition = 1.2 + offset
+        }
+    }
+
+    private var movePairs: [MovePair] = []
+    private var moveConnectorLayers: [MoveConnectorLayerSet] = []
+    private var moveConnectorHits: [MoveConnectorHit] = []
+    private var hoveredMoveConnector: Int? {
+        didSet { if hoveredMoveConnector != oldValue { invalidate([.scroll, .decor]) } }
+    }
+    private var pressedMoveConnector: MoveConnectorHit?
+
+    private var moveBadgeLayers: [StillLayer] = []
+    private var moveBadgeHits: [(rect: CGRect, hunk: Int)] = []
+    private var moveBadgeGlyphs: [String: CGImage] = [:]
+    private var hoveredMoveBadge: Int? {
+        didSet { if hoveredMoveBadge != oldValue { invalidate([.scroll, .decor]) } }
+    }
+    private var pressedMoveBadge: Int?
+
+    /// Pair ID currently hovered via either a bridge move curve or a move badge.
+    private var activeHoveredMovePairID: Int? {
+        if let hoveredMoveConnector { return hoveredMoveConnector }
+        if let badge = hoveredMoveBadge, let doc = document, doc.hunks.indices.contains(badge) {
+            return doc.hunks[badge].moveInfo?.pairID
+        }
+        return nil
     }
 
     /// Gives every change a small button that puts it back the way the left side has it.
@@ -540,7 +673,7 @@ final class CodeCanvasView: NSView {
 
         connector.anchorPoint = .zero
         connector.masksToBounds = true
-        for _ in 0..<3 {
+        for _ in 0..<4 {
             let ribbon = StillShapeLayer()
             ribbon.strokeColor = nil
             connector.addSublayer(ribbon)
@@ -548,13 +681,14 @@ final class CodeCanvasView: NSView {
         }
         ribbonOutline.fillColor = nil
         ribbonOutline.lineWidth = 1
+        ribbonOutline.zPosition = 1
         connector.addSublayer(ribbonOutline)
         root.addSublayer(connector)
 
         ruler.anchorPoint = .zero
         rulerThumb.cornerRadius = 3
         ruler.addSublayer(rulerThumb)
-        for _ in 0..<3 {
+        for _ in 0..<4 {
             let mark = StillShapeLayer()
             mark.strokeColor = nil
             ruler.addSublayer(mark)
@@ -651,6 +785,14 @@ final class CodeCanvasView: NSView {
         editor = nil
         annotations = nil
         requestedMode = mode
+        collapseUnchanged = doc?.semanticOptions.collapseUnchanged ?? false
+        expandedFoldSegments = []
+        hoveredFoldSegment = nil
+        pressedFoldSegment = nil
+        hoveredMoveBadge = nil
+        pressedMoveBadge = nil
+        hoveredMoveConnector = nil
+        pressedMoveConnector = nil
         vimEngine.resetToNormal(switchInputSource: false)
         vimCursor = TextPosition(row: 0, column: 0)
         lastRelativeCursorLine = -1
@@ -664,6 +806,7 @@ final class CodeCanvasView: NSView {
         clearLSPHover()
         contextLSPSymbol = nil
         invalidateTextCaches()
+        rebuildFoldLayout()
         rebuildHunkRows()
         invalidate(.everything)
         reportVimStateIfNeeded(force: true)
@@ -679,9 +822,48 @@ final class CodeCanvasView: NSView {
         requestedMode = mode
         selection = nil
         clearLSPHover()
+        rebuildFoldLayout()
         rebuildHunkRows()
         if let caret { selection = TextSelection(pane: .right, anchor: rowPosition(caret.anchor), head: rowPosition(caret.head)) }
         invalidate(.everything)
+    }
+
+    /// Updates unchanged-region folding without reloading the document, keeping the caret and viewport anchored.
+    func setFolding(enabled: Bool, expandedSegments: Set<Int>) {
+        guard enabled != collapseUnchanged || expandedSegments != expandedFoldSegments else { return }
+        let caret = editSelection
+        let anchorLine: Int?
+        let beforeY: CGFloat?
+        let lh = codeFont.lineHeight
+        if let doc = document, case .text = doc.content, !doc.right.lines.isEmpty {
+            let line = caret?.head.row ?? (source(pane: .right, row: max(0, Int((resolveScroll().right + lh / 2) / lh)))?.line)
+            anchorLine = line
+            beforeY = line.map { CGFloat(editRow(forLine: $0)) * lh - resolveScroll().right }
+        } else {
+            anchorLine = nil
+            beforeY = nil
+        }
+        collapseUnchanged = enabled
+        expandedFoldSegments = expandedSegments
+        hoveredFoldSegment = nil
+        pressedFoldSegment = nil
+        clearLSPHover()
+        rebuildFoldLayout()
+        rebuildHunkRows()
+        if let caret {
+            selection = TextSelection(pane: .right, anchor: rowPosition(caret.anchor), head: rowPosition(caret.head))
+        } else if selection != nil {
+            selection = nil
+        }
+        container?.updateDocumentSize()
+        invalidate(.everything)
+        if let anchorLine, let beforeY {
+            for _ in 0..<4 {
+                let after = CGFloat(editRow(forLine: anchorLine)) * lh - resolveScroll().right
+                guard abs(after - beforeY) >= 0.5 else { break }
+                container?.scrollBy(dx: 0, dy: after - beforeY)
+            }
+        }
     }
 
     /// Invalidates cached CoreText lines and text tiles for the changed 0-based buffer lines on `side`
@@ -699,7 +881,16 @@ final class CodeCanvasView: NSView {
         switch mode {
         case .sideBySide:
             let pane = panes[side.rawValue]
-            let tiles = Set(changedLines.map { $0 / tileRows })
+            let tiles: Set<Int>
+            if isFoldingActive {
+                var set = Set<Int>()
+                for line in changedLines {
+                    set.insert(displayRow(forLine: line, side: side) / tileRows)
+                }
+                tiles = set
+            } else {
+                tiles = Set(changedLines.map { $0 / tileRows })
+            }
             for (key, tile) in pane.textTiles where tiles.contains(key.index) {
                 tile.removeFromSuperlayer()
                 pane.textTiles.removeValue(forKey: key)
@@ -716,17 +907,15 @@ final class CodeCanvasView: NSView {
             for index in tiles { pane.contentWidths.removeValue(forKey: index) }
         case .unified:
             let pane = panes[1]
-            let rows = doc.unifiedRows
+            let rowCount = paneRowCount(.right)
             var tiles = Set<Int>()
             for key in pane.textTiles.keys {
                 let first = key.index * tileRows
-                let last = min(rows.count, first + tileRows)
+                let last = min(rowCount, first + tileRows)
                 guard first < last else { continue }
                 for r in first..<last {
-                    let row = rows[r]
-                    let line = side == .left ? (row.kind == .removed ? Int(row.left) : -1)
-                                             : (row.kind == .removed ? -1 : Int(row.right))
-                    if line >= 0, changedLines.contains(line) {
+                    guard let src = source(pane: .right, row: r), src.side == side else { continue }
+                    if changedLines.contains(src.line) {
                         tiles.insert(key.index)
                         break
                     }
@@ -765,25 +954,269 @@ final class CodeCanvasView: NSView {
         cachedParagraphStyle = nil
     }
 
+    private func rebuildFoldLayout() {
+        foldedSegments.removeAll(keepingCapacity: true)
+        leftPaneRows.removeAll(keepingCapacity: true)
+        rightPaneRows.removeAll(keepingCapacity: true)
+        unifiedDisplayRows.removeAll(keepingCapacity: true)
+        hunkLeftDisplayStart.removeAll(keepingCapacity: true)
+        hunkRightDisplayStart.removeAll(keepingCapacity: true)
+        foldedVirtualLineCount = 0
+
+        guard let doc = document, case .text = doc.content, mode != .single, collapseUnchanged else {
+            isFoldingActive = false
+            return
+        }
+        let map = doc.displayMap(expandedSegments: expandedFoldSegments, collapseEnabled: true)
+        guard !map.foldRegions.isEmpty else {
+            isFoldingActive = false
+            return
+        }
+        isFoldingActive = true
+
+        var foldBySegment: [Int: DiffFoldRegion] = [:]
+        foldBySegment.reserveCapacity(map.foldRegions.count)
+        for region in map.foldRegions {
+            foldBySegment[region.segmentIndex] = region
+        }
+
+        hunkLeftDisplayStart = [Int](repeating: 0, count: doc.hunks.count)
+        hunkRightDisplayStart = [Int](repeating: 0, count: doc.hunks.count)
+        foldedSegments.reserveCapacity(doc.segments.count)
+
+        var virtualRow = 0
+        for (segIndex, seg) in doc.segments.enumerated() {
+            let leftRowStart = leftPaneRows.count
+            let rightRowStart = rightPaneRows.count
+            var leftFoldRow: Int?
+            var rightFoldRow: Int?
+
+            if let region = foldBySegment[segIndex] {
+                let lPrefixEnd = max(seg.leftStart, min(region.leftRange.lowerBound, seg.leftStart + seg.leftCount))
+                let lSuffixStart = max(lPrefixEnd, min(region.leftRange.upperBound, seg.leftStart + seg.leftCount))
+                if seg.leftStart < lPrefixEnd {
+                    for l in seg.leftStart..<lPrefixEnd { leftPaneRows.append(.line(side: .left, line: l)) }
+                }
+                leftFoldRow = leftPaneRows.count
+                leftPaneRows.append(.foldBar(region))
+                if lSuffixStart < seg.leftStart + seg.leftCount {
+                    for l in lSuffixStart..<(seg.leftStart + seg.leftCount) { leftPaneRows.append(.line(side: .left, line: l)) }
+                }
+
+                let rPrefixEnd = max(seg.rightStart, min(region.rightRange.lowerBound, seg.rightStart + seg.rightCount))
+                let rSuffixStart = max(rPrefixEnd, min(region.rightRange.upperBound, seg.rightStart + seg.rightCount))
+                if seg.rightStart < rPrefixEnd {
+                    for r in seg.rightStart..<rPrefixEnd { rightPaneRows.append(.line(side: .right, line: r)) }
+                }
+                rightFoldRow = rightPaneRows.count
+                rightPaneRows.append(.foldBar(region))
+                if rSuffixStart < seg.rightStart + seg.rightCount {
+                    for r in rSuffixStart..<(seg.rightStart + seg.rightCount) { rightPaneRows.append(.line(side: .right, line: r)) }
+                }
+            } else {
+                if seg.leftCount > 0 {
+                    for l in seg.leftStart..<(seg.leftStart + seg.leftCount) {
+                        leftPaneRows.append(.line(side: .left, line: l))
+                    }
+                }
+                if seg.rightCount > 0 {
+                    for r in seg.rightStart..<(seg.rightStart + seg.rightCount) {
+                        rightPaneRows.append(.line(side: .right, line: r))
+                    }
+                }
+                if seg.hunk >= 0, seg.hunk < doc.hunks.count {
+                    hunkLeftDisplayStart[seg.hunk] = leftRowStart
+                    hunkRightDisplayStart[seg.hunk] = rightRowStart
+                }
+            }
+
+            let lRowCount = leftPaneRows.count - leftRowStart
+            let rRowCount = rightPaneRows.count - rightRowStart
+            let foldedSeg = FoldedSegment(
+                segmentIndex: segIndex,
+                virtualStart: virtualRow,
+                leftRowStart: leftRowStart,
+                leftRowCount: lRowCount,
+                rightRowStart: rightRowStart,
+                rightRowCount: rRowCount,
+                leftLineStart: seg.leftStart,
+                leftLineCount: seg.leftCount,
+                rightLineStart: seg.rightStart,
+                rightLineCount: seg.rightCount,
+                hunk: seg.hunk,
+                foldRegion: foldBySegment[segIndex],
+                leftFoldRow: leftFoldRow,
+                rightFoldRow: rightFoldRow
+            )
+            foldedSegments.append(foldedSeg)
+            virtualRow += foldedSeg.span
+        }
+        foldedVirtualLineCount = virtualRow
+
+        if mode == .unified {
+            let rawRows = doc.unifiedRows
+            unifiedDisplayRows.reserveCapacity(rawRows.count)
+            var emitted = Set<Int>()
+            for uRow in rawRows {
+                if uRow.kind == .context {
+                    let region: DiffFoldRegion? =
+                        (uRow.right >= 0 ? map.foldRegion(containingLine: Int(uRow.right), side: .right) : nil)
+                        ?? (uRow.left >= 0 ? map.foldRegion(containingLine: Int(uRow.left), side: .left) : nil)
+                    if let region {
+                        if emitted.insert(region.segmentIndex).inserted {
+                            unifiedDisplayRows.append(.foldBar(region))
+                        }
+                        continue
+                    }
+                }
+                unifiedDisplayRows.append(.unified(uRow))
+            }
+        }
+    }
+
     private func rebuildHunkRows() {
         tickStateCache = nil
-        guard let doc = document else { hunkRows = []; return }
+        guard let doc = document else {
+            hunkRows = []
+            movePairs = []
+            return
+        }
+        var sourcesByPair: [Int: Int] = [:]
+        var targetsByPair: [Int: Int] = [:]
+        for (idx, h) in doc.hunks.enumerated() {
+            guard let move = h.moveInfo else { continue }
+            switch move.role {
+            case .source: sourcesByPair[move.pairID] = idx
+            case .target: targetsByPair[move.pairID] = idx
+            }
+        }
+        movePairs = sourcesByPair.keys.sorted().compactMap { pairID in
+            guard let src = sourcesByPair[pairID], let dst = targetsByPair[pairID] else { return nil }
+            return MovePair(pairID: pairID, sourceHunk: src, targetHunk: dst)
+        }
         switch mode {
         case .sideBySide:
             var rows = [Int](repeating: 0, count: doc.hunks.count)
-            for s in doc.segments where s.hunk >= 0 { rows[s.hunk] = s.virtualStart }
+            if isFoldingActive {
+                for s in foldedSegments where s.hunk >= 0 && s.hunk < rows.count { rows[s.hunk] = s.virtualStart }
+            } else {
+                for s in doc.segments where s.hunk >= 0 { rows[s.hunk] = s.virtualStart }
+            }
             hunkRows = rows
         case .unified:
             var rows = [Int](repeating: 0, count: doc.hunks.count)
             var seen = -1
-            for (index, row) in doc.unifiedRows.enumerated() where row.hunk > Int32(seen) {
-                seen = Int(row.hunk)
-                rows[seen] = index
+            if isFoldingActive {
+                for (index, item) in unifiedDisplayRows.enumerated() {
+                    if case .unified(let row) = item, row.hunk > Int32(seen) {
+                        seen = Int(row.hunk)
+                        if seen < rows.count { rows[seen] = index }
+                    }
+                }
+            } else {
+                for (index, row) in doc.unifiedRows.enumerated() where row.hunk > Int32(seen) {
+                    seen = Int(row.hunk)
+                    rows[seen] = index
+                }
             }
             hunkRows = rows
         case .single:
             hunkRows = []
         }
+    }
+
+    /// Display row in `.sideBySide` pane space for 0-based buffer `line` on `side`.
+    private func displayRow(forLine line: Int, side: Side) -> Int {
+        guard isFoldingActive, !foldedSegments.isEmpty else { return line }
+        let clampedLine = max(0, line)
+        var lo = 0, hi = foldedSegments.count - 1
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            let start = side == .left ? foldedSegments[mid].leftLineStart : foldedSegments[mid].rightLineStart
+            if start <= clampedLine { lo = mid } else { hi = mid - 1 }
+        }
+        var idx = lo
+        while idx >= 0 {
+            let s = foldedSegments[idx]
+            let start = side == .left ? s.leftLineStart : s.rightLineStart
+            let count = side == .left ? s.leftLineCount : s.rightLineCount
+            let rowStart = side == .left ? s.leftRowStart : s.rightRowStart
+            if count > 0, clampedLine >= start, clampedLine < start + count {
+                if let region = s.foldRegion, let foldRow = (side == .left ? s.leftFoldRow : s.rightFoldRow) {
+                    let foldRange = side == .left ? region.leftRange : region.rightRange
+                    if foldRange.contains(clampedLine) { return foldRow }
+                    if clampedLine < foldRange.lowerBound { return rowStart + (clampedLine - start) }
+                    return foldRow + 1 + (clampedLine - foldRange.upperBound)
+                }
+                return rowStart + (clampedLine - start)
+            }
+            if start < clampedLine && count > 0 { break }
+            idx -= 1
+        }
+        let maxRow = max(0, (side == .left ? leftPaneRows.count : rightPaneRows.count) - 1)
+        return min(clampedLine, maxRow)
+    }
+
+    private func hunkDisplayStart(_ hunkIndex: Int, side: Side) -> Int {
+        guard let doc = document, doc.hunks.indices.contains(hunkIndex) else { return 0 }
+        if isFoldingActive {
+            return side == .left ? hunkLeftDisplayStart[hunkIndex] : hunkRightDisplayStart[hunkIndex]
+        }
+        let h = doc.hunks[hunkIndex]
+        return side == .left ? h.leftStart : h.rightStart
+    }
+
+    private func foldedVirtualPosition(of line: Int, side: Side) -> Double {
+        let targetRow = displayRow(forLine: line, side: side)
+        guard !foldedSegments.isEmpty else { return Double(targetRow) }
+        var lo = 0, hi = foldedSegments.count - 1
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            let start = side == .left ? foldedSegments[mid].leftRowStart : foldedSegments[mid].rightRowStart
+            if start <= targetRow { lo = mid } else { hi = mid - 1 }
+        }
+        let s = foldedSegments[lo]
+        let start = side == .left ? s.leftRowStart : s.rightRowStart
+        let count = side == .left ? s.leftRowCount : s.rightRowCount
+        guard count > 0 else { return Double(s.virtualStart) }
+        let t = min(1.0, max(0.0, Double(targetRow - start) / Double(count)))
+        return Double(s.virtualStart) + Double(s.span) * t
+    }
+
+    private func foldedPanePositions(forVirtual v: Double) -> (left: Double, right: Double) {
+        guard !foldedSegments.isEmpty else { return (0, 0) }
+        if v <= 0 { return (0, 0) }
+        if v >= Double(foldedVirtualLineCount) {
+            return (Double(leftPaneRows.count), Double(rightPaneRows.count))
+        }
+        var lo = 0, hi = foldedSegments.count - 1
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if Double(foldedSegments[mid].virtualStart) <= v { lo = mid } else { hi = mid - 1 }
+        }
+        let s = foldedSegments[lo]
+        let span = max(1, s.span)
+        let t = min(1.0, max(0.0, (v - Double(s.virtualStart)) / Double(span)))
+        return (Double(s.leftRowStart) + Double(s.leftRowCount) * t,
+                Double(s.rightRowStart) + Double(s.rightRowCount) * t)
+    }
+
+    private func unifiedDisplayRow(forLine line: Int, side: Side) -> Int {
+        guard let doc = document else { return 0 }
+        guard isFoldingActive else { return doc.unifiedRow(ofLine: line, side: side) }
+        for (idx, item) in unifiedDisplayRows.enumerated() {
+            switch item {
+            case .unified(let r):
+                let candidate = side == .left ? Int(r.left) : Int(r.right)
+                if candidate == line { return idx }
+                if candidate > line { return idx }
+            case .foldBar(let region):
+                let range = side == .left ? region.leftRange : region.rightRange
+                if range.contains(line) { return idx }
+                if range.lowerBound > line { return idx }
+            }
+        }
+        return max(0, unifiedDisplayRows.count - 1)
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -831,8 +1264,8 @@ final class CodeCanvasView: NSView {
     var rowCount: Int {
         guard let doc = document, case .text = doc.content else { return 0 }
         switch mode {
-        case .sideBySide: return doc.virtualLineCount
-        case .unified: return doc.unifiedRows.count
+        case .sideBySide: return isFoldingActive ? foldedVirtualLineCount : doc.virtualLineCount
+        case .unified: return isFoldingActive ? unifiedDisplayRows.count : doc.unifiedRows.count
         case .single: return doc.right.lines.count
         }
     }
@@ -845,9 +1278,12 @@ final class CodeCanvasView: NSView {
     func row(forLine line: Int, side: Side) -> Int {
         guard let doc = document else { return 0 }
         switch mode {
-        case .sideBySide: return Int(doc.virtualPosition(of: line, side: side))
-        case .unified: return doc.unifiedRow(ofLine: line, side: side)
-        case .single: return line
+        case .sideBySide:
+            return isFoldingActive ? Int(foldedVirtualPosition(of: line, side: side)) : Int(doc.virtualPosition(of: line, side: side))
+        case .unified:
+            return unifiedDisplayRow(forLine: line, side: side)
+        case .single:
+            return line
         }
     }
 
@@ -964,13 +1400,17 @@ final class CodeCanvasView: NSView {
         }
         let k = maxScroll > 0 ? y / maxScroll : 0
         let anchor = k * max(0, h - pad)
-        let positions = doc.panePositions(forVirtual: Double((y + anchor) / lh))
+        let positions = isFoldingActive
+            ? foldedPanePositions(forVirtual: Double((y + anchor) / lh))
+            : doc.panePositions(forVirtual: Double((y + anchor) / lh))
+        let leftTotal = isFoldingActive ? leftPaneRows.count : doc.left.lines.count
+        let rightTotal = isFoldingActive ? rightPaneRows.count : doc.right.lines.count
         func top(_ position: Double, _ count: Int) -> CGFloat {
             let limit = max(0, CGFloat(count) * lh + pad - h)
             return pixelRound(min(max(CGFloat(position) * lh - anchor, 0), limit)) + overscroll
         }
-        return Scroll(left: top(positions.left, doc.left.lines.count),
-                      right: top(positions.right, doc.right.lines.count), x: x, y: y)
+        return Scroll(left: top(positions.left, leftTotal),
+                      right: top(positions.right, rightTotal), x: x, y: y)
     }
 
     /// Maps a row in a pane to the buffer line it displays.
@@ -978,8 +1418,17 @@ final class CodeCanvasView: NSView {
         guard let doc = document, row >= 0 else { return nil }
         switch mode {
         case .sideBySide:
+            if isFoldingActive {
+                let rows = pane == .left ? leftPaneRows : rightPaneRows
+                guard row < rows.count, case .line(let s, let l) = rows[row] else { return nil }
+                return l < doc.buffer(s).lines.count ? (s, l) : nil
+            }
             return row < doc.buffer(pane).lines.count ? (pane, row) : nil
         case .unified:
+            if isFoldingActive {
+                guard row < unifiedDisplayRows.count, case .unified(let r) = unifiedDisplayRows[row] else { return nil }
+                return r.kind == .removed ? (.left, Int(r.left)) : (.right, Int(r.right))
+            }
             guard row < doc.unifiedRows.count else { return nil }
             let r = doc.unifiedRows[row]
             return r.kind == .removed ? (.left, Int(r.left)) : (.right, Int(r.right))
@@ -991,9 +1440,13 @@ final class CodeCanvasView: NSView {
     private func paneRowCount(_ pane: Side) -> Int {
         guard let doc = document else { return 0 }
         switch mode {
-        case .sideBySide: return doc.buffer(pane).lines.count
-        case .unified: return doc.unifiedRows.count
-        case .single: return doc.right.lines.count
+        case .sideBySide:
+            if isFoldingActive { return pane == .left ? leftPaneRows.count : rightPaneRows.count }
+            return doc.buffer(pane).lines.count
+        case .unified:
+            return isFoldingActive ? unifiedDisplayRows.count : doc.unifiedRows.count
+        case .single:
+            return doc.right.lines.count
         }
     }
 
@@ -1005,14 +1458,15 @@ final class CodeCanvasView: NSView {
         return first...last
     }
 
-    /// Index of the first hunk that ends at or after `line` on `side`.
-    private func firstHunk(_ doc: DiffDocument, side: Side, endingAtOrAfter line: Int) -> Int {
+    /// Index of the first hunk whose displayed end on `side` is at or after `displayRow`.
+    private func firstHunk(_ doc: DiffDocument, side: Side, endingAtOrAfter row: Int) -> Int {
         var lo = 0, hi = doc.hunks.count
         while lo < hi {
             let mid = (lo + hi) / 2
             let h = doc.hunks[mid]
-            let end = side == .left ? h.leftStart + h.leftCount : h.rightStart + h.rightCount
-            if end < line { lo = mid + 1 } else { hi = mid }
+            let start = hunkDisplayStart(mid, side: side)
+            let count = side == .left ? h.leftCount : h.rightCount
+            if start + count < row { lo = mid + 1 } else { hi = mid }
         }
         return lo
     }
@@ -1023,6 +1477,26 @@ final class CodeCanvasView: NSView {
         case .added: return 1
         case .deleted: return 2
         }
+    }
+
+    /// Colour bucket index for a hunk: 0 = modified, 1 = added, 2 = deleted, 3 = moved.
+    private func hunkBucket(_ hunk: Hunk) -> Int {
+        hunk.moveInfo != nil ? 3 : kindIndex(hunk.kind)
+    }
+
+    /// Staggers the vertical connector lane inside the bridge when multiple move pairs coexist,
+    /// snapped to half-points so 1pt vertical strokes stay crisp.
+    private func moveConnectorLaneX(forPairID pairID: Int, totalPairs: Int) -> CGFloat {
+        let x1 = connectorWidth
+        let raw: CGFloat
+        if totalPairs <= 1 {
+            raw = x1 * 0.5
+        } else {
+            let fractions: [CGFloat] = [0.50, 0.38, 0.62, 0.44, 0.56]
+            let slot = ((pairID % fractions.count) + fractions.count) % fractions.count
+            raw = x1 * fractions[slot]
+        }
+        return floor(raw) + 0.5
     }
 
     // MARK: Text
@@ -1161,7 +1635,13 @@ final class CodeCanvasView: NSView {
                 let useRelative = vimModeEnabled && vimRelativeLineNumbers
                 let activeLine = vimCursor.row
                 for row in firstRow...lastRow {
-                    let r = doc.unifiedRows[row]
+                    let r: UnifiedRow
+                    if isFoldingActive {
+                        guard row < unifiedDisplayRows.count, case .unified(let uRow) = unifiedDisplayRows[row] else { continue }
+                        r = uRow
+                    } else {
+                        r = doc.unifiedRows[row]
+                    }
                     let y = CGFloat(row - firstRow) * lh
                     if r.left >= 0 { drawNumber(ctx, Int(r.left) + 1, rightEdge: shift + numberWidth - 4, y: y) }
                     if r.right >= 0 {
@@ -1180,7 +1660,9 @@ final class CodeCanvasView: NSView {
                 let useRelative = vimModeEnabled && vimRelativeLineNumbers && tile.pane == .right
                 let activeLine = vimCursor.row
                 for row in firstRow...lastRow {
-                    let shown = useRelative ? (row == activeLine ? row + 1 : abs(row - activeLine)) : (row + 1)
+                    guard let src = source(pane: tile.pane, row: row) else { continue }
+                    let lineIdx = src.line
+                    let shown = useRelative ? (lineIdx == activeLine ? lineIdx + 1 : abs(lineIdx - activeLine)) : (lineIdx + 1)
                     drawNumber(ctx, shown, rightEdge: rightEdge, y: CGFloat(row - firstRow) * lh)
                 }
             }
@@ -1193,9 +1675,19 @@ final class CodeCanvasView: NSView {
     private func rightLine(row: Int) -> Int? {
         guard let doc = document, row >= 0 else { return nil }
         switch mode {
-        case .sideBySide, .single:
+        case .sideBySide:
+            if isFoldingActive {
+                guard row < rightPaneRows.count, case .line(_, let l) = rightPaneRows[row] else { return nil }
+                return l < doc.right.lines.count ? l : nil
+            }
+            return row < doc.right.lines.count ? row : nil
+        case .single:
             return row < doc.right.lines.count ? row : nil
         case .unified:
+            if isFoldingActive {
+                guard row < unifiedDisplayRows.count, case .unified(let r) = unifiedDisplayRows[row] else { return nil }
+                return r.right >= 0 ? Int(r.right) : nil
+            }
             guard row < doc.unifiedRows.count else { return nil }
             let line = doc.unifiedRows[row].right
             return line >= 0 ? Int(line) : nil
@@ -1235,7 +1727,7 @@ final class CodeCanvasView: NSView {
     /// The middle of a line's Annotate label, in the canvas's coordinates (for the debug hooks).
     func annotationPoint(line: Int) -> CGPoint? {
         guard annotationWidth > 0, annotations?.index(atLine: line) != nil else { return nil }
-        let row = mode == .unified ? editRow(forLine: line) : line
+        let row = editRow(forLine: line)
         let y = (CGFloat(row) + 0.5) * codeFont.lineHeight - resolveScroll().right
         guard y > 0, y < bounds.height else { return nil }
         return CGPoint(x: annotationX + annotationWidth / 2, y: y)
@@ -1258,7 +1750,7 @@ final class CodeCanvasView: NSView {
             return
         }
         let lh = codeFont.lineHeight
-        let row = mode == .unified ? editRow(forLine: line) : line
+        let row = editRow(forLine: line)
         let anchor = CGPoint(x: annotationX + annotationWidth, y: CGFloat(row) * lh - resolveScroll().right)
         delegate?.canvas(self, hoverAnnotation: entry, anchor: anchor)
     }
@@ -1380,6 +1872,12 @@ final class CodeCanvasView: NSView {
             tickLayers.forEach { $0.isHidden = true }
             conflictHits.removeAll()
             conflictLayers.forEach { $0.isHidden = true }
+            foldBarHits.removeAll()
+            foldBarLayers.forEach { $0.isHidden = true }
+            moveBadgeHits.removeAll()
+            moveBadgeLayers.forEach { $0.isHidden = true }
+            moveConnectorHits.removeAll()
+            moveConnectorLayers.forEach { $0.setHidden(true) }
             updateCaret()
             return
         }
@@ -1436,9 +1934,16 @@ final class CodeCanvasView: NSView {
             }
         }
 
-        if currentMode == .sideBySide { updateConnectors(doc, scroll) }
+        if currentMode == .sideBySide {
+            updateConnectors(doc, scroll)
+        } else {
+            moveConnectorHits.removeAll(keepingCapacity: true)
+            moveConnectorLayers.forEach { $0.setHidden(true) }
+        }
         updateRuler(doc, scroll, marks: redecorate)
+        updateFoldBars(doc, scroll)
         updateRevertButtons(doc, scroll)
+        updateMoveBadges(doc, scroll)
         updateConflictButtons(doc, scroll)
         updateCaret()
     }
@@ -1604,15 +2109,47 @@ final class CodeCanvasView: NSView {
     /// stands for the start of the next line that is still there.
     func linePosition(_ position: TextPosition) -> TextPosition {
         guard let doc = document, !doc.right.lines.isEmpty else { return TextPosition(row: 0, column: 0) }
-        guard mode == .unified else { return TextEditing.clamp(position, in: doc.right.lines) }
-        let rows = doc.unifiedRows
-        guard !rows.isEmpty else { return TextPosition(row: 0, column: 0) }
-        var row = min(max(0, position.row), rows.count - 1)
-        if rows[row].right >= 0 { return TextEditing.clamp(TextPosition(row: Int(rows[row].right), column: position.column), in: doc.right.lines) }
-        while row < rows.count, rows[row].right < 0 { row += 1 }
-        if row < rows.count { return TextPosition(row: Int(rows[row].right), column: 0) }
-        let last = doc.right.lines.count - 1
-        return TextPosition(row: last, column: doc.right.lines[last].utf16.count)
+        switch mode {
+        case .single:
+            return TextEditing.clamp(position, in: doc.right.lines)
+        case .sideBySide:
+            guard isFoldingActive else { return TextEditing.clamp(position, in: doc.right.lines) }
+            guard !rightPaneRows.isEmpty else { return TextPosition(row: 0, column: 0) }
+            let row = min(max(0, position.row), rightPaneRows.count - 1)
+            switch rightPaneRows[row] {
+            case .line(_, let line):
+                return TextEditing.clamp(TextPosition(row: line, column: position.column), in: doc.right.lines)
+            case .foldBar(let region):
+                return TextEditing.clamp(TextPosition(row: region.rightRange.lowerBound, column: 0), in: doc.right.lines)
+            }
+        case .unified:
+            if isFoldingActive {
+                guard !unifiedDisplayRows.isEmpty else { return TextPosition(row: 0, column: 0) }
+                var row = min(max(0, position.row), unifiedDisplayRows.count - 1)
+                while row < unifiedDisplayRows.count {
+                    switch unifiedDisplayRows[row] {
+                    case .unified(let r):
+                        if r.right >= 0 {
+                            let col = row == position.row ? position.column : 0
+                            return TextEditing.clamp(TextPosition(row: Int(r.right), column: col), in: doc.right.lines)
+                        }
+                    case .foldBar(let region):
+                        return TextEditing.clamp(TextPosition(row: region.rightRange.lowerBound, column: 0), in: doc.right.lines)
+                    }
+                    row += 1
+                }
+                let last = doc.right.lines.count - 1
+                return TextPosition(row: last, column: doc.right.lines[last].utf16.count)
+            }
+            let rows = doc.unifiedRows
+            guard !rows.isEmpty else { return TextPosition(row: 0, column: 0) }
+            var row = min(max(0, position.row), rows.count - 1)
+            if rows[row].right >= 0 { return TextEditing.clamp(TextPosition(row: Int(rows[row].right), column: position.column), in: doc.right.lines) }
+            while row < rows.count, rows[row].right < 0 { row += 1 }
+            if row < rows.count { return TextPosition(row: Int(rows[row].right), column: 0) }
+            let last = doc.right.lines.count - 1
+            return TextPosition(row: last, column: doc.right.lines[last].utf16.count)
+        }
     }
 
     /// A position in the right side as a row of the right pane.
@@ -1621,8 +2158,12 @@ final class CodeCanvasView: NSView {
     }
 
     func editRow(forLine line: Int) -> Int {
-        guard let doc = document, mode == .unified else { return line }
-        return doc.unifiedRow(ofLine: line, side: .right)
+        guard document != nil else { return line }
+        switch mode {
+        case .single: return line
+        case .sideBySide: return isFoldingActive ? displayRow(forLine: line, side: .right) : line
+        case .unified: return unifiedDisplayRow(forLine: line, side: .right)
+        }
     }
 
     /// Distance of a column from the start of the right side's line, as laid out.
@@ -1693,10 +2234,10 @@ final class CodeCanvasView: NSView {
         for key in Array(lineCacheNew.keys) where key & 1 == Side.right.rawValue && stale(key >> 1) { lineCacheNew.removeValue(forKey: key) }
         for key in Array(lineCacheOld.keys) where key & 1 == Side.right.rawValue && stale(key >> 1) { lineCacheOld.removeValue(forKey: key) }
 
-        if mode == .unified || gutterDigits != gutterDigitsBefore {
-            // Rows of the unified view interleave both sides and move with every hunk; a wider gutter moves everything.
+        if mode == .unified || isFoldingActive || gutterDigits != gutterDigitsBefore {
+            // Rows of the unified or folded view can shift across segments; a wider gutter moves everything.
             right.dropTiles()
-            if gutterDigits != gutterDigitsBefore { panes[0].dropTiles() }
+            if isFoldingActive || gutterDigits != gutterDigitsBefore { panes[0].dropTiles() }
         } else {
             let tileRows = Self.tileRows
             var tiles = Set(rows.map { $0 / tileRows })
@@ -1730,6 +2271,7 @@ final class CodeCanvasView: NSView {
             annotations = mapped
         }
         editCount += 1
+        rebuildFoldLayout()
         rebuildHunkRows()
         invalidate([.decor, .selection, .scroll])
         container?.updateDocumentSize()
@@ -1743,12 +2285,17 @@ final class CodeCanvasView: NSView {
         guard let doc = document else { change(); return }
         let lh = codeFont.lineHeight
         let caret = editSelection
-        let anchorLine = caret?.head.row ?? Int((resolveScroll().right + lh / 2) / lh)
+        let anchorLine = caret?.head.row ?? (source(pane: .right, row: max(0, Int((resolveScroll().right + lh / 2) / lh)))?.line ?? 0)
         let before = CGFloat(editRow(forLine: anchorLine)) * lh - resolveScroll().right
+        let wasFolded = isFoldingActive
         change()
         if let focused = focusedHunk, focused >= doc.hunks.count { focusedHunk = nil }
+        rebuildFoldLayout()
         rebuildHunkRows()
-        if mode == .unified { panes[1].dropTiles() }
+        if mode == .unified || wasFolded || isFoldingActive {
+            panes[1].dropTiles()
+            if wasFolded || isFoldingActive { panes[0].dropTiles() }
+        }
         if let caret { selection = TextSelection(pane: .right, anchor: rowPosition(caret.anchor), head: rowPosition(caret.head)) }
         invalidate([.decor, .selection, .scroll])
         container?.updateDocumentSize()
@@ -1812,19 +2359,24 @@ final class CodeCanvasView: NSView {
         }
     }
 
-    /// Change bands, word-level highlights, search hits and focus markers for a window of rows.
+    /// Change bands, word-level highlights, rename boxes, search hits and focus markers for a window of rows.
     private func rebuildDecor(_ pane: Pane, _ doc: DiffDocument, rows: Range<Int>) {
         let lh = codeFont.lineHeight
         let bandWidth = pane.band.bounds.width
-        var lines = [[CGRect]](repeating: [], count: 3)
-        var marks = lines, words = lines
+        var lines = [[CGRect]](repeating: [], count: 4)
+        var marks = [[CGRect]](repeating: [], count: 4)
+        var words = [[CGRect]](repeating: [], count: 4)
+        var renameRects = [[CGRect]](repeating: [], count: RenameGroup.paletteCount)
+        var moveHoverRects: [CGRect] = []
         var excluded: [CGRect] = []
         var focusedTopRects: [CGRect] = [], focusedBottomRects: [CGRect] = []
         var focusedTopColor = theme.focusedBorder(.modified), focusedBottomColor = theme.focusedBorder(.modified)
         let ticks = commitTicks
-        var lineColors = Self.kinds.map { theme.line($0) }
+        var lineColors = [theme.modified, theme.added, theme.deleted, theme.moved]
         let markColors = lineColors
-        var wordColors = Self.kinds.map { theme.word($0) }
+        var wordColors = [theme.modifiedWord, theme.addedWord, theme.deletedWord, theme.movedWord]
+        let hasRenames = !doc.renameGroups.isEmpty
+        let hoveredMovePair = activeHoveredMovePairID
 
         switch mode {
         case .sideBySide:
@@ -1832,47 +2384,74 @@ final class CodeCanvasView: NSView {
             var index = firstHunk(doc, side: side, endingAtOrAfter: rows.lowerBound)
             while index < doc.hunks.count {
                 let hunk = doc.hunks[index]
-                let start = side == .left ? hunk.leftStart : hunk.rightStart
+                let displayStart = hunkDisplayStart(index, side: side)
+                let lineStart = side == .left ? hunk.leftStart : hunk.rightStart
                 let n = side == .left ? hunk.leftCount : hunk.rightCount
-                if start > rows.upperBound { break }
-                let k = kindIndex(hunk.kind)
+                if displayStart > rows.upperBound { break }
+                let k = hunkBucket(hunk)
                 let isFocused = focusedHunk == index
                 if n == 0 {
-                    let rect = CGRect(x: 0, y: CGFloat(start) * lh - 1, width: bandWidth, height: 2)
-                    if isFocused {
-                        focusedTopRects.append(rect)
-                        focusedTopColor = theme.focusedBorder(hunk.kind)
-                    } else {
-                        marks[k].append(rect)
+                    // Moved source/target blocks never draw a fake 0-height gap hairline on the opposite pane.
+                    if hunk.moveInfo == nil {
+                        let rect = CGRect(x: 0, y: CGFloat(displayStart) * lh - 1, width: bandWidth, height: 2)
+                        if isFocused {
+                            focusedTopRects.append(rect)
+                            focusedTopColor = theme.focusedBorder(for: hunk)
+                        } else {
+                            marks[k].append(rect)
+                        }
                     }
                 } else {
                     // Clipped to the window so a huge hunk never makes a huge layer.
-                    let a = max(start, rows.lowerBound), b = min(start + n, rows.upperBound)
+                    let a = max(displayStart, rows.lowerBound), b = min(displayStart + n, rows.upperBound)
                     if a < b {
                         let y = CGFloat(a) * lh, height = CGFloat(b - a) * lh
-                        lines[k].append(CGRect(x: 0, y: y, width: bandWidth, height: height))
+                        let rect = CGRect(x: 0, y: y, width: bandWidth, height: height)
+                        lines[k].append(rect)
+                        if let move = hunk.moveInfo, let hoveredMovePair, move.pairID == hoveredMovePair {
+                            moveHoverRects.append(rect)
+                        }
                         if isFocused {
-                            let borderColor = theme.focusedBorder(hunk.kind)
-                            if start >= rows.lowerBound {
-                                focusedTopRects.append(CGRect(x: 0, y: CGFloat(start) * lh, width: bandWidth, height: 1))
+                            let borderColor = theme.focusedBorder(for: hunk)
+                            if displayStart >= rows.lowerBound {
+                                focusedTopRects.append(CGRect(x: 0, y: CGFloat(displayStart) * lh, width: bandWidth, height: 1))
                                 focusedTopColor = borderColor
                             }
-                            if start + n <= rows.upperBound {
-                                focusedBottomRects.append(CGRect(x: 0, y: CGFloat(start + n) * lh - 1, width: bandWidth, height: 1))
+                            if displayStart + n <= rows.upperBound {
+                                focusedBottomRects.append(CGRect(x: 0, y: CGFloat(displayStart + n) * lh - 1, width: bandWidth, height: 1))
                                 focusedBottomColor = borderColor
                             }
                         }
-                        if let ticks { appendExcluded(ticks, side: side, lines: a..<b, row: a, width: bandWidth, to: &excluded) }
-                        let inline = side == .left ? hunk.leftInline : hunk.rightInline
+                        let lineA = lineStart + (a - displayStart)
+                        let lineB = lineStart + (b - displayStart)
+                        if let ticks { appendExcluded(ticks, side: side, lines: lineA..<lineB, row: a, width: bandWidth, to: &excluded) }
+                        let inline: [[Range<Int>]]
+                        if let move = hunk.moveInfo, let moveInline = move.inlineDiff, hunk.kind != .modified {
+                            inline = (side == .left && move.role == .source) ? moveInline.source
+                                : ((side == .right && move.role == .target) ? moveInline.target : [])
+                        } else {
+                            inline = side == .left ? hunk.leftInline : hunk.rightInline
+                        }
                         // `inline` may be empty or shorter than the hunk.
-                        var line = a
-                        let inlineEnd = min(b, start + inline.count)
-                        while line < inlineEnd {
+                        var r = a
+                        let inlineEndRow = min(b, displayStart + inline.count)
+                        while r < inlineEndRow {
+                            let offset = r - displayStart
+                            let line = lineStart + offset
                             // A line that stays out of the commit is pale, without the words that changed in it.
                             if ticks?.isExcluded(side, line) != true {
-                                appendRects(inline[line - start], side: side, line: line, row: line, to: &words[k])
+                                let rawRanges = inline[offset]
+                                let filteredRanges: [Range<Int>]
+                                if hasRenames, !rawRanges.isEmpty {
+                                    filteredRanges = rawRanges.filter {
+                                        doc.renameColorIndex(hunkIndex: index, side: side, lineIndex: line, range: $0) == nil
+                                    }
+                                } else {
+                                    filteredRanges = rawRanges
+                                }
+                                appendRects(filteredRanges, side: side, line: line, row: r, to: &words[k])
                             }
-                            line += 1
+                            r += 1
                         }
                     }
                 }
@@ -1880,36 +2459,64 @@ final class CodeCanvasView: NSView {
             }
 
         case .unified:
-            lineColors = [theme.added, theme.removedLine, theme.removedLine]
-            wordColors = [theme.addedWord, theme.removedWord, theme.removedWord]
-            let data = doc.unifiedRows
-            let end = min(rows.upperBound, data.count)
+            lineColors = [theme.added, theme.removedLine, theme.removedLine, theme.moved]
+            wordColors = [theme.addedWord, theme.removedWord, theme.removedWord, theme.movedWord]
+            let totalRows = paneRowCount(.right)
+            let end = min(rows.upperBound, totalRows)
+            func unifiedRowAt(_ idx: Int) -> UnifiedRow? {
+                if isFoldingActive {
+                    guard idx < unifiedDisplayRows.count, case .unified(let r) = unifiedDisplayRows[idx] else { return nil }
+                    return r
+                }
+                return doc.unifiedRows[idx]
+            }
             var row = rows.lowerBound
             while row < end {
-                let first = data[row]
-                guard first.kind != .context else { row += 1; continue }
+                guard let first = unifiedRowAt(row), first.kind != .context else { row += 1; continue }
                 var next = row + 1
-                while next < end, data[next].kind == first.kind, data[next].hunk == first.hunk { next += 1 }
-                let group = first.kind == .added ? 0 : 1
+                while next < end, let u = unifiedRowAt(next), u.kind == first.kind, u.hunk == first.hunk { next += 1 }
+                let hunkIdx = Int(first.hunk)
+                let hunk: Hunk? = (hunkIdx >= 0 && hunkIdx < doc.hunks.count) ? doc.hunks[hunkIdx] : nil
+                let isMoved = hunk?.moveInfo != nil
+                let group = isMoved ? 3 : (first.kind == .added ? 0 : 1)
                 let rect = CGRect(x: 0, y: CGFloat(row) * lh, width: bandWidth, height: CGFloat(next - row) * lh)
                 lines[group].append(rect)
+                if let move = hunk?.moveInfo, let hoveredMovePair, move.pairID == hoveredMovePair {
+                    moveHoverRects.append(rect)
+                }
                 if let ticks {
                     let side: Side = first.kind == .added ? .right : .left
                     let firstLine = Int(side == .left ? first.left : first.right)
                     appendExcluded(ticks, side: side, lines: firstLine..<(firstLine + next - row), row: row, width: bandWidth, to: &excluded)
                 }
-                if first.hunk >= 0, Int(first.hunk) < doc.hunks.count {
-                    let hunk = doc.hunks[Int(first.hunk)]
+                if let hunk {
                     for i in row..<next {
+                        guard let u = unifiedRowAt(i) else { continue }
                         if first.kind == .removed {
-                            let line = Int(data[i].left), offset = line - hunk.leftStart
-                            if offset >= 0, offset < hunk.leftInline.count, ticks?.isExcluded(.left, line) != true {
-                                appendRects(hunk.leftInline[offset], side: .left, line: line, row: i, to: &words[1])
+                            let line = Int(u.left), offset = line - hunk.leftStart
+                            let inlineArr: [[Range<Int>]] = (isMoved && hunk.kind != .modified && hunk.moveInfo?.role == .source)
+                                ? (hunk.moveInfo?.inlineDiff?.source ?? [])
+                                : hunk.leftInline
+                            if offset >= 0, offset < inlineArr.count, ticks?.isExcluded(.left, line) != true {
+                                let raw = inlineArr[offset]
+                                let filtered = hasRenames ? raw.filter {
+                                    doc.renameColorIndex(hunkIndex: hunkIdx, side: .left, lineIndex: line, range: $0) == nil
+                                } : raw
+                                let wordSlot = isMoved ? 3 : 1
+                                appendRects(filtered, side: .left, line: line, row: i, to: &words[wordSlot])
                             }
                         } else {
-                            let line = Int(data[i].right), offset = line - hunk.rightStart
-                            if offset >= 0, offset < hunk.rightInline.count, ticks?.isExcluded(.right, line) != true {
-                                appendRects(hunk.rightInline[offset], side: .right, line: line, row: i, to: &words[0])
+                            let line = Int(u.right), offset = line - hunk.rightStart
+                            let inlineArr: [[Range<Int>]] = (isMoved && hunk.kind != .modified && hunk.moveInfo?.role == .target)
+                                ? (hunk.moveInfo?.inlineDiff?.target ?? [])
+                                : hunk.rightInline
+                            if offset >= 0, offset < inlineArr.count, ticks?.isExcluded(.right, line) != true {
+                                let raw = inlineArr[offset]
+                                let filtered = hasRenames ? raw.filter {
+                                    doc.renameColorIndex(hunkIndex: hunkIdx, side: .right, lineIndex: line, range: $0) == nil
+                                } : raw
+                                let wordSlot = isMoved ? 3 : 0
+                                appendRects(filtered, side: .right, line: line, row: i, to: &words[wordSlot])
                             }
                         }
                     }
@@ -1920,20 +2527,41 @@ final class CodeCanvasView: NSView {
                 let hunk = doc.hunks[focused]
                 let hunkStart = hunkRows[focused]
                 let hunkEnd = hunkStart + hunk.leftCount + hunk.rightCount
-                if hunkStart < hunkEnd, hunkEnd <= data.count, hunkStart < end, hunkEnd > rows.lowerBound {
+                if hunkStart < hunkEnd, hunkEnd <= totalRows, hunkStart < end, hunkEnd > rows.lowerBound {
                     if hunkStart >= rows.lowerBound {
                         focusedTopRects.append(CGRect(x: 0, y: CGFloat(hunkStart) * lh, width: bandWidth, height: 1))
-                        focusedTopColor = hunk.leftCount > 0 ? theme.removedBorder : theme.addedBorder
+                        focusedTopColor = hunk.moveInfo != nil ? theme.movedBorder : (hunk.leftCount > 0 ? theme.removedBorder : theme.addedBorder)
                     }
                     if hunkEnd <= end {
                         focusedBottomRects.append(CGRect(x: 0, y: CGFloat(hunkEnd) * lh - 1, width: bandWidth, height: 1))
-                        focusedBottomColor = hunk.rightCount > 0 ? theme.addedBorder : theme.removedBorder
+                        focusedBottomColor = hunk.moveInfo != nil ? theme.movedBorder : (hunk.rightCount > 0 ? theme.addedBorder : theme.removedBorder)
                     }
                 }
             }
 
         case .single:
             break
+        }
+
+        // Cross-hunk identifier rename highlights (coordinated 6-color fill + 1pt rounded border).
+        if hasRenames, mode != .single {
+            let slotCount = RenameGroup.paletteCount
+            for row in rows {
+                guard let src = source(pane: pane.side, row: row) else { continue }
+                if ticks?.isExcluded(src.side, src.line) == true { continue }
+                let occs = doc.renameOccurrences(side: src.side, lineIndex: src.line)
+                guard !occs.isEmpty else { continue }
+                let layout = ctLine(src.side, src.line)
+                for occ in occs {
+                    let x0 = CTLineGetOffsetForStringIndex(layout, occ.range.lowerBound, nil)
+                    let x1 = CTLineGetOffsetForStringIndex(layout, occ.range.upperBound, nil)
+                    guard x1 > x0 else { continue }
+                    let slot = ((occ.colorIndex % slotCount) + slotCount) % slotCount
+                    let rect = CGRect(x: max(0, textInset + x0 - 1), y: CGFloat(row) * lh + 1,
+                                      width: (x1 - x0) + 2, height: lh - 2)
+                    renameRects[slot].append(rect)
+                }
+            }
         }
 
         var hits: [CGRect] = [], current: [CGRect] = []
@@ -1952,8 +2580,8 @@ final class CodeCanvasView: NSView {
         var focusRow: Int?
         if let focus = focusLine {
             switch mode {
-            case .sideBySide: if focus.side == pane.side { focusRow = focus.line }
-            case .unified: focusRow = doc.unifiedRow(ofLine: focus.line, side: focus.side)
+            case .sideBySide: if focus.side == pane.side { focusRow = displayRow(forLine: focus.line, side: focus.side) }
+            case .unified: focusRow = unifiedDisplayRow(forLine: focus.line, side: focus.side)
             case .single: if focus.side == .right { focusRow = focus.line }
             }
         }
@@ -1966,11 +2594,21 @@ final class CodeCanvasView: NSView {
             pane.focus.isHidden = true
         }
 
-        for k in 0..<3 {
+        for k in 0..<4 {
             pane.lines[k].set(lines[k], color: lineColors[k])
             pane.marks[k].set(marks[k], color: markColors[k])
             pane.words[k].set(words[k], color: wordColors[k], radius: 2.5)
         }
+        for slot in 0..<RenameGroup.paletteCount {
+            let style = theme.renameStyle(at: slot)
+            pane.renames[slot].set(renameRects[slot], color: style.fill, radius: 3, borderColor: style.border, borderWidth: 1)
+        }
+        pane.moveHighlight.set(
+            moveHoverRects,
+            color: theme.movedAccent.copy(alpha: theme.isDark ? 0.10 : 0.07) ?? theme.moved,
+            borderColor: theme.movedBorder.copy(alpha: theme.isDark ? 0.92 : 0.85) ?? theme.movedBorder,
+            borderWidth: 1
+        )
         pane.focusedTop.set(focusedTopRects, color: focusedTopColor)
         pane.focusedBottom.set(focusedBottomRects, color: focusedBottomColor)
         pane.excluded.set(excluded, color: theme.background.copy(alpha: 0.62) ?? theme.background)
@@ -2025,7 +2663,8 @@ final class CodeCanvasView: NSView {
         pane.selection.set(rects, color: theme.selection)
     }
 
-    /// The curved ribbons joining each change across the divider.
+    /// The curved ribbons joining each change across the divider, plus SemanticDiff-style
+    /// cross-position curves connecting paired moved blocks.
     private func updateConnectors(_ doc: DiffDocument, _ scroll: Scroll) {
         let lh = codeFont.lineHeight
         let h = bounds.height
@@ -2034,16 +2673,21 @@ final class CodeCanvasView: NSView {
         let firstLeft = max(0, Int(floor(scroll.left / lh))), firstRight = max(0, Int(floor(scroll.right / lh)))
         var index = min(firstHunk(doc, side: .left, endingAtOrAfter: firstLeft),
                         firstHunk(doc, side: .right, endingAtOrAfter: firstRight))
-        let fills = [CGMutablePath(), CGMutablePath(), CGMutablePath()]
+        let fills = [CGMutablePath(), CGMutablePath(), CGMutablePath(), CGMutablePath()]
         var outlinePath: CGMutablePath?
         var outlineColor: CGColor?
         while index < doc.hunks.count {
             let hunk = doc.hunks[index]
-            var l0 = CGFloat(hunk.leftStart) * lh - scroll.left
+            var l0 = CGFloat(hunkDisplayStart(index, side: .left)) * lh - scroll.left
             var l1 = l0 + CGFloat(hunk.leftCount) * lh
-            var r0 = CGFloat(hunk.rightStart) * lh - scroll.right
+            var r0 = CGFloat(hunkDisplayStart(index, side: .right)) * lh - scroll.right
             var r1 = r0 + CGFloat(hunk.rightCount) * lh
             if min(l0, r0) > h { break }
+            // Moved blocks use cross-position S-curves below instead of fake 0-height gap ribbons.
+            if hunk.moveInfo != nil {
+                index += 1
+                continue
+            }
             if max(l1, r1) >= 0 {
                 if hunk.leftCount == 0 { l0 -= 1; l1 += 1 }
                 if hunk.rightCount == 0 { r0 -= 1; r1 += 1 }
@@ -2055,7 +2699,8 @@ final class CodeCanvasView: NSView {
                 path.addLine(to: CGPoint(x: x1, y: r1))
                 path.addCurve(to: CGPoint(x: 0, y: l1), control1: CGPoint(x: x1 - bend, y: r1), control2: CGPoint(x: bend, y: l1))
                 path.closeSubpath()
-                fills[kindIndex(hunk.kind)].addPath(path)
+                let bucket = hunkBucket(hunk)
+                fills[bucket].addPath(path)
 
                 if index == focusedHunk {
                     let stroke = CGMutablePath()
@@ -2066,20 +2711,352 @@ final class CodeCanvasView: NSView {
                     stroke.move(to: CGPoint(x: 0, y: botL))
                     stroke.addCurve(to: CGPoint(x: x1, y: botR), control1: CGPoint(x: bend, y: botL), control2: CGPoint(x: x1 - bend, y: botR))
                     outlinePath = stroke
-                    outlineColor = theme.focusedBorder(hunk.kind)
+                    outlineColor = theme.focusedBorder(for: hunk)
                 }
             }
             index += 1
         }
         let scale = backingScale
-        for k in 0..<3 {
+        let colors = [theme.modified, theme.added, theme.deleted, theme.moved]
+        for k in 0..<4 {
             ribbons[k].contentsScale = scale
-            ribbons[k].fillColor = theme.line(Self.kinds[k])
+            ribbons[k].fillColor = colors[k]
             ribbons[k].path = fills[k].isEmpty ? nil : fills[k]
         }
         ribbonOutline.contentsScale = scale
         ribbonOutline.strokeColor = outlineColor
         ribbonOutline.path = outlinePath
+        updateMoveConnectors(doc, scroll)
+    }
+
+    /// Smooth diff-style funnels at each visible moved block joined by a restrained 1pt
+    /// connecting line along the bridge's lane, matching regular diff ribbons in geometry and tone.
+    private func updateMoveConnectors(_ doc: DiffDocument, _ scroll: Scroll) {
+        moveConnectorHits.removeAll(keepingCapacity: true)
+        guard !movePairs.isEmpty, bounds.height > 1 else {
+            moveConnectorLayers.forEach { $0.setHidden(true) }
+            if hoveredMoveConnector != nil { hoveredMoveConnector = nil }
+            return
+        }
+
+        let lh = codeFont.lineHeight
+        let h = bounds.height
+        let x1 = connectorWidth
+        let scale = backingScale
+        let hoveredPair = activeHoveredMovePairID
+        let totalPairs = movePairs.count
+        let maxTurnR: CGFloat = 5.0
+        let kappa: CGFloat = 0.55228475
+
+        func visibleMid(top: CGFloat, bottom: CGFloat) -> CGFloat {
+            let visTop = max(top, 0)
+            let visBot = min(bottom, h)
+            return (visTop + visBot) * 0.5
+        }
+
+        func appendCubicSamples(p0: CGPoint, c1: CGPoint, c2: CGPoint, p3: CGPoint, steps: Int = 6, to pts: inout [CGPoint]) {
+            if pts.isEmpty { pts.append(p0) }
+            for i in 1...steps {
+                let t = CGFloat(i) / CGFloat(steps)
+                let mt = 1 - t
+                let mt2 = mt * mt
+                let t2 = t * t
+                let x = mt2 * mt * p0.x + 3 * mt2 * t * c1.x + 3 * mt * t2 * c2.x + t2 * t * p3.x
+                let y = mt2 * mt * p0.y + 3 * mt2 * t * c1.y + 3 * mt * t2 * c2.y + t2 * t * p3.y
+                pts.append(CGPoint(x: x, y: y))
+            }
+        }
+
+        func addLeftFunnel(l0: CGFloat, l1: CGFloat, tipX: CGFloat, midY: CGFloat, fill: CGMutablePath, stroke: CGMutablePath) {
+            let bend = tipX * 0.5
+            fill.move(to: CGPoint(x: 0, y: l0))
+            fill.addCurve(to: CGPoint(x: tipX, y: midY), control1: CGPoint(x: bend, y: l0), control2: CGPoint(x: tipX - bend, y: midY))
+            fill.addCurve(to: CGPoint(x: 0, y: l1), control1: CGPoint(x: tipX - bend, y: midY), control2: CGPoint(x: bend, y: l1))
+            fill.closeSubpath()
+
+            let topL = min(l0 + 0.5, midY)
+            let botL = max(l1 - 0.5, midY)
+            stroke.move(to: CGPoint(x: 0, y: topL))
+            stroke.addCurve(to: CGPoint(x: tipX, y: midY), control1: CGPoint(x: bend, y: topL), control2: CGPoint(x: tipX - bend, y: midY))
+            stroke.move(to: CGPoint(x: 0, y: botL))
+            stroke.addCurve(to: CGPoint(x: tipX, y: midY), control1: CGPoint(x: bend, y: botL), control2: CGPoint(x: tipX - bend, y: midY))
+        }
+
+        func addRightFunnel(r0: CGFloat, r1: CGFloat, tipX: CGFloat, midY: CGFloat, fill: CGMutablePath, stroke: CGMutablePath) {
+            let span = x1 - tipX
+            let bend = span * 0.5
+            fill.move(to: CGPoint(x: tipX, y: midY))
+            fill.addCurve(to: CGPoint(x: x1, y: r0), control1: CGPoint(x: tipX + bend, y: midY), control2: CGPoint(x: x1 - bend, y: r0))
+            fill.addLine(to: CGPoint(x: x1, y: r1))
+            fill.addCurve(to: CGPoint(x: tipX, y: midY), control1: CGPoint(x: x1 - bend, y: r1), control2: CGPoint(x: tipX + bend, y: midY))
+            fill.closeSubpath()
+
+            let topR = min(r0 + 0.5, midY)
+            let botR = max(r1 - 0.5, midY)
+            stroke.move(to: CGPoint(x: tipX, y: midY))
+            stroke.addCurve(to: CGPoint(x: x1, y: topR), control1: CGPoint(x: tipX + bend, y: midY), control2: CGPoint(x: x1 - bend, y: topR))
+            stroke.move(to: CGPoint(x: tipX, y: midY))
+            stroke.addCurve(to: CGPoint(x: x1, y: botR), control1: CGPoint(x: tipX + bend, y: midY), control2: CGPoint(x: x1 - bend, y: botR))
+        }
+
+        func addEdgeChevron(x: CGFloat, pointingUp: Bool, to stroke: CGMutablePath) {
+            let tipY: CGFloat = pointingUp ? 1.5 : (h - 1.5)
+            let inward: CGFloat = pointingUp ? 1 : -1
+            let halfW: CGFloat = 2.8
+            let armH: CGFloat = 3.0
+            stroke.move(to: CGPoint(x: x - halfW, y: tipY + inward * armH))
+            stroke.addLine(to: CGPoint(x: x, y: tipY))
+            stroke.addLine(to: CGPoint(x: x + halfW, y: tipY + inward * armH))
+        }
+
+        var used = 0
+        for pair in movePairs {
+            guard doc.hunks.indices.contains(pair.sourceHunk),
+                  doc.hunks.indices.contains(pair.targetHunk) else { continue }
+            let src = doc.hunks[pair.sourceHunk]
+            let dst = doc.hunks[pair.targetHunk]
+            let rawSrcTop = CGFloat(hunkDisplayStart(pair.sourceHunk, side: .left)) * lh - scroll.left
+            let rawSrcBottom = rawSrcTop + CGFloat(max(1, src.leftCount)) * lh
+            let rawDstTop = CGFloat(hunkDisplayStart(pair.targetHunk, side: .right)) * lh - scroll.right
+            let rawDstBottom = rawDstTop + CGFloat(max(1, dst.rightCount)) * lh
+
+            let srcVisible = rawSrcBottom >= 0 && rawSrcTop <= h
+            let dstVisible = rawDstBottom >= 0 && rawDstTop <= h
+            guard srcVisible || dstVisible else { continue }
+
+            let l0 = max(rawSrcTop, -h), l1 = min(rawSrcBottom, 2 * h)
+            let r0 = max(rawDstTop, -h), r1 = min(rawDstBottom, 2 * h)
+
+            let laneX = moveConnectorLaneX(forPairID: pair.pairID, totalPairs: totalPairs)
+            let tipL = max(6.0, laneX - maxTurnR)
+            let tipR = min(x1 - 6.0, laneX + maxTurnR)
+            let isHovered = hoveredPair == pair.pairID
+            let isFocused = focusedHunk == pair.sourceHunk || focusedHunk == pair.targetHunk
+
+            let fillPath = CGMutablePath()
+            let strokePath = CGMutablePath()
+            var spineSamples: [CGPoint] = []
+            let clickSourceHunk: Int
+
+            if srcVisible && dstVisible {
+                let lMid = visibleMid(top: rawSrcTop, bottom: rawSrcBottom)
+                let rMid = visibleMid(top: rawDstTop, bottom: rawDstBottom)
+                let verticalGap = max(rawSrcTop, rawDstTop) - min(rawSrcBottom, rawDstBottom)
+                let useDirectRibbon = verticalGap <= lh * 0.5 && abs(rMid - lMid) <= max(lh * 3.5, 64)
+
+                if useDirectRibbon {
+                    let bend = x1 * 0.5
+                    fillPath.move(to: CGPoint(x: 0, y: l0))
+                    fillPath.addCurve(to: CGPoint(x: x1, y: r0), control1: CGPoint(x: bend, y: l0), control2: CGPoint(x: x1 - bend, y: r0))
+                    fillPath.addLine(to: CGPoint(x: x1, y: r1))
+                    fillPath.addCurve(to: CGPoint(x: 0, y: l1), control1: CGPoint(x: x1 - bend, y: r1), control2: CGPoint(x: bend, y: l1))
+                    fillPath.closeSubpath()
+
+                    let topL = min(l0 + 0.5, lMid), botL = max(l1 - 0.5, lMid)
+                    let topR = min(r0 + 0.5, rMid), botR = max(r1 - 0.5, rMid)
+                    strokePath.move(to: CGPoint(x: 0, y: topL))
+                    strokePath.addCurve(to: CGPoint(x: x1, y: topR), control1: CGPoint(x: bend, y: topL), control2: CGPoint(x: x1 - bend, y: topR))
+                    strokePath.move(to: CGPoint(x: 0, y: botL))
+                    strokePath.addCurve(to: CGPoint(x: x1, y: botR), control1: CGPoint(x: bend, y: botL), control2: CGPoint(x: x1 - bend, y: botR))
+
+                    appendCubicSamples(
+                        p0: CGPoint(x: 0, y: lMid),
+                        c1: CGPoint(x: bend, y: lMid),
+                        c2: CGPoint(x: x1 - bend, y: rMid),
+                        p3: CGPoint(x: x1, y: rMid),
+                        steps: 10,
+                        to: &spineSamples
+                    )
+                } else {
+                    addLeftFunnel(l0: l0, l1: l1, tipX: tipL, midY: lMid, fill: fillPath, stroke: strokePath)
+                    addRightFunnel(r0: r0, r1: r1, tipX: tipR, midY: rMid, fill: fillPath, stroke: strokePath)
+
+                    let dy = rMid - lMid
+                    let dir: CGFloat = dy >= 0 ? 1 : -1
+                    let turnY = min(maxTurnR, abs(dy) * 0.5)
+                    let dxL = laneX - tipL
+                    let dxR = tipR - laneX
+
+                    let p0 = CGPoint(x: tipL, y: lMid)
+                    let c1L = CGPoint(x: tipL + dxL * kappa, y: lMid)
+                    let c2L = CGPoint(x: laneX, y: lMid + dir * turnY * (1 - kappa))
+                    let pTurnL = CGPoint(x: laneX, y: lMid + dir * turnY)
+
+                    let pTurnR = CGPoint(x: laneX, y: rMid - dir * turnY)
+                    let c1R = CGPoint(x: laneX, y: rMid - dir * turnY * (1 - kappa))
+                    let c2R = CGPoint(x: tipR - dxR * kappa, y: rMid)
+                    let p3 = CGPoint(x: tipR, y: rMid)
+
+                    strokePath.move(to: p0)
+                    strokePath.addCurve(to: pTurnL, control1: c1L, control2: c2L)
+                    if abs(pTurnR.y - pTurnL.y) > 0.25 {
+                        strokePath.addLine(to: pTurnR)
+                    }
+                    strokePath.addCurve(to: p3, control1: c1R, control2: c2R)
+
+                    appendCubicSamples(p0: p0, c1: c1L, c2: c2L, p3: pTurnL, to: &spineSamples)
+                    if abs(pTurnR.y - pTurnL.y) > 0.25 {
+                        spineSamples.append(pTurnR)
+                    }
+                    appendCubicSamples(p0: pTurnR, c1: c1R, c2: c2R, p3: p3, to: &spineSamples)
+                }
+                clickSourceHunk = (focusedHunk == pair.targetHunk) ? pair.targetHunk : pair.sourceHunk
+            } else if srcVisible {
+                let lMid = visibleMid(top: rawSrcTop, bottom: rawSrcBottom)
+                addLeftFunnel(l0: l0, l1: l1, tipX: tipL, midY: lMid, fill: fillPath, stroke: strokePath)
+
+                let goingUp = rawDstBottom < 0
+                let dir: CGFloat = goingUp ? -1 : 1
+                let edgeY: CGFloat = goingUp ? 0 : h
+                let availY = abs(edgeY - lMid)
+                let showChevron = availY > 10
+                let endY: CGFloat = showChevron ? (goingUp ? 1.5 : (h - 1.5)) : edgeY
+                let turnY = min(maxTurnR, abs(endY - lMid))
+                let dxL = laneX - tipL
+
+                let p0 = CGPoint(x: tipL, y: lMid)
+                let c1 = CGPoint(x: tipL + dxL * kappa, y: lMid)
+                let c2 = CGPoint(x: laneX, y: lMid + dir * turnY * (1 - kappa))
+                let pTurn = CGPoint(x: laneX, y: lMid + dir * turnY)
+                let pEnd = CGPoint(x: laneX, y: endY)
+
+                strokePath.move(to: p0)
+                strokePath.addCurve(to: pTurn, control1: c1, control2: c2)
+                if abs(pEnd.y - pTurn.y) > 0.25 {
+                    strokePath.addLine(to: pEnd)
+                }
+                if showChevron {
+                    addEdgeChevron(x: laneX, pointingUp: goingUp, to: strokePath)
+                }
+
+                appendCubicSamples(p0: p0, c1: c1, c2: c2, p3: pTurn, to: &spineSamples)
+                if abs(pEnd.y - pTurn.y) > 0.25 {
+                    spineSamples.append(pEnd)
+                }
+                clickSourceHunk = pair.sourceHunk
+            } else {
+                let rMid = visibleMid(top: rawDstTop, bottom: rawDstBottom)
+                addRightFunnel(r0: r0, r1: r1, tipX: tipR, midY: rMid, fill: fillPath, stroke: strokePath)
+
+                let fromAbove = rawSrcBottom < 0
+                let dir: CGFloat = fromAbove ? 1 : -1
+                let edgeY: CGFloat = fromAbove ? 0 : h
+                let availY = abs(rMid - edgeY)
+                let showChevron = availY > 10
+                let startY: CGFloat = showChevron ? (fromAbove ? 1.5 : (h - 1.5)) : edgeY
+                let turnY = min(maxTurnR, abs(rMid - startY))
+                let dxR = tipR - laneX
+
+                let pStart = CGPoint(x: laneX, y: startY)
+                let pTurn = CGPoint(x: laneX, y: rMid - dir * turnY)
+                let c1 = CGPoint(x: laneX, y: rMid - dir * turnY * (1 - kappa))
+                let c2 = CGPoint(x: tipR - dxR * kappa, y: rMid)
+                let p3 = CGPoint(x: tipR, y: rMid)
+
+                if showChevron {
+                    addEdgeChevron(x: laneX, pointingUp: fromAbove, to: strokePath)
+                }
+                strokePath.move(to: pStart)
+                if abs(pTurn.y - pStart.y) > 0.25 {
+                    strokePath.addLine(to: pTurn)
+                }
+                strokePath.addCurve(to: p3, control1: c1, control2: c2)
+
+                spineSamples.append(pStart)
+                if abs(pTurn.y - pStart.y) > 0.25 {
+                    spineSamples.append(pTurn)
+                }
+                appendCubicSamples(p0: pTurn, c1: c1, c2: c2, p3: p3, to: &spineSamples)
+                clickSourceHunk = pair.targetHunk
+            }
+
+            if used == moveConnectorLayers.count {
+                moveConnectorLayers.append(MoveConnectorLayerSet(host: connector))
+            }
+            let layerSet = moveConnectorLayers[used]
+            used += 1
+            layerSet.setZOffset(isHovered ? 1.0 : (isFocused ? 0.5 : 0.0))
+
+            let fillColor = isHovered
+                ? (theme.moved.copy(alpha: theme.isDark ? 0.28 : 0.20) ?? theme.moved)
+                : theme.moved
+            let strokeColor = isHovered
+                ? (theme.movedBorder.copy(alpha: theme.isDark ? 0.92 : 0.85) ?? theme.movedBorder)
+                : theme.movedBorder
+            let lineWidth: CGFloat = isHovered ? 1.5 : 1.0
+
+            layerSet.fill.contentsScale = scale
+            layerSet.fill.fillColor = fillColor
+            layerSet.fill.path = fillPath.isEmpty ? nil : fillPath
+
+            layerSet.stroke.contentsScale = scale
+            layerSet.stroke.strokeColor = strokeColor
+            layerSet.stroke.lineWidth = lineWidth
+            layerSet.stroke.path = strokePath.isEmpty ? nil : strokePath
+            layerSet.setHidden(false)
+
+            var hitBounds = fillPath.isEmpty ? CGRect.null : fillPath.boundingBoxOfPath
+            for pt in spineSamples {
+                hitBounds = hitBounds.union(CGRect(origin: pt, size: .zero))
+            }
+            if !hitBounds.isNull {
+                hitBounds = hitBounds.insetBy(dx: -7, dy: -7)
+            }
+            moveConnectorHits.append(MoveConnectorHit(
+                pairID: pair.pairID,
+                sourceHunk: pair.sourceHunk,
+                targetHunk: pair.targetHunk,
+                bothVisible: srcVisible && dstVisible,
+                clickSourceHunk: clickSourceHunk,
+                fillPath: fillPath,
+                spineSamples: spineSamples,
+                bounds: hitBounds
+            ))
+        }
+
+        for layerSet in moveConnectorLayers[used...] {
+            layerSet.setHidden(true)
+        }
+        if let hovered = hoveredMoveConnector, !moveConnectorHits.contains(where: { $0.pairID == hovered }) {
+            hoveredMoveConnector = nil
+        }
+    }
+
+    private func moveConnectorHit(at point: CGPoint) -> MoveConnectorHit? {
+        guard mode == .sideBySide, !moveConnectorHits.isEmpty else { return nil }
+        let local = CGPoint(x: point.x - paneWidth, y: point.y)
+        guard local.x >= 0, local.x <= connectorWidth else { return nil }
+        let maxDistSq: CGFloat = 6.5 * 6.5
+        var best: (hit: MoveConnectorHit, distSq: CGFloat)?
+        for hit in moveConnectorHits where hit.bounds.contains(local) {
+            if hit.fillPath.contains(local) {
+                return hit
+            }
+            let pts = hit.spineSamples
+            guard pts.count >= 2 else { continue }
+            var minDistSq = CGFloat.greatestFiniteMagnitude
+            for i in 0..<(pts.count - 1) {
+                let d2 = Self.pointToSegmentDistanceSquared(local, pts[i], pts[i + 1])
+                if d2 < minDistSq { minDistSq = d2 }
+            }
+            if minDistSq <= maxDistSq, best == nil || minDistSq < best!.distSq {
+                best = (hit, minDistSq)
+            }
+        }
+        return best?.hit
+    }
+
+    private static func pointToSegmentDistanceSquared(_ p: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
+        let vx = b.x - a.x, vy = b.y - a.y
+        let lenSq = vx * vx + vy * vy
+        guard lenSq > 1e-6 else {
+            let dx = p.x - a.x, dy = p.y - a.y
+            return dx * dx + dy * dy
+        }
+        let t = min(1, max(0, ((p.x - a.x) * vx + (p.y - a.y) * vy) / lenSq))
+        let px = a.x + t * vx, py = a.y + t * vy
+        let dx = p.x - px, dy = p.y - py
+        return dx * dx + dy * dy
     }
 
     // MARK: Revert buttons
@@ -2131,7 +3108,8 @@ final class CodeCanvasView: NSView {
             let bottom: CGFloat // where the change ends, in view coordinates
             let rest: CGFloat   // where its button sits while the change starts on screen
             if sideBySide {
-                let l0 = CGFloat(hunk.leftStart) * lh - scroll.left, r0 = CGFloat(hunk.rightStart) * lh - scroll.right
+                let l0 = CGFloat(hunkDisplayStart(index, side: .left)) * lh - scroll.left
+                let r0 = CGFloat(hunkDisplayStart(index, side: .right)) * lh - scroll.right
                 if min(l0, r0) > h { break }
                 bottom = max(l0 + CGFloat(hunk.leftCount) * lh, r0 + CGFloat(hunk.rightCount) * lh)
                 // Midway along the top edge of the ribbon; a side with no lines is just a hairline there.
@@ -2272,7 +3250,7 @@ final class CodeCanvasView: NSView {
         let right = bounds.width - rulerWidth - 10
         var used = 0
         for (index, block) in conflicts.enumerated() {
-            let row = mode == .unified ? doc.unifiedRow(ofLine: block.start, side: .right) : block.start
+            let row = editRow(forLine: block.start)
             let top = CGFloat(row) * lh - scroll.right
             guard top > -lh, top < h else { continue }
             var x = right
@@ -2369,23 +3347,277 @@ final class CodeCanvasView: NSView {
         revertHits.first { $0.rect.insetBy(dx: -3, dy: -3).contains(point) }?.hunk
     }
 
+    // MARK: Move badges
+
+    private func updateMoveBadges(_ doc: DiffDocument, _ scroll: Scroll) {
+        moveBadgeHits.removeAll(keepingCapacity: true)
+        guard mode == .sideBySide || mode == .unified, !doc.hunks.isEmpty else {
+            moveBadgeLayers.forEach { $0.isHidden = true }
+            return
+        }
+        let lh = codeFont.lineHeight, h = bounds.height, scale = backingScale
+        let sideBySide = mode == .sideBySide
+        var index = 0
+        if sideBySide {
+            index = min(firstHunk(doc, side: .left, endingAtOrAfter: max(0, Int(floor(scroll.left / lh)))),
+                        firstHunk(doc, side: .right, endingAtOrAfter: max(0, Int(floor(scroll.right / lh)))))
+        } else {
+            let topRow = Int(floor(scroll.right / lh))
+            var lo = 0, hi = doc.hunks.count
+            while lo < hi {
+                let mid = (lo + hi) / 2
+                if hunkRow(mid) + doc.hunks[mid].leftCount + doc.hunks[mid].rightCount < topRow { lo = mid + 1 } else { hi = mid }
+            }
+            index = lo
+        }
+        var used = 0
+        while index < doc.hunks.count {
+            let hunk = doc.hunks[index]
+            let l0 = sideBySide ? CGFloat(hunkDisplayStart(index, side: .left)) * lh - scroll.left : 0
+            let r0 = sideBySide ? CGFloat(hunkDisplayStart(index, side: .right)) * lh - scroll.right : CGFloat(hunkRow(index)) * lh - scroll.right
+            if sideBySide {
+                if min(l0, r0) > h { break }
+            } else {
+                if r0 > h { break }
+            }
+            guard let move = hunk.moveInfo else { index += 1; continue }
+            let hot = hoveredMoveBadge == index || activeHoveredMovePairID == move.pairID
+            let title = Self.moveBadgeTitle(for: move)
+            guard let image = moveBadgeGlyph(title, hot: hot) else { index += 1; continue }
+            let size = CGSize(width: CGFloat(image.width) / scale, height: CGFloat(image.height) / scale)
+
+            let rect: CGRect
+            if sideBySide {
+                let isSource = move.role == .source && hunk.leftCount > 0
+                let topY: CGFloat
+                let bottomY: CGFloat
+                let rightEdge: CGFloat
+                if isSource {
+                    topY = l0
+                    bottomY = topY + CGFloat(hunk.leftCount) * lh
+                    rightEdge = textRect(.left).maxX - 8
+                } else {
+                    topY = r0
+                    bottomY = topY + CGFloat(max(1, hunk.rightCount)) * lh
+                    rightEdge = bounds.width - rulerWidth - 10
+                }
+                guard topY <= h, bottomY >= 0 else { index += 1; continue }
+                let rest = topY + (lh - size.height) / 2
+                let y = pixelRound(max(rest, min(3, bottomY - size.height - 3)))
+                let minX = isSource ? 8 : (textRect(.right).minX + 8)
+                rect = CGRect(x: pixelRound(max(minX, rightEdge - size.width)), y: y, width: size.width, height: size.height)
+            } else {
+                let topY = r0
+                let bottomY = topY + CGFloat(max(1, hunk.leftCount + hunk.rightCount)) * lh
+                guard bottomY >= 0 else { index += 1; continue }
+                var rightEdge = bounds.width - rulerWidth - 10
+                if showsRevertButtons { rightEdge -= revertSize + 8 }
+                if commitTicks != nil { rightEdge -= tickSize + 8 }
+                let rest = topY + (lh - size.height) / 2
+                let y = pixelRound(max(rest, min(3, bottomY - size.height - 3)))
+                rect = CGRect(x: pixelRound(max(textRect(.right).minX + 8, rightEdge - size.width)), y: y, width: size.width, height: size.height)
+            }
+
+            if used == moveBadgeLayers.count {
+                let layer = StillLayer()
+                layer.anchorPoint = .zero
+                layer.zPosition = 8
+                root.addSublayer(layer)
+                moveBadgeLayers.append(layer)
+            }
+            let layer = moveBadgeLayers[used]
+            used += 1
+            place(layer, rect)
+            layer.contentsScale = scale
+            layer.contents = image
+            layer.opacity = 1.0
+            layer.isHidden = false
+            moveBadgeHits.append((rect, index))
+            index += 1
+        }
+        for layer in moveBadgeLayers[used...] { layer.isHidden = true }
+        if let hovered = hoveredMoveBadge, !moveBadgeHits.contains(where: { $0.hunk == hovered }) { hoveredMoveBadge = nil }
+    }
+
+    private static func moveBadgeTitle(for move: HunkMoveInfo) -> String {
+        let pct = Int((move.similarity * 100).rounded())
+        let tweaked = move.similarity < 0.999 || move.inlineDiff != nil
+        switch move.role {
+        case .source:
+            return tweaked
+                ? L("↗ Moved \(pct)% · edited", "↗ 移动源 \(pct)% · 有微调")
+                : L("↗ Moved · 100%", "↗ 移动源 · 100%")
+        case .target:
+            return tweaked
+                ? L("↘ Moved \(pct)% · edited", "↘ 移动目标 \(pct)% · 有微调")
+                : L("↘ Moved · 100%", "↘ 移动目标 · 100%")
+        }
+    }
+
+    private func moveBadgeGlyph(_ title: String, hot: Bool) -> CGImage? {
+        let scale = backingScale
+        let fontSize = max(9.5, min(11.5, codeFont.size - 1.5))
+        let key = "\(title)|\(hot)|\(theme.isDark)|\(scale)|\(fontSize)"
+        if let cached = moveBadgeGlyphs[key] { return cached }
+        let font = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
+        let ink: NSColor = hot ? .white : (NSColor(cgColor: theme.movedAccent) ?? .systemPurple)
+        let text = NSAttributedString(string: title, attributes: [.font: font, .foregroundColor: ink])
+        let textSize = text.size()
+        let size = CGSize(width: ceil(textSize.width + 14), height: ceil(min(codeFont.lineHeight - 2, textSize.height + 4)))
+        guard let context = CGContext(data: nil, width: Int(size.width * scale), height: Int(size.height * scale),
+                                      bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        context.scaleBy(x: scale, y: scale)
+        let pill = CGPath(roundedRect: CGRect(origin: .zero, size: size).insetBy(dx: 0.5, dy: 0.5),
+                          cornerWidth: size.height / 2, cornerHeight: size.height / 2, transform: nil)
+        context.addPath(pill)
+        context.setFillColor(hot ? theme.movedAccent : theme.background)
+        context.fillPath()
+        if !hot {
+            context.addPath(pill)
+            context.setFillColor(theme.moved)
+            context.fillPath()
+            context.addPath(pill)
+            context.setStrokeColor(theme.movedBorder)
+            context.setLineWidth(1)
+            context.strokePath()
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        text.draw(at: CGPoint(x: 7, y: (size.height - textSize.height) / 2))
+        NSGraphicsContext.restoreGraphicsState()
+        let image = context.makeImage()
+        moveBadgeGlyphs[key] = image
+        return image
+    }
+
+    private func moveBadgeHit(at point: CGPoint) -> Int? {
+        moveBadgeHits.first { $0.rect.insetBy(dx: -2, dy: -2).contains(point) }?.hunk
+    }
+
+    // MARK: Fold bars
+
+    private func updateFoldBars(_ doc: DiffDocument, _ scroll: Scroll) {
+        foldBarHits.removeAll(keepingCapacity: true)
+        guard isFoldingActive else {
+            foldBarLayers.forEach { $0.isHidden = true }
+            return
+        }
+        let lh = codeFont.lineHeight, h = bounds.height, scale = backingScale
+        let fullWidth = max(0, bounds.width - rulerWidth)
+        var used = 0
+
+        func placeFoldBar(rect: CGRect, region: DiffFoldRegion) {
+            guard rect.width > 12, rect.maxY >= 0, rect.minY <= h else { return }
+            let hot = hoveredFoldSegment == region.segmentIndex
+            guard let image = foldBarGlyph(hiddenCount: region.hiddenLineCount, width: rect.width, height: lh, hot: hot) else { return }
+            if used == foldBarLayers.count {
+                let layer = StillLayer()
+                layer.anchorPoint = .zero
+                layer.zPosition = 7.5
+                root.addSublayer(layer)
+                foldBarLayers.append(layer)
+            }
+            let layer = foldBarLayers[used]
+            used += 1
+            place(layer, rect)
+            layer.contentsScale = scale
+            layer.contents = image
+            layer.isHidden = false
+            foldBarHits.append((rect, region.segmentIndex))
+        }
+
+        switch mode {
+        case .sideBySide:
+            let leftBand = bandRect(.left)
+            let rightBand = bandRect(.right)
+            for seg in foldedSegments {
+                guard let region = seg.foldRegion, let lRow = seg.leftFoldRow, let rRow = seg.rightFoldRow else { continue }
+                let lY = CGFloat(lRow) * lh - scroll.left
+                let rY = CGFloat(rRow) * lh - scroll.right
+                if max(lY, rY) < -lh { continue }
+                if min(lY, rY) > h { break }
+                if abs(lY - rY) <= 1.5 {
+                    placeFoldBar(rect: CGRect(x: 0, y: pixelRound(rY), width: fullWidth, height: lh), region: region)
+                } else {
+                    placeFoldBar(rect: CGRect(x: leftBand.minX, y: pixelRound(lY), width: leftBand.width, height: lh), region: region)
+                    placeFoldBar(rect: CGRect(x: rightBand.minX, y: pixelRound(rY), width: rightBand.width, height: lh), region: region)
+                }
+            }
+        case .unified:
+            guard let visible = visibleRows(top: scroll.right, count: unifiedDisplayRows.count) else { break }
+            for row in visible {
+                if case .foldBar(let region) = unifiedDisplayRows[row] {
+                    let y = CGFloat(row) * lh - scroll.right
+                    placeFoldBar(rect: CGRect(x: 0, y: pixelRound(y), width: fullWidth, height: lh), region: region)
+                }
+            }
+        case .single:
+            break
+        }
+
+        for layer in foldBarLayers[used...] { layer.isHidden = true }
+        if let hovered = hoveredFoldSegment, !foldBarHits.contains(where: { $0.segmentIndex == hovered }) { hoveredFoldSegment = nil }
+    }
+
+    private func foldBarGlyph(hiddenCount: Int, width: CGFloat, height: CGFloat, hot: Bool) -> CGImage? {
+        let scale = backingScale
+        let quantWidth = max(32, Int(ceil(width)))
+        let hInt = max(14, Int(ceil(height)))
+        let key = "\(hiddenCount)|\(quantWidth)|\(hInt)|\(hot)|\(theme.isDark)|\(scale)"
+        if let cached = foldBarGlyphs[key] { return cached }
+        if foldBarGlyphs.count > 120 { foldBarGlyphs.removeAll(keepingCapacity: true) }
+        guard let context = CGContext(data: nil, width: Int(CGFloat(quantWidth) * scale), height: Int(CGFloat(hInt) * scale),
+                                      bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        context.scaleBy(x: scale, y: scale)
+        let rect = CGRect(x: 0, y: 0, width: CGFloat(quantWidth), height: CGFloat(hInt))
+        context.setFillColor(hot ? theme.foldHoverBg : theme.foldBg)
+        context.fill(rect)
+        context.setFillColor(theme.foldBorder)
+        context.fill(CGRect(x: 0, y: 0, width: rect.width, height: 1))
+        context.fill(CGRect(x: 0, y: rect.height - 1, width: rect.width, height: 1))
+
+        let label = L("⋯ Expand \(hiddenCount) unchanged lines ⋯", "⋯ 展开 \(hiddenCount) 行未变更代码 ⋯")
+        let font = NSFont.systemFont(ofSize: max(10, min(12, codeFont.size - 1)), weight: .medium)
+        let ink = NSColor(cgColor: hot ? theme.accent : theme.foldText) ?? .secondaryLabelColor
+        let attr = NSAttributedString(string: label, attributes: [.font: font, .foregroundColor: ink])
+        let textSize = attr.size()
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        attr.draw(at: CGPoint(x: max(12, (rect.width - textSize.width) / 2), y: (rect.height - textSize.height) / 2))
+        NSGraphicsContext.restoreGraphicsState()
+
+        let image = context.makeImage()
+        foldBarGlyphs[key] = image
+        return image
+    }
+
+    private func foldBarHit(at point: CGPoint) -> Int? {
+        foldBarHits.first { $0.rect.contains(point) }?.segmentIndex
+    }
+
     /// The change shown at `point`, if there is one there.
     func hunkIndex(at point: CGPoint) -> Int? {
         guard let doc = document, case .text = doc.content, point.x < bounds.width - rulerWidth else { return nil }
-        if let hit = revertHit(at: point) ?? tickHit(at: point) { return hit }
+        if let hit = revertHit(at: point) ?? tickHit(at: point) ?? moveBadgeHit(at: point) { return hit }
         let side = pane(at: point)
         let scroll = resolveScroll()
         let row = Int(floor((point.y + (side == .left ? scroll.left : scroll.right)) / codeFont.lineHeight))
         guard row >= 0, row < paneRowCount(side) else { return nil }
         switch mode {
         case .unified:
+            if isFoldingActive {
+                guard row < unifiedDisplayRows.count, case .unified(let u) = unifiedDisplayRows[row] else { return nil }
+                return u.hunk >= 0 ? Int(u.hunk) : nil
+            }
             let hunk = Int(doc.unifiedRows[row].hunk)
             return hunk >= 0 ? hunk : nil
         case .sideBySide:
             let index = firstHunk(doc, side: side, endingAtOrAfter: row)
             guard index < doc.hunks.count else { return nil }
             let hunk = doc.hunks[index]
-            let start = side == .left ? hunk.leftStart : hunk.rightStart
+            let start = hunkDisplayStart(index, side: side)
             let count = side == .left ? hunk.leftCount : hunk.rightCount
             return row >= start && row < start + count ? index : nil
         case .single:
@@ -2424,18 +3656,26 @@ final class CodeCanvasView: NSView {
         if tick != hoveredTick { hoveredTick = tick }
         let conflict = point.flatMap(conflictHit(at:))
         if conflict?.block != hoveredConflict?.block || conflict?.choice != hoveredConflict?.choice { hoveredConflict = conflict }
+        let moveBadge = point.flatMap(moveBadgeHit(at:))
+        if moveBadge != hoveredMoveBadge { hoveredMoveBadge = moveBadge }
+        let foldHit = point.flatMap(foldBarHit(at:))
+        if foldHit != hoveredFoldSegment { hoveredFoldSegment = foldHit }
+        let moveConnector = (hit == nil && tick == nil && conflict == nil && moveBadge == nil && foldHit == nil)
+            ? point.flatMap(moveConnectorHit(at:))
+            : nil
+        if moveConnector?.pairID != hoveredMoveConnector { hoveredMoveConnector = moveConnector?.pairID }
         let commandOnly = event.map { Self.isCommandOnly($0.modifierFlags) } ?? false
-        let buttonHit = hit != nil || tick != nil || conflict != nil || line != nil
+        let buttonHit = hit != nil || tick != nil || conflict != nil || moveBadge != nil || foldHit != nil || moveConnector != nil || line != nil
         if let point, commandOnly, !buttonHit {
             updateLSPHover(at: point)
         } else {
             clearLSPHover()
         }
-        // The canvas is one big text cursor rectangle; over a button, commit, or ⌘-hovered symbol it should look clickable.
+        // The canvas is one big text cursor rectangle; over a button, commit, fold bar, move badge/connector, or ⌘-hovered symbol it should look clickable.
         guard let point else { return }
         if hit != nil || tick != nil || conflict != nil {
             NSCursor.arrow.set()
-        } else if line != nil || lspHover != nil {
+        } else if moveBadge != nil || moveConnector != nil || foldHit != nil || line != nil || lspHover != nil {
             NSCursor.pointingHand.set()
         } else if annotationWidth > 0, point.x >= annotationX, point.x < annotationX + annotationWidth {
             NSCursor.arrow.set()
@@ -2468,7 +3708,9 @@ final class CodeCanvasView: NSView {
         }
         let commandOnly = Self.isCommandOnly(event.modifierFlags)
         let overControl = revertHit(at: point) != nil || tickHit(at: point) != nil
-            || conflictHit(at: point) != nil || annotatedLine(at: point) != nil
+            || conflictHit(at: point) != nil || moveBadgeHit(at: point) != nil
+            || moveConnectorHit(at: point) != nil
+            || foldBarHit(at: point) != nil || annotatedLine(at: point) != nil
         if commandOnly && !overControl {
             updateLSPHover(at: point)
         } else {
@@ -2476,7 +3718,7 @@ final class CodeCanvasView: NSView {
         }
         if revertHit(at: point) != nil || tickHit(at: point) != nil || conflictHit(at: point) != nil {
             NSCursor.arrow.set()
-        } else if annotatedLine(at: point) != nil || lspHover != nil {
+        } else if moveBadgeHit(at: point) != nil || moveConnectorHit(at: point) != nil || foldBarHit(at: point) != nil || annotatedLine(at: point) != nil || lspHover != nil {
             NSCursor.pointingHand.set()
         } else if annotationWidth > 0, point.x >= annotationX, point.x < annotationX + annotationWidth {
             NSCursor.arrow.set()
@@ -2610,15 +3852,22 @@ final class CodeCanvasView: NSView {
             rulerThumb.frame = CGRect(x: 1, y: scroll.y / lh * scale, width: rulerWidth - 2, height: max(12, h / lh * scale))
         }
         guard marks else { return }
-        let paths = [CGMutablePath(), CGMutablePath(), CGMutablePath()]
+        let paths = [CGMutablePath(), CGMutablePath(), CGMutablePath(), CGMutablePath()]
         for (index, hunk) in doc.hunks.enumerated() where index < hunkRows.count {
             let span = mode == .unified ? hunk.leftCount + hunk.rightCount : max(hunk.leftCount, hunk.rightCount)
-            paths[kindIndex(hunk.kind)].addRect(CGRect(x: 3, y: CGFloat(hunkRows[index]) * scale,
-                                                       width: rulerWidth - 6, height: max(2, CGFloat(span) * scale)))
+            let bucket = hunkBucket(hunk)
+            let rect = CGRect(
+                x: 3,
+                y: CGFloat(hunkRows[index]) * scale,
+                width: rulerWidth - 6,
+                height: max(2, CGFloat(span) * scale)
+            )
+            paths[bucket].addRect(rect)
         }
-        for k in 0..<3 {
+        let markColors = [theme.modifiedMark, theme.addedMark, theme.deletedMark, theme.movedMark]
+        for k in 0..<4 {
             rulerMarks[k].contentsScale = backingScale
-            rulerMarks[k].fillColor = theme.mark(Self.kinds[k])
+            rulerMarks[k].fillColor = markColors[k]
             rulerMarks[k].path = paths[k].isEmpty ? nil : paths[k]
         }
     }
@@ -2697,6 +3946,18 @@ final class CodeCanvasView: NSView {
             pressedConflict = hit
             return
         }
+        if let hunk = moveBadgeHit(at: point) {
+            pressedMoveBadge = hunk
+            return
+        }
+        if let seg = foldBarHit(at: point) {
+            pressedFoldSegment = seg
+            return
+        }
+        if let hit = moveConnectorHit(at: point) {
+            pressedMoveConnector = hit
+            return
+        }
         if annotationWidth > 0, point.x >= annotationX, point.x < annotationX + annotationWidth {
             // The Annotate column: a click on a line with a commit shows that commit; it never selects text.
             if let line = annotatedLine(at: point), let entry = annotations?.entry(atLine: line) {
@@ -2754,7 +4015,7 @@ final class CodeCanvasView: NSView {
             scrollRuler(to: point)
             return
         }
-        guard pressedRevert == nil, pressedTick == nil, pressedConflict == nil, dragSelecting, let current = selection else { return }
+        guard pressedRevert == nil, pressedTick == nil, pressedConflict == nil, pressedMoveBadge == nil, pressedMoveConnector == nil, pressedFoldSegment == nil, dragSelecting, let current = selection else { return }
         if point.y < 0 {
             container?.scrollBy(dx: 0, dy: max(-60, point.y))
         } else if point.y > bounds.height {
@@ -2787,6 +4048,40 @@ final class CodeCanvasView: NSView {
             pressedConflict = nil
             if let hit = conflictHit(at: convert(event.locationInWindow, from: nil)), hit.block == pressed.block, hit.choice == pressed.choice {
                 delegate?.canvas(self, resolveConflict: pressed.block, choice: pressed.choice)
+            }
+            return
+        }
+        if let pressed = pressedMoveBadge {
+            pressedMoveBadge = nil
+            if moveBadgeHit(at: convert(event.locationInWindow, from: nil)) == pressed {
+                delegate?.canvas(self, jumpToMoveCounterpart: pressed)
+            }
+            return
+        }
+        if let pressed = pressedMoveConnector {
+            pressedMoveConnector = nil
+            let pt = convert(event.locationInWindow, from: nil)
+            if let hit = moveConnectorHit(at: pt), hit.pairID == pressed.pairID {
+                let sourceHunk: Int
+                if hit.bothVisible {
+                    if focusedHunk == hit.sourceHunk {
+                        sourceHunk = hit.sourceHunk
+                    } else if focusedHunk == hit.targetHunk {
+                        sourceHunk = hit.targetHunk
+                    } else {
+                        sourceHunk = pt.x >= paneWidth + connectorWidth * 0.5 ? hit.targetHunk : hit.sourceHunk
+                    }
+                } else {
+                    sourceHunk = hit.clickSourceHunk
+                }
+                delegate?.canvas(self, jumpToMoveCounterpart: sourceHunk)
+            }
+            return
+        }
+        if let pressed = pressedFoldSegment {
+            pressedFoldSegment = nil
+            if foldBarHit(at: convert(event.locationInWindow, from: nil)) == pressed {
+                delegate?.canvas(self, expandFoldSegment: pressed)
             }
             return
         }
@@ -2866,15 +4161,31 @@ final class CodeCanvasView: NSView {
         switch mode {
         case .sideBySide, .single:
             let side: Side = mode == .single ? .right : sel.pane
+            if isFoldingActive && mode == .sideBySide {
+                let rowTotal = paneRowCount(side)
+                guard rowTotal > 0 else { return nil }
+                var range: ClosedRange<Int>?
+                for row in min(sel.lower.row, rowTotal - 1)...min(upper, rowTotal - 1) {
+                    guard let src = source(pane: side, row: row) else { continue }
+                    range = range.map { min($0.lowerBound, src.line)...max($0.upperBound, src.line) } ?? src.line...src.line
+                }
+                return range.map { (side, $0) }
+            }
             let count = doc.buffer(side).lines.count
             guard count > 0 else { return nil }
             return (side, min(sel.lower.row, count - 1)...min(upper, count - 1))
         case .unified:
-            let rows = doc.unifiedRows
-            guard !rows.isEmpty else { return nil }
+            let rowTotal = paneRowCount(.right)
+            guard rowTotal > 0 else { return nil }
             var right: ClosedRange<Int>?, left: ClosedRange<Int>?
-            for row in min(sel.lower.row, rows.count - 1)...min(upper, rows.count - 1) {
-                let r = rows[row]
+            for row in min(sel.lower.row, rowTotal - 1)...min(upper, rowTotal - 1) {
+                let r: UnifiedRow
+                if isFoldingActive {
+                    guard case .unified(let u) = unifiedDisplayRows[row] else { continue }
+                    r = u
+                } else {
+                    r = doc.unifiedRows[row]
+                }
                 if r.right >= 0 {
                     let line = Int(r.right)
                     right = right.map { min($0.lowerBound, line)...max($0.upperBound, line) } ?? line...line

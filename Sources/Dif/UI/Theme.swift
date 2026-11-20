@@ -53,6 +53,26 @@ enum Palette {
     static let chip = NSColor.dyn(0x000000, 0xFFFFFF, lightAlpha: 0.06, darkAlpha: 0.09)
     static let added = NSColor.dyn(0x1E8A34, 0x73BD79)
     static let removed = NSColor.dyn(0xC7392F, 0xE5736B)
+    // SemanticDiff: moved code (distinct violet-indigo), fold bar, and 6 coordinated rename accents.
+    static let movedBg = NSColor.dyn(0x7C4DFF, 0x9B72FF, lightAlpha: 0.13, darkAlpha: 0.20)
+    static let movedBorder = NSColor.dyn(0x6D4AFF, 0xA882FF, lightAlpha: 0.55, darkAlpha: 0.65)
+    static let movedAccent = NSColor.dyn(0x6338F0, 0xB392FF)
+    static let foldBg = NSColor.dyn(0xF2F4F8, 0x262930)
+    static let foldHoverBg = NSColor.dyn(0xE6EBF5, 0x303540)
+    static let foldText = NSColor.dyn(0x5E6677, 0x9AA2B2)
+    static let renameAccents: [NSColor] = [
+        NSColor.dyn(0x0D9488, 0x2DD4BF), // teal
+        NSColor.dyn(0x7C3AED, 0xA78BFA), // violet
+        NSColor.dyn(0xD97706, 0xFBBF24), // amber
+        NSColor.dyn(0xDB2777, 0xF472B6), // rose
+        NSColor.dyn(0x2563EB, 0x60A5FA), // indigo
+        NSColor.dyn(0x059669, 0x34D399), // emerald
+    ]
+
+    static func renameAccent(at index: Int) -> NSColor {
+        let count = renameAccents.count
+        return renameAccents[((index % count) + count) % count]
+    }
 
     static func status(_ kind: FileChange.Kind?) -> NSColor {
         switch kind {
@@ -86,7 +106,21 @@ extension Color {
     static let difChip = Color(Palette.chip)
     static let difAdded = Color(Palette.added)
     static let difRemoved = Color(Palette.removed)
+    static let difMovedBg = Color(Palette.movedBg)
+    static let difMovedBorder = Color(Palette.movedBorder)
+    static let difMovedAccent = Color(Palette.movedAccent)
+    static let difFoldBg = Color(Palette.foldBg)
+    static let difFoldHoverBg = Color(Palette.foldHoverBg)
+    static let difFoldText = Color(Palette.foldText)
+    static func difRenameAccent(at index: Int) -> Color { Color(Palette.renameAccent(at: index)) }
     static func status(_ kind: FileChange.Kind?) -> Color { Color(Palette.status(kind)) }
+}
+
+/// Fill, border, and accent colours for one cross-hunk `RenameGroup` palette slot.
+struct RenameHighlightStyle: Equatable, Sendable {
+    let fill: CGColor
+    let border: CGColor
+    let accent: CGColor
 }
 
 // MARK: - Code canvas theme
@@ -121,6 +155,10 @@ struct CanvasTheme {
     let deleted: CGColor, deletedWord: CGColor, deletedMark: CGColor, deletedBorder: CGColor
     // Unified view uses the universal red/green.
     let removedLine: CGColor, removedWord: CGColor, removedBorder: CGColor
+    // SemanticDiff: moved blocks (violet-indigo), cross-hunk rename groups (6 slots), and unchanged fold bars.
+    let moved: CGColor, movedWord: CGColor, movedMark: CGColor, movedBorder: CGColor, movedAccent: CGColor
+    let renamePalette: [RenameHighlightStyle]
+    let foldBg: CGColor, foldHoverBg: CGColor, foldBorder: CGColor, foldText: CGColor
     let selection: CGColor
     let searchMatch: CGColor
     let searchCurrent: CGColor
@@ -257,6 +295,24 @@ struct CanvasTheme {
         TokenStyle(c(0x2C3038)),                   // 25: exportedProperty (exported struct field: dark neutral gray)
     ]
 
+    private static let darkRenamePalette: [RenameHighlightStyle] = [
+        RenameHighlightStyle(fill: c(0x2DD4BF, 0.18), border: c(0x2DD4BF, 0.72), accent: c(0x2DD4BF)),
+        RenameHighlightStyle(fill: c(0xA78BFA, 0.19), border: c(0xA78BFA, 0.74), accent: c(0xA78BFA)),
+        RenameHighlightStyle(fill: c(0xFBBF24, 0.18), border: c(0xFBBF24, 0.72), accent: c(0xFBBF24)),
+        RenameHighlightStyle(fill: c(0xF472B6, 0.18), border: c(0xF472B6, 0.72), accent: c(0xF472B6)),
+        RenameHighlightStyle(fill: c(0x60A5FA, 0.19), border: c(0x60A5FA, 0.74), accent: c(0x60A5FA)),
+        RenameHighlightStyle(fill: c(0x34D399, 0.18), border: c(0x34D399, 0.72), accent: c(0x34D399)),
+    ]
+
+    private static let lightRenamePalette: [RenameHighlightStyle] = [
+        RenameHighlightStyle(fill: c(0x0D9488, 0.13), border: c(0x0D9488, 0.62), accent: c(0x0D9488)),
+        RenameHighlightStyle(fill: c(0x7C3AED, 0.12), border: c(0x7C3AED, 0.60), accent: c(0x7C3AED)),
+        RenameHighlightStyle(fill: c(0xD97706, 0.14), border: c(0xD97706, 0.62), accent: c(0xD97706)),
+        RenameHighlightStyle(fill: c(0xDB2777, 0.12), border: c(0xDB2777, 0.60), accent: c(0xDB2777)),
+        RenameHighlightStyle(fill: c(0x2563EB, 0.12), border: c(0x2563EB, 0.60), accent: c(0x2563EB)),
+        RenameHighlightStyle(fill: c(0x059669, 0.13), border: c(0x059669, 0.60), accent: c(0x059669)),
+    ]
+
     static let dark = CanvasTheme(
         isDark: true,
         background: c(0x1E1F22),
@@ -269,6 +325,9 @@ struct CanvasTheme {
         added: c(0x3FA65A, 0.20), addedWord: c(0x3FA65A, 0.42), addedMark: c(0x57B46F), addedBorder: c(0x57B46F, 0.55),
         deleted: c(0x868A93, 0.20), deletedWord: c(0x868A93, 0.40), deletedMark: c(0x8E929B), deletedBorder: c(0x8E929B, 0.52),
         removedLine: c(0xE5534B, 0.17), removedWord: c(0xE5534B, 0.38), removedBorder: c(0xE5534B, 0.55),
+        moved: c(0x9B72FF, 0.19), movedWord: c(0x9B72FF, 0.42), movedMark: c(0xB392FF), movedBorder: c(0xA882FF, 0.65), movedAccent: c(0xB392FF),
+        renamePalette: darkRenamePalette,
+        foldBg: c(0x262930), foldHoverBg: c(0x303540), foldBorder: c(0x3E434D), foldText: c(0x9AA2B2),
         selection: c(0x2F65CA, 0.55),
         searchMatch: c(0xE8B339, 0.35),
         searchCurrent: c(0xF5A623, 0.85),
@@ -290,6 +349,9 @@ struct CanvasTheme {
         added: c(0x2DA44E, 0.15), addedWord: c(0x2DA44E, 0.32), addedMark: c(0x2DA44E), addedBorder: c(0x2DA44E, 0.50),
         deleted: c(0x6E7481, 0.14), deletedWord: c(0x6E7481, 0.28), deletedMark: c(0x868B97), deletedBorder: c(0x6E7481, 0.46),
         removedLine: c(0xE5534B, 0.12), removedWord: c(0xE5534B, 0.28), removedBorder: c(0xE5534B, 0.48),
+        moved: c(0x7C4DFF, 0.13), movedWord: c(0x7C4DFF, 0.30), movedMark: c(0x6D4AFF), movedBorder: c(0x6D4AFF, 0.55), movedAccent: c(0x6338F0),
+        renamePalette: lightRenamePalette,
+        foldBg: c(0xF2F4F8), foldHoverBg: c(0xE6EBF5), foldBorder: c(0xDCE1EB), foldText: c(0x5E6677),
         selection: c(0x3574F0, 0.28),
         searchMatch: c(0xF5C542, 0.45),
         searchCurrent: c(0xF59E0B, 0.90),
@@ -307,12 +369,20 @@ struct CanvasTheme {
         }
     }
 
+    func line(for hunk: Hunk) -> CGColor {
+        hunk.moveInfo != nil ? moved : line(hunk.kind)
+    }
+
     func word(_ kind: Hunk.Kind) -> CGColor {
         switch kind {
         case .modified: return modifiedWord
         case .added: return addedWord
         case .deleted: return deletedWord
         }
+    }
+
+    func word(for hunk: Hunk) -> CGColor {
+        hunk.moveInfo != nil ? movedWord : word(hunk.kind)
     }
 
     func mark(_ kind: Hunk.Kind) -> CGColor {
@@ -323,12 +393,25 @@ struct CanvasTheme {
         }
     }
 
+    func mark(for hunk: Hunk) -> CGColor {
+        hunk.moveInfo != nil ? movedMark : mark(hunk.kind)
+    }
+
     func focusedBorder(_ kind: Hunk.Kind) -> CGColor {
         switch kind {
         case .modified: return modifiedBorder
         case .added: return addedBorder
         case .deleted: return deletedBorder
         }
+    }
+
+    func focusedBorder(for hunk: Hunk) -> CGColor {
+        hunk.moveInfo != nil ? movedBorder : focusedBorder(hunk.kind)
+    }
+
+    func renameStyle(at colorIndex: Int) -> RenameHighlightStyle {
+        let count = renamePalette.count
+        return renamePalette[((colorIndex % count) + count) % count]
     }
 }
 

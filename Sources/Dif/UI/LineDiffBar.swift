@@ -8,6 +8,7 @@ struct LineDiffRow: Equatable, Sendable {
         case removed
         case added
         case modified
+        case moved
         case empty
     }
 
@@ -22,17 +23,28 @@ struct LineDiffRow: Equatable, Sendable {
     static let empty = LineDiffRow(lineNumber: nil, text: "", syntaxSpans: [], highlightRanges: [], kind: .empty)
 }
 
+/// Metadata describing a moved code block when the active line belongs to a hunk paired by move detection.
+struct LineDiffMoveContext: Equatable, Sendable {
+    var hunkIndex: Int
+    var counterpartHunkIndex: Int
+    var role: MoveRole
+    var similarity: Double
+    var hasInlineEdits: Bool
+}
+
 /// Paired Left (Old) / Right (New) snapshot of a single selected line for the bottom inline diff bar.
 struct LineDiffSnapshot: Equatable, Sendable {
     var left: LineDiffRow
     var right: LineDiffRow
     var language: LanguageSpec
     var hunkKind: Hunk.Kind?
+    var moveContext: LineDiffMoveContext? = nil
 
     static func == (lhs: LineDiffSnapshot, rhs: LineDiffSnapshot) -> Bool {
         lhs.left == rhs.left
             && lhs.right == rhs.right
             && lhs.hunkKind == rhs.hunkKind
+            && lhs.moveContext == rhs.moveContext
             && (lhs.language === rhs.language || (lhs.language.name == rhs.language.name && lhs.language.family == rhs.language.family))
     }
 }
@@ -120,12 +132,12 @@ enum LineDiffExtractor {
         guard line >= 0, line < sourceBuffer.lines.count else { return nil }
 
         var precedingDelta = 0
-        for hunk in doc.hunks {
+        for (hunkIndex, hunk) in doc.hunks.enumerated() {
             let start = side == .left ? hunk.leftStart : hunk.rightStart
             let count = side == .left ? hunk.leftCount : hunk.rightCount
 
             if count > 0, line >= start, line < start + count {
-                return extractInHunk(doc: doc, hunk: hunk, side: side, line: line)
+                return extractInHunk(doc: doc, hunk: hunk, hunkIndex: hunkIndex, side: side, line: line)
             }
             if start + count <= line {
                 precedingDelta += hunk.rightCount - hunk.leftCount
@@ -174,17 +186,74 @@ enum LineDiffExtractor {
 
     // MARK: - Private helpers
 
-    private static func extractInHunk(doc: DiffDocument, hunk: Hunk, side: Side, line: Int) -> LineDiffSnapshot? {
+    private static func extractInHunk(doc: DiffDocument, hunk: Hunk, hunkIndex: Int, side: Side, line: Int) -> LineDiffSnapshot? {
+        if let move = hunk.moveInfo, doc.hunks.indices.contains(move.counterpartHunkIndex) {
+            let counterpart = doc.hunks[move.counterpartHunkIndex]
+            let isSourceSide = move.role == .source && side == .left
+            let isTargetSide = move.role == .target && side == .right
+            if isSourceSide || isTargetSide {
+                let sourceHunk = move.role == .source ? hunk : counterpart
+                let targetHunk = move.role == .target ? hunk : counterpart
+                let offset = isSourceSide ? (line - hunk.leftStart) : (line - hunk.rightStart)
+                let srcLine = sourceHunk.leftStart + offset
+                let dstLine = targetHunk.rightStart + offset
+                let hasSrc = offset >= 0 && offset < sourceHunk.leftCount && srcLine >= 0 && srcLine < doc.left.lines.count
+                let hasDst = offset >= 0 && offset < targetHunk.rightCount && dstLine >= 0 && dstLine < doc.right.lines.count
+
+                var leftRanges: [Range<Int>] = []
+                var rightRanges: [Range<Int>] = []
+                if let inline = move.inlineDiff {
+                    if offset >= 0, offset < inline.source.count { leftRanges = inline.source[offset] }
+                    if offset >= 0, offset < inline.target.count { rightRanges = inline.target[offset] }
+                } else if hasSrc && hasDst && doc.left.lines[srcLine] != doc.right.lines[dstLine] {
+                    let fallback = fallbackInlineDiff(old: doc.left.lines[srcLine], new: doc.right.lines[dstLine])
+                    leftRanges = fallback.left
+                    rightRanges = fallback.right
+                }
+
+                let leftRow: LineDiffRow = hasSrc
+                    ? makeRow(buffer: doc.left, line: srcLine, highlightRanges: leftRanges, kind: .moved)
+                    : .empty
+                let rightRow: LineDiffRow = hasDst
+                    ? makeRow(buffer: doc.right, line: dstLine, highlightRanges: rightRanges, kind: .moved)
+                    : .empty
+                let context = LineDiffMoveContext(
+                    hunkIndex: hunkIndex,
+                    counterpartHunkIndex: move.counterpartHunkIndex,
+                    role: move.role,
+                    similarity: move.similarity,
+                    hasInlineEdits: move.inlineDiff != nil || move.similarity < 0.999
+                )
+                return LineDiffSnapshot(
+                    left: leftRow,
+                    right: rightRow,
+                    language: doc.language,
+                    hunkKind: hunk.kind,
+                    moveContext: context
+                )
+            }
+        }
+
+        let moveContext: LineDiffMoveContext? = hunk.moveInfo.map {
+            LineDiffMoveContext(
+                hunkIndex: hunkIndex,
+                counterpartHunkIndex: $0.counterpartHunkIndex,
+                role: $0.role,
+                similarity: $0.similarity,
+                hasInlineEdits: $0.inlineDiff != nil || $0.similarity < 0.999
+            )
+        }
+
         switch hunk.kind {
         case .added:
             guard side == .right else { return nil }
             let rightRow = makeRow(buffer: doc.right, line: line, highlightRanges: [], kind: .added)
-            return LineDiffSnapshot(left: .empty, right: rightRow, language: doc.language, hunkKind: .added)
+            return LineDiffSnapshot(left: .empty, right: rightRow, language: doc.language, hunkKind: .added, moveContext: moveContext)
 
         case .deleted:
             guard side == .left else { return nil }
             let leftRow = makeRow(buffer: doc.left, line: line, highlightRanges: [], kind: .removed)
-            return LineDiffSnapshot(left: leftRow, right: .empty, language: doc.language, hunkKind: .deleted)
+            return LineDiffSnapshot(left: leftRow, right: .empty, language: doc.language, hunkKind: .deleted, moveContext: moveContext)
 
         case .modified:
             let thisStart = side == .left ? hunk.leftStart : hunk.rightStart
@@ -213,15 +282,15 @@ enum LineDiffExtractor {
 
                 let leftRow = makeRow(buffer: doc.left, line: leftLine, highlightRanges: leftRanges, kind: .modified)
                 let rightRow = makeRow(buffer: doc.right, line: rightLine, highlightRanges: rightRanges, kind: .modified)
-                return LineDiffSnapshot(left: leftRow, right: rightRow, language: doc.language, hunkKind: .modified)
+                return LineDiffSnapshot(left: leftRow, right: rightRow, language: doc.language, hunkKind: .modified, moveContext: moveContext)
             } else {
                 // Asymmetric modified hunk: this line has no partner at the same offset on the other side.
                 if side == .left {
                     let leftRow = makeRow(buffer: doc.left, line: line, highlightRanges: [], kind: .removed)
-                    return LineDiffSnapshot(left: leftRow, right: .empty, language: doc.language, hunkKind: .modified)
+                    return LineDiffSnapshot(left: leftRow, right: .empty, language: doc.language, hunkKind: .modified, moveContext: moveContext)
                 } else {
                     let rightRow = makeRow(buffer: doc.right, line: line, highlightRanges: [], kind: .added)
-                    return LineDiffSnapshot(left: .empty, right: rightRow, language: doc.language, hunkKind: .modified)
+                    return LineDiffSnapshot(left: .empty, right: rightRow, language: doc.language, hunkKind: .modified, moveContext: moveContext)
                 }
             }
         }
@@ -364,8 +433,10 @@ struct LineDiffBarView: View {
     let theme: CanvasTheme
     let codeFont: CodeFont
     let onClose: () -> Void
+    var onJumpToMoveCounterpart: ((Int) -> Void)? = nil
 
     @State private var closeHovered = false
+    @State private var jumpHovered = false
 
     private var rowHeight: CGFloat {
         max(20, min(25, codeFont.lineHeight + 3))
@@ -382,6 +453,12 @@ struct LineDiffBarView: View {
                 .frame(height: 1)
 
             if let snapshot {
+                if let move = snapshot.moveContext {
+                    moveBanner(move)
+                    Rectangle()
+                        .fill(Color(cgColor: theme.separator).opacity(0.6))
+                        .frame(height: 1)
+                }
                 diffBody(snapshot)
             } else {
                 emptyBody
@@ -390,9 +467,63 @@ struct LineDiffBarView: View {
         .background(Color(cgColor: theme.background))
         .overlay(alignment: .topTrailing) {
             closeButton
-                .padding(.top, 4)
+                .padding(.top, snapshot?.moveContext != nil ? 3 : 4)
                 .padding(.trailing, 6)
         }
+    }
+
+    private func moveBanner(_ move: LineDiffMoveContext) -> some View {
+        let pct = Int((move.similarity * 100).rounded())
+        let roleText = move.role == .source ? L("Move Source", "移动源") : L("Move Target", "移动目标")
+        let summaryText: String = move.hasInlineEdits
+            ? L("Moved block (similarity \(pct)% · tweaked)", "已移动（相似度 \(pct)% · 有微调）")
+            : L("Moved block (100% identical)", "已移动（100% 一致）")
+        return HStack(spacing: 8) {
+            Image(systemName: move.role == .source ? "arrow.up.right" : "arrow.down.right")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundStyle(Color.difMovedAccent)
+            Text(roleText)
+                .font(.ui(size: 10.5, weight: .semibold))
+                .foregroundStyle(Color.difMovedAccent)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 1)
+                .background(Capsule().fill(Color.difMovedBg))
+                .overlay(Capsule().strokeBorder(Color.difMovedBorder.opacity(0.6), lineWidth: 0.75))
+            Text(summaryText)
+                .font(.ui(size: 11, weight: .medium))
+                .foregroundStyle(Color.difText2)
+                .lineLimit(1)
+            if let onJump = onJumpToMoveCounterpart {
+                Button {
+                    onJump(move.hunkIndex)
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.left.arrow.right")
+                            .font(.system(size: 9.5, weight: .semibold))
+                        Text(move.role == .source ? L("Jump to Target", "跳至目标块") : L("Jump to Source", "跳至源块"))
+                            .font(.ui(size: 10.5, weight: .semibold))
+                    }
+                    .foregroundStyle(jumpHovered ? Color.white : Color.difMovedAccent)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .fill(jumpHovered ? Color.difMovedAccent : Color.difMovedBg)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4, style: .continuous)
+                            .strokeBorder(Color.difMovedBorder.opacity(jumpHovered ? 0 : 0.7), lineWidth: 0.75)
+                    )
+                }
+                .buttonStyle(.plain)
+                .onHover { jumpHovered = $0 }
+                .help(L("Jump to the paired moved hunk", "跳转到配对的移动代码块"))
+            }
+            Spacer(minLength: 28)
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 24)
+        .background(Color.difMovedBg.opacity(0.55))
     }
 
     @ViewBuilder
@@ -518,6 +649,8 @@ struct LineDiffBarView: View {
             return ("+", Color(cgColor: theme.addedMark))
         case .modified:
             return (isLeft ? "−" : "+", Color(cgColor: theme.modifiedMark))
+        case .moved:
+            return (isLeft ? "↗" : "↘", Color(cgColor: theme.movedAccent))
         case .unchanged:
             return ("·", Color(cgColor: theme.gutterText))
         case .empty:
@@ -531,6 +664,7 @@ struct LineDiffBarView: View {
         case .removed: return Color(cgColor: theme.removedLine)
         case .added: return Color(cgColor: theme.added)
         case .modified: return Color(cgColor: theme.modified)
+        case .moved: return Color(cgColor: theme.moved)
         }
     }
 
@@ -539,6 +673,7 @@ struct LineDiffBarView: View {
         case .removed: return Color(cgColor: theme.removedWord)
         case .added: return Color(cgColor: theme.addedWord)
         case .modified: return Color(cgColor: theme.modifiedWord)
+        case .moved: return Color(cgColor: theme.movedWord)
         case .unchanged, .empty: return nil
         }
     }
