@@ -225,13 +225,18 @@ struct CommitPanel: View {
     }
 
     private func aiCommitHelp(included: Int) -> String {
+        let provider = store.settings.aiProvider(for: .commit)
+        let model = store.settings.aiModel(for: provider, task: .commit)
+        let agentDesc = model.map { "\(provider.displayName) · \($0)" } ?? provider.displayName
         if project.isGeneratingCommitMessage {
-            return L("Generating commit message with agy… Click to cancel", "正在使用 agy 生成提交信息… 点击取消")
+            return L("Generating commit message with \(agentDesc)… Click to cancel",
+                     "正在使用 \(agentDesc) 生成提交信息… 点击取消")
         }
         if included == 0 {
             return L("Tick the files to commit first", "先勾选要提交的文件")
         }
-        return L("Generate commit message with agy AI", "使用 agy AI 生成提交信息")
+        return L("Generate commit message with \(agentDesc)",
+                 "使用 \(agentDesc) 生成提交信息")
     }
 }
 

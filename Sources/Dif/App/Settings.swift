@@ -138,14 +138,90 @@ final class Settings {
     var vimRelativeLineNumbers: Bool
     /// Show the Beyond Compare-style bottom inline line diff bar under the code viewer.
     var showLineDiffBar: Bool
+    /// Distinct local AI task roles that can independently select their provider and model.
+    enum AITask: String, CaseIterable, Sendable {
+        case commit
+        case grouping
+    }
+
+    /// Selected local AI agent provider for Commit Message generation (Direct edition only).
+    var aiCommitProvider: AgentProvider
+    /// Preferred model ID per provider rawValue for Commit Message generation (`nil`/absent means provider default).
+    var aiCommitModels: [String: String]
+    /// Selected local AI agent provider for AI Hunk Grouping (Direct edition only).
+    var aiGroupingProvider: AgentProvider
+    /// Preferred model ID per provider rawValue for AI Hunk Grouping (`nil`/absent means provider default).
+    var aiGroupingModels: [String: String]
     /// Customizable commit message format specification used for AI commit generation.
     var commitMessageFormat: String
+
+    /// Legacy compatibility accessor pointing to the commit provider.
+    var aiAgentProvider: AgentProvider {
+        get { aiCommitProvider }
+        set { aiCommitProvider = newValue }
+    }
 
     /// The commit message format to send to AI, falling back to `defaultCommitMessageFormat` when empty.
     var effectiveCommitMessageFormat: String {
         commitMessageFormat.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? Self.defaultCommitMessageFormat
             : commitMessageFormat
+    }
+
+    /// Returns the configured AI provider for `task`.
+    func aiProvider(for task: AITask) -> AgentProvider {
+        switch task {
+        case .commit: return aiCommitProvider
+        case .grouping: return aiGroupingProvider
+        }
+    }
+
+    /// Persists the chosen AI provider for `task`.
+    func setAIProvider(_ provider: AgentProvider, for task: AITask) {
+        switch task {
+        case .commit:
+            guard aiCommitProvider != provider else { return }
+            aiCommitProvider = provider
+        case .grouping:
+            guard aiGroupingProvider != provider else { return }
+            aiGroupingProvider = provider
+        }
+        save()
+    }
+
+    /// Returns the persisted model identifier for `provider` and `task`, or `nil` to use the provider's default model.
+    func aiModel(for provider: AgentProvider, task: AITask = .commit) -> String? {
+        let map: [String: String]
+        switch task {
+        case .commit: map = aiCommitModels
+        case .grouping: map = aiGroupingModels
+        }
+        guard let raw = map[provider.rawValue] else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Persists the preferred model identifier for `provider` and `task` (`nil` or empty restores provider default).
+    func setAIModel(_ model: String?, for provider: AgentProvider, task: AITask = .commit) {
+        let trimmed = model?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = (trimmed?.isEmpty == false) ? trimmed : nil
+        switch task {
+        case .commit:
+            if aiCommitModels[provider.rawValue] == normalized { return }
+            if let normalized {
+                aiCommitModels[provider.rawValue] = normalized
+            } else {
+                aiCommitModels.removeValue(forKey: provider.rawValue)
+            }
+        case .grouping:
+            if aiGroupingModels[provider.rawValue] == normalized { return }
+            if let normalized {
+                aiGroupingModels[provider.rawValue] = normalized
+            } else {
+                aiGroupingModels.removeValue(forKey: provider.rawValue)
+            }
+        }
+        save()
     }
 
     @ObservationIgnored private let defaults: UserDefaults
@@ -177,6 +253,12 @@ final class Settings {
         vimMode = defaults.object(forKey: "vimMode") as? Bool ?? true
         vimRelativeLineNumbers = defaults.object(forKey: "vimRelativeLineNumbers") as? Bool ?? false
         showLineDiffBar = defaults.object(forKey: "showLineDiffBar") as? Bool ?? true
+        let legacyProvider = AgentProvider(rawValue: defaults.string(forKey: "aiAgentProvider") ?? "") ?? .agy
+        let legacyModels = defaults.dictionary(forKey: "aiAgentModels") as? [String: String] ?? [:]
+        aiCommitProvider = AgentProvider(rawValue: defaults.string(forKey: "aiCommitProvider") ?? "") ?? legacyProvider
+        aiCommitModels = defaults.dictionary(forKey: "aiCommitModels") as? [String: String] ?? legacyModels
+        aiGroupingProvider = AgentProvider(rawValue: defaults.string(forKey: "aiGroupingProvider") ?? "") ?? legacyProvider
+        aiGroupingModels = defaults.dictionary(forKey: "aiGroupingModels") as? [String: String] ?? legacyModels
         if let savedFormat = defaults.string(forKey: "commitMessageFormat"),
            !savedFormat.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             commitMessageFormat = savedFormat
@@ -207,6 +289,12 @@ final class Settings {
         defaults.set(vimMode, forKey: "vimMode")
         defaults.set(vimRelativeLineNumbers, forKey: "vimRelativeLineNumbers")
         defaults.set(showLineDiffBar, forKey: "showLineDiffBar")
+        defaults.set(aiCommitProvider.rawValue, forKey: "aiCommitProvider")
+        defaults.set(aiCommitModels, forKey: "aiCommitModels")
+        defaults.set(aiGroupingProvider.rawValue, forKey: "aiGroupingProvider")
+        defaults.set(aiGroupingModels, forKey: "aiGroupingModels")
+        // Keep legacy key aligned with commit provider for downgrade compatibility.
+        defaults.set(aiCommitProvider.rawValue, forKey: "aiAgentProvider")
         if commitMessageFormat.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             defaults.removeObject(forKey: "commitMessageFormat")
         } else {

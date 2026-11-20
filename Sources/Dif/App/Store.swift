@@ -80,6 +80,19 @@ final class AppStore {
     var externalRequest: DiffRequest?
     @ObservationIgnored var definitionTask: Task<Void, Never>?
 
+    // Local AI agents & hunk grouping (Direct edition only; see AIGroupActions.swift).
+    var agentAvailabilities: [AgentAvailability] = []
+    var agentAvailabilityChecked = false
+    var agentModelsByProvider: [AgentProvider: [AgentModel]] = [:]
+    var loadingModelsProviders: Set<AgentProvider> = []
+    var agentModelErrors: [AgentProvider: String] = [:]
+    @ObservationIgnored var agentAvailabilityTask: Task<Void, Never>?
+    @ObservationIgnored var agentModelAttemptedProviders: Set<AgentProvider> = []
+    @ObservationIgnored var agentModelLoadTokens: [AgentProvider: UInt64] = [:]
+    @ObservationIgnored var agentModelLoadTasks: [AgentProvider: Task<Void, Never>] = [:]
+    /// Pending hunk focus requested from the Groups tab while the target file finishes loading.
+    @ObservationIgnored var pendingGroupHunkFocus: (root: URL, path: String, hunkIndex: Int)?
+
     @ObservationIgnored var recent: [RecentFile] = []
     /// Rollbacks and deletes that can still be undone, oldest first.
     @ObservationIgnored var undoStack: [UndoItem] = []

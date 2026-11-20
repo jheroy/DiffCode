@@ -1478,9 +1478,6 @@ struct SettingsView: View {
     /// Weights genuinely available for the currently selected code font family.
     @State private var availableWeights: [CodeFontWeight] = CodeFontWeight.allCases
     @State private var typographyExpanded = true
-    /// Detected `agy` CLI path for AI commit generation (resolved asynchronously when Settings opens).
-    @State private var agyCLIPath: String?
-    @State private var agyCLIChecked = false
 
     var body: some View {
         @Bindable var settings = store.settings
@@ -1645,8 +1642,13 @@ struct SettingsView: View {
             // Fonts installed since the last time show too.
             families = await Task.detached(priority: .userInitiated) { MonospaceFonts.installed() }.value
             if !AppEnvironment.isAppStore {
-                agyCLIPath = await Task.detached(priority: .utility) { AICommitGenerator.resolveCLI() }.value
-                agyCLIChecked = true
+                await store.refreshAgentAvailability(forceRefresh: false)
+                let commitProvider = settings.aiProvider(for: .commit)
+                store.loadAgentModels(for: commitProvider, forceRefresh: false)
+                let groupingProvider = settings.aiProvider(for: .grouping)
+                if groupingProvider != commitProvider {
+                    store.loadAgentModels(for: groupingProvider, forceRefresh: false)
+                }
             }
         }
         .onChange(of: settings.codeFontFamily) { _, family in
@@ -1668,6 +1670,16 @@ struct SettingsView: View {
             settings.save()
             store.viewer.setVimRelativeLineNumbers(enabled)
         }
+        .onChange(of: settings.aiCommitProvider) { _, provider in
+            if !AppEnvironment.isAppStore {
+                store.loadAgentModels(for: provider, forceRefresh: false)
+            }
+        }
+        .onChange(of: settings.aiGroupingProvider) { _, provider in
+            if !AppEnvironment.isAppStore {
+                store.loadAgentModels(for: provider, forceRefresh: false)
+            }
+        }
         .onChange(of: settings.commitMessageFormat) { _, _ in
             settings.save()
         }
@@ -1676,36 +1688,89 @@ struct SettingsView: View {
     private func aiCommitSection(settings: Settings) -> some View {
         @Bindable var settings = settings
         let isDefaultFormat = settings.commitMessageFormat == Settings.defaultCommitMessageFormat
-        let statusText: String = {
-            if !agyCLIChecked { return L("Checking…", "检测中…") }
-            if let path = agyCLIPath { return path }
-            return L("agy not found in PATH", "未在 PATH 中找到 agy")
-        }()
+
         return VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 6) {
-                Text(L("AI Commit", "AI 提交信息"))
+                Text(L("AI Agent & Commit", "AI 助手与提交"))
                     .font(.ui(size: 12.5, weight: .medium))
                     .foregroundStyle(Color.difText)
                 Rectangle()
                     .fill(Color.difHairline)
                     .frame(height: 1)
             }
-            row(L("agy CLI", "agy CLI")) {
-                HStack(spacing: 6) {
-                    if agyCLIChecked {
-                        Circle()
-                            .fill(agyCLIPath != nil ? Color.difAdded : Color.difRemoved)
-                            .frame(width: 6, height: 6)
+
+            // Provider overview cards: install status dot, ACP/CLI badge, and executable path for all 3 agents.
+            HStack(spacing: 6) {
+                ForEach(AgentProvider.allCases) { provider in
+                    let avail = store.availability(for: provider)
+                    let installed = avail?.isInstalled ?? false
+                    let transportLabel = (avail?.transportKind ?? (provider == .agy ? .acp : .cli)).rawValue.uppercased()
+                    let isUsed = settings.aiProvider(for: .commit) == provider || settings.aiProvider(for: .grouping) == provider
+                    let pathText: String = {
+                        if !store.agentAvailabilityChecked { return L("Checking…", "检测中…") }
+                        if let path = avail?.executablePath { return path }
+                        return L("Not found in PATH", "未在 PATH 中找到")
+                    }()
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(!store.agentAvailabilityChecked
+                                      ? Color.difText3.opacity(0.5)
+                                      : (installed ? Color.difAdded : Color.difRemoved))
+                                .frame(width: 6, height: 6)
+                            Text(provider.displayName)
+                                .font(.ui(size: 11, weight: isUsed ? .semibold : .medium))
+                                .foregroundStyle(isUsed ? Color.difText : Color.difText2)
+                                .lineLimit(1)
+                            Spacer(minLength: 2)
+                            Text(transportLabel)
+                                .font(.ui(size: 9, weight: .semibold, design: .rounded))
+                                .foregroundStyle(isUsed ? Color.difAccent : Color.difText3)
+                                .padding(.horizontal, 4)
+                                .padding(.vertical, 1)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                        .fill(isUsed ? Color.difAccent.opacity(0.14) : Color.difChip)
+                                )
+                        }
+                        Text(pathText)
+                            .font(.ui(size: 10, design: avail?.executablePath != nil ? .monospaced : .default))
+                            .foregroundStyle(avail?.executablePath != nil ? Color.difText3 : Color.difText3.opacity(0.8))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
                     }
-                    Text(statusText)
-                        .font(.ui(size: 11.5, design: agyCLIPath != nil ? .monospaced : .default))
-                        .foregroundStyle(agyCLIPath != nil ? Color.difText2 : Color.difText3)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(isUsed ? Color.difSelection.opacity(0.55) : Color.difChip.opacity(0.65))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .strokeBorder(isUsed ? Color.difAccent.opacity(0.35) : Color.difHairline, lineWidth: 1)
+                    )
+                    .help(avail?.executablePath
+                          ?? L("Install \(provider.executableName) CLI and ensure it is in PATH",
+                               "请安装 \(provider.executableName) 并确保它在 PATH 中"))
                 }
-                .frame(maxWidth: UI.s(260), alignment: .trailing)
-                .help(agyCLIPath ?? L("Install agy CLI and ensure it is in PATH", "请安装 agy CLI 并确保它在 PATH 中"))
             }
+
+            // Independent per-task Provider + Model selectors sharing the same model list cache.
+            VStack(alignment: .leading, spacing: 8) {
+                aiTaskConfigRow(
+                    title: L("Commit Message", "提交信息"),
+                    task: .commit,
+                    settings: settings
+                )
+                aiTaskConfigRow(
+                    title: L("AI Grouping", "变更分组"),
+                    task: .grouping,
+                    settings: settings
+                )
+            }
+
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
                     Text(L("Commit format", "提交格式"))
@@ -1735,6 +1800,96 @@ struct SettingsView: View {
                         RoundedRectangle(cornerRadius: 6, style: .continuous)
                             .strokeBorder(Color.difHairline, lineWidth: 1)
                     )
+            }
+        }
+    }
+
+    private func aiTaskConfigRow(title: String, task: Settings.AITask, settings: Settings) -> some View {
+        let provider = settings.aiProvider(for: task)
+        let availability = store.availability(for: provider)
+        let models = store.agentModelsByProvider[provider] ?? []
+        let isLoadingModels = store.loadingModelsProviders.contains(provider)
+        let modelError = store.agentModelErrors[provider]
+        let selectedModel = settings.aiModel(for: provider, task: task)
+        let defaultModel = models.first(where: \.isDefault)
+        let missingModel: String? = selectedModel.flatMap { chosen in
+            models.isEmpty || models.contains(where: { $0.id == chosen }) ? nil : chosen
+        }
+
+        return VStack(alignment: .leading, spacing: 4) {
+            row(title) {
+                HStack(spacing: 6) {
+                    Picker("", selection: Binding<AgentProvider>(
+                        get: { settings.aiProvider(for: task) },
+                        set: { store.selectAgentProvider($0, for: task) }
+                    )) {
+                        ForEach(AgentProvider.allCases) { item in
+                            let avail = store.availability(for: item)
+                            let suffix = (store.agentAvailabilityChecked && avail?.isInstalled == false)
+                                ? L(" (not installed)", "（未安装）") : ""
+                            Text(item.displayName + suffix).tag(item)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .frame(width: UI.s(132))
+                    .help(availability?.executablePath ?? provider.displayName)
+
+                    Picker("", selection: Binding<String?>(
+                        get: { selectedModel },
+                        set: { store.selectAgentModel($0, for: provider, task: task) }
+                    )) {
+                        Text(defaultModel.map { L("Auto (\($0.name))", "默认（\($0.name)）") }
+                             ?? L("Auto (Default)", "自动（默认模型）"))
+                            .tag(String?.none)
+                        if !models.isEmpty || missingModel != nil {
+                            Divider()
+                        }
+                        ForEach(models) { model in
+                            Text(model.isDefault ? "\(model.name) (\(L("default", "默认")))" : model.name)
+                                .tag(String?.some(model.id))
+                        }
+                        if let missingModel {
+                            Text("\(missingModel) (\(L("saved", "已保存")))")
+                                .tag(String?.some(missingModel))
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .frame(width: UI.s(164))
+
+                    ZStack {
+                        IconButton(symbol: "arrow.clockwise",
+                                   help: L("Refresh model list", "刷新模型列表"),
+                                   size: 11.5) {
+                            Task {
+                                await store.refreshAgentAvailability(forceRefresh: true)
+                                store.loadAgentModels(for: provider, forceRefresh: true)
+                            }
+                        }
+                        .opacity(isLoadingModels ? 0 : 1)
+                        .disabled(isLoadingModels)
+                        if isLoadingModels {
+                            ProgressView()
+                                .controlSize(.small)
+                                .scaleEffect(0.55)
+                                .frame(width: UI.s(22), height: UI.s(22))
+                        }
+                    }
+                }
+            }
+            if store.agentAvailabilityChecked, availability?.isInstalled == false {
+                Text(L("\(provider.executableName) not found in PATH",
+                       "未在 PATH 中找到 \(provider.executableName)"))
+                    .font(.ui(size: 10.5))
+                    .foregroundStyle(Color.difRemoved)
+                    .lineLimit(1)
+            } else if let modelError, !modelError.isEmpty {
+                Text(modelError)
+                    .font(.ui(size: 10.5))
+                    .foregroundStyle(Color.difRemoved)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

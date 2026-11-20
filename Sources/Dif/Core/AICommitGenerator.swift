@@ -67,10 +67,9 @@ enum AICommitGenerator {
 
     // MARK: - CLI Resolution
 
-    /// Locates the `agy` executable via login-shell PATH and common user/Homebrew bin directories.
-    static func resolveCLI(searchPaths: [String]? = nil) -> String? {
-        guard !AppEnvironment.isAppStore else { return nil }
-        return LSPBinaryLocator.resolve(executable: "agy", searchPaths: searchPaths)
+    /// Locates the `agy` executable (or specified provider executable) via login-shell PATH and common bin directories.
+    static func resolveCLI(provider: AgentProvider = .agy, searchPaths: [String]? = nil) -> String? {
+        LocalAgentEnvironment.availability(for: provider, searchPaths: searchPaths).executablePath
     }
 
     /// Arguments passed to `agy` for fast, non-interactive commit message generation.
@@ -540,11 +539,84 @@ enum AICommitGenerator {
 
     // MARK: - Generation & Process Execution
 
-    /// Generates a commit message for `payload` using `agy` (or an explicit `cliPath` in tests).
+    /// Collects checked working-tree diffs and generates a commit message via `LocalAgentService`
+    /// (defaults to `agy` ACP; supports selecting any `AgentProvider` and optional `model`).
+    static func generate(
+        repoRoot: URL,
+        files: [FileChange],
+        excludedLines: [String: Set<ChangeLine>] = [:],
+        isInitial: Bool = false,
+        format: String,
+        provider: AgentProvider = .agy,
+        model: String? = nil,
+        timeout: TimeInterval = TimeInterval(defaultTimeoutSeconds),
+        service: LocalAgentService = .shared
+    ) async throws -> String {
+        guard !AppEnvironment.isAppStore else {
+            throw AICommitError.unavailableInAppStore
+        }
+        try Task.checkCancellation()
+        let payload = try await collectCheckedDiff(
+            changes: files,
+            excludedLines: excludedLines,
+            in: repoRoot,
+            isInitial: isInitial
+        )
+        return try await generate(
+            from: payload,
+            format: format,
+            provider: provider,
+            model: model,
+            workingDirectory: repoRoot,
+            timeoutSeconds: max(5, Int(timeout.rounded())),
+            service: service
+        )
+    }
+
+    /// Generates a commit message for `payload` using `LocalAgentService` (defaults to `agy` ACP).
     static func generate(
         from payload: CheckedDiffPayload,
         format: String,
-        cliPath: String? = nil,
+        provider: AgentProvider = .agy,
+        model: String? = nil,
+        workingDirectory: URL? = nil,
+        timeoutSeconds: Int = defaultTimeoutSeconds,
+        service: LocalAgentService = .shared
+    ) async throws -> String {
+        guard !AppEnvironment.isAppStore else {
+            throw AICommitError.unavailableInAppStore
+        }
+        try Task.checkCancellation()
+
+        let prompt = buildPrompt(diff: payload.diff, format: format, summary: payload.summary)
+        let workDir = workingDirectory ?? FileManager.default.temporaryDirectory
+
+        let raw: String
+        do {
+            raw = try await service.generate(
+                provider: provider,
+                model: model,
+                cwd: workDir,
+                prompt: prompt,
+                jsonSchema: nil,
+                timeout: TimeInterval(max(5, timeoutSeconds))
+            )
+        } catch let error as LocalAgentError {
+            throw mapAgentError(error)
+        }
+
+        let cleaned = cleanResponse(raw)
+        guard !cleaned.isEmpty else {
+            throw AICommitError.emptyResponse
+        }
+        return cleaned
+    }
+
+    /// Generates a commit message for `payload` using an explicit CLI executable path (retained for direct CLI testing).
+    static func generate(
+        from payload: CheckedDiffPayload,
+        format: String,
+        cliPath: String,
         environment: [String: String]? = nil,
         workingDirectory: URL? = nil,
         timeoutSeconds: Int = defaultTimeoutSeconds
@@ -554,26 +626,17 @@ enum AICommitGenerator {
         }
         try Task.checkCancellation()
 
-        let executable: String
-        if let explicit = cliPath {
-            guard FileManager.default.isExecutableFile(atPath: explicit) else {
-                throw AICommitError.cliNotFound
-            }
-            executable = explicit
-        } else {
-            guard let resolved = resolveCLI() else {
-                throw AICommitError.cliNotFound
-            }
-            executable = resolved
+        guard FileManager.default.isExecutableFile(atPath: cliPath) else {
+            throw AICommitError.cliNotFound
         }
 
         let prompt = buildPrompt(diff: payload.diff, format: format, summary: payload.summary)
         let args = cliArguments(prompt: prompt, timeoutSeconds: timeoutSeconds)
-        let env = environment ?? LSPBinaryLocator.environment()
+        let env = environment ?? LocalAgentEnvironment.environment()
         let workDir = workingDirectory ?? FileManager.default.temporaryDirectory
 
         let raw = try await runCLI(
-            executable: executable,
+            executable: cliPath,
             arguments: args,
             environment: env,
             workingDirectory: workDir,
@@ -584,6 +647,28 @@ enum AICommitGenerator {
             throw AICommitError.emptyResponse
         }
         return cleaned
+    }
+
+    static func mapAgentError(_ error: LocalAgentError) -> AICommitError {
+        switch error {
+        case .unavailableInAppStore:
+            return .unavailableInAppStore
+        case .providerNotInstalled(.agy):
+            return .cliNotFound
+        case .providerNotInstalled(let provider):
+            return .executionFailed(
+                status: 127,
+                stderr: LocalAgentError.providerNotInstalled(provider).localizedDescription
+            )
+        case .timedOut:
+            return .timedOut
+        case .emptyResponse:
+            return .emptyResponse
+        case .protocolError(_, let detail):
+            return .executionFailed(status: 1, stderr: detail)
+        case .executionFailed(_, let status, let stderr):
+            return .executionFailed(status: status, stderr: stderr)
+        }
     }
 
     private final class OutputBuffer: @unchecked Sendable {

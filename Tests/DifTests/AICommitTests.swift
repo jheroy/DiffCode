@@ -558,4 +558,78 @@ final class AICommitTests: XCTestCase {
             XCTAssertLessThan(Date().timeIntervalSince(start), 3.0)
         }
     }
+
+    // MARK: - LocalAgentService Migration (ACP default + provider/model selection)
+
+    func testGenerateViaLocalAgentServiceUsesACPAndRepoRootOverload() async throws {
+        let root = try await makeRepo()
+        try writeFile("feature.swift", content: "let v = 1\n", in: root)
+        try await runGit(["add", "-A"], in: root)
+        try await runGit(["commit", "-q", "-m", "Initial"], in: root)
+        try writeFile("feature.swift", content: "let v = 2\n", in: root)
+
+        let status = try await Git.status(in: root)
+        let binDir = try makeTempDir("acp-commit-bin")
+        let agyURL = binDir.appendingPathComponent("agy")
+        let mockACP = """
+        #!/usr/bin/env python3
+        import json, sys
+
+        def emit(obj):
+            sys.stdout.write(json.dumps(obj) + "\\n")
+            sys.stdout.flush()
+
+        selected_model = None
+        for raw in sys.stdin:
+            msg = json.loads(raw)
+            m = msg.get("method")
+            i = msg.get("id")
+            if m == "initialize":
+                emit({"jsonrpc":"2.0","id":i,"result":{"protocolVersion":1}})
+            elif m == "session/new":
+                emit({"jsonrpc":"2.0","id":i,"result":{"sessionId":"s-commit"}})
+            elif m == "session/set_model":
+                selected_model = msg["params"]["modelId"]
+                emit({"jsonrpc":"2.0","id":i,"result":{}})
+            elif m == "session/prompt":
+                reply = f"```gitcommit\\n✨ feat(feature): 使用 {selected_model} 更新变量值\\n```"
+                emit({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":reply}}}})
+                emit({"jsonrpc":"2.0","id":i,"result":{"stopReason":"end_turn"}})
+            elif m == "session/close":
+                emit({"jsonrpc":"2.0","id":i,"result":{}})
+                break
+        """
+        try Data(mockACP.utf8).write(to: agyURL)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: agyURL.path)
+
+        let service = LocalAgentService(
+            searchPaths: [binDir.path],
+            environment: ProcessInfo.processInfo.environment
+        )
+        let message = try await AICommitGenerator.generate(
+            repoRoot: root,
+            files: status.changes,
+            format: Settings.defaultCommitMessageFormat,
+            provider: .agy,
+            model: "gemini-3.8-flash-low",
+            timeout: 15,
+            service: service
+        )
+        XCTAssertEqual(message, "✨ feat(feature): 使用 gemini-3.8-flash-low 更新变量值")
+    }
+
+    func testMapAgentErrorPreservesAICommitErrorSemantics() {
+        XCTAssertEqual(AICommitGenerator.mapAgentError(.unavailableInAppStore), .unavailableInAppStore)
+        XCTAssertEqual(AICommitGenerator.mapAgentError(.providerNotInstalled(.agy)), .cliNotFound)
+        XCTAssertEqual(AICommitGenerator.mapAgentError(.timedOut(.claude)), .timedOut)
+        XCTAssertEqual(AICommitGenerator.mapAgentError(.emptyResponse(.codex)), .emptyResponse)
+        XCTAssertEqual(
+            AICommitGenerator.mapAgentError(.executionFailed(provider: .claude, status: 7, stderr: "boom")),
+            .executionFailed(status: 7, stderr: "boom")
+        )
+        XCTAssertEqual(
+            AICommitGenerator.mapAgentError(.protocolError(provider: .agy, detail: "bad rpc")),
+            .executionFailed(status: 1, stderr: "bad rpc")
+        )
+    }
 }

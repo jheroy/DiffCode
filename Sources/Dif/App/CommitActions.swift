@@ -219,7 +219,7 @@ extension AppStore {
         project.setIncluded(!targets.allSatisfy { project.inclusion($0) == .on }, targets)
     }
 
-    /// Generates a commit message for the project's currently checked changes using the `agy` CLI.
+    /// Generates a commit message for the project's currently checked changes using the configured local AI agent.
     /// Calling again while generation is in progress cancels the running request.
     func generateCommitMessage(in project: Project? = nil) {
         guard let project = project ?? currentProject else { return }
@@ -240,6 +240,9 @@ extension AppStore {
         guard viewer.saveEdits() else { return }
 
         let format = settings.effectiveCommitMessageFormat
+        let provider = settings.aiProvider(for: .commit)
+        let model = settings.aiModel(for: provider, task: .commit)
+        let repoRoot = project.url
         let token = project.beginCommitMessageGeneration()
         project.commitMessageGenerationTask = Task { @MainActor [weak self, weak project] in
             guard let self, let project else { return }
@@ -249,7 +252,13 @@ extension AppStore {
             do {
                 let payload = try await AICommitGenerator.collectCheckedDiff(for: project)
                 try Task.checkCancellation()
-                let generated = try await AICommitGenerator.generate(from: payload, format: format)
+                let generated = try await AICommitGenerator.generate(
+                    from: payload,
+                    format: format,
+                    provider: provider,
+                    model: model,
+                    workingDirectory: repoRoot
+                )
                 try Task.checkCancellation()
                 guard project.commitMessageGenerationID == token else { return }
                 project.commitMessage = generated
@@ -266,7 +275,7 @@ extension AppStore {
         }
     }
 
-    /// Cancels any active AI commit message generation for `project`, terminating the underlying `agy` process.
+    /// Cancels any active AI commit message generation for `project`, terminating the underlying agent process.
     func cancelCommitMessageGeneration(in project: Project? = nil) {
         guard let project = project ?? currentProject else { return }
         project.cancelCommitMessageGeneration()
