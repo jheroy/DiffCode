@@ -214,7 +214,7 @@ struct XLSXZipArchive: Sendable {
             // 2. Check for ZIP64 EOCD Locator immediately before EOCD.
             if eocdOffset >= 20, Self.readUInt32LE(base, eocdOffset - 20) == 0x07064b50 {
                 let zip64EOCDOffset = Self.readUInt64LE(base, eocdOffset - 20 + 8)
-                if zip64EOCDOffset <= UInt64(count), Int(zip64EOCDOffset) + 56 <= count {
+                if zip64EOCDOffset <= UInt64(count), UInt64(count) - zip64EOCDOffset >= 56 {
                     let z64 = Int(zip64EOCDOffset)
                     if Self.readUInt32LE(base, z64) == 0x06064b50 {
                         if totalEntries == 0xFFFF {
@@ -240,7 +240,7 @@ struct XLSXZipArchive: Sendable {
             let cdEnd = pos + Int(cdSize)
             var dict: [String: Entry] = [:]
             var names: [String] = []
-            let reserve = min(Int(totalEntries), 16_384)
+            let reserve = Int(min(totalEntries, 16_384))
             dict.reserveCapacity(reserve)
             names.reserveCapacity(reserve)
 
@@ -471,10 +471,20 @@ struct XLSXZipArchive: Sendable {
 
     // MARK: zlib Helpers
 
-    private static func inflateRaw(data: Data, range: Range<Int>, expectedSize: UInt64) throws -> Data {
+    /// Upper bound for a single decompressed XML entry (guards against zip bombs).
+    static let maxDecompressedEntryBytes = 256 * 1024 * 1024
+
+    static func inflateRaw(
+        data: Data,
+        range: Range<Int>,
+        expectedSize: UInt64,
+        maxOutputBytes: Int = maxDecompressedEntryBytes
+    ) throws -> Data {
         if range.isEmpty { return Data() }
 
-        let initialCapacity = min(max(Int(min(expectedSize, UInt64(Int.max))), 256), 64 * 1024 * 1024)
+        let hardCap = max(1, maxOutputBytes)
+        let hinted = Int(min(expectedSize, UInt64(hardCap)))
+        let initialCapacity = min(max(hinted, min(256, hardCap)), min(64 * 1024 * 1024, hardCap))
         var output = Data(count: initialCapacity)
 
         var stream = z_stream()
@@ -494,7 +504,12 @@ struct XLSXZipArchive: Sendable {
 
             while true {
                 if totalOut >= output.count {
-                    let nextSize = max(output.count * 2, output.count + 65_536)
+                    // Allow growing 1 byte past hardCap so an entry of exact size `hardCap` can emit Z_STREAM_END.
+                    let ceiling = hardCap + 1
+                    guard output.count < ceiling else {
+                        throw XLSXError.decompressionFailed("Entry exceeds maximum decompressed size (\(hardCap) bytes)")
+                    }
+                    let nextSize = min(ceiling, max(output.count * 2, output.count + 65_536))
                     output.count = nextSize
                 }
                 let remaining = output.count - totalOut
@@ -508,6 +523,9 @@ struct XLSXZipArchive: Sendable {
                 }
 
                 totalOut = Int(stream.total_out)
+                if totalOut > hardCap {
+                    throw XLSXError.decompressionFailed("Entry exceeds maximum decompressed size (\(hardCap) bytes)")
+                }
 
                 if status == Z_STREAM_END {
                     break
@@ -516,7 +534,7 @@ struct XLSXZipArchive: Sendable {
                         continue
                     }
                     if stream.avail_in == 0 {
-                        break
+                        throw XLSXError.decompressionFailed("Truncated deflate stream")
                     }
                 } else if status == Z_BUF_ERROR && stream.avail_out == 0 {
                     continue
@@ -885,7 +903,12 @@ private struct FastXMLScanner {
         return value
     }
 
+    /// Excel worksheet bounds: 16,384 columns (`XFD`) and 1,048,576 rows.
+    static let maxColumns = 16_384
+    static let maxRows = 1_048_576
+
     /// Parses an Excel cell reference like `AB12` into zero-based `(row, col)`.
+    /// Rejects arithmetic overflows and coordinates outside Excel's limits (`XFD` / `1_048_576`).
     @inline(__always)
     func parseCellRef(_ slice: ByteSlice) -> (row: Int, col: Int)? {
         guard !slice.isEmpty else { return nil }
@@ -894,17 +917,20 @@ private struct FastXMLScanner {
         var hasLetters = false
         while i < slice.end {
             let b = base[i]
+            let letterVal: Int
             if b >= 0x41 && b <= 0x5A { // 'A'...'Z'
-                col = col * 26 + Int(b - 0x41) + 1
-                hasLetters = true
-                i += 1
+                letterVal = Int(b - 0x41) + 1
             } else if b >= 0x61 && b <= 0x7A { // 'a'...'z'
-                col = col * 26 + Int(b - 0x61) + 1
-                hasLetters = true
-                i += 1
+                letterVal = Int(b - 0x61) + 1
             } else {
                 break
             }
+            let (mul, o1) = col.multipliedReportingOverflow(by: 26)
+            let (add, o2) = mul.addingReportingOverflow(letterVal)
+            if o1 || o2 || add > Self.maxColumns { return nil }
+            col = add
+            hasLetters = true
+            i += 1
         }
         guard hasLetters, i < slice.end else { return nil }
         var row = 0
@@ -912,7 +938,10 @@ private struct FastXMLScanner {
         while i < slice.end {
             let b = base[i]
             guard b >= 0x30 && b <= 0x39 else { return nil }
-            row = row * 10 + Int(b - 0x30)
+            let (mul, o1) = row.multipliedReportingOverflow(by: 10)
+            let (add, o2) = mul.addingReportingOverflow(Int(b - 0x30))
+            if o1 || o2 || add > Self.maxRows { return nil }
+            row = add
             hasDigits = true
             i += 1
         }
@@ -1469,11 +1498,14 @@ enum XLSXReader {
 
             var inSheetData = false
             var inRow = false
+            var rowValid = true
+            var rowHasExplicitIndex = false
             var currentRowIndex = -1
             var nextCol = 0
             var currentRowCells: [(col: Int, value: String)] = []
 
             var inCell = false
+            var cellValid = true
             var cellCol = 0
             var cellRow = 0
             var cellType: CellType = .number
@@ -1487,7 +1519,7 @@ enum XLSXReader {
 
             @inline(__always)
             func commitCell() {
-                guard !valueBuf.isEmpty else { return }
+                guard cellValid, cellCol >= 0, cellCol < FastXMLScanner.maxColumns, !valueBuf.isEmpty else { return }
                 let resolved: String
                 switch cellType {
                 case .sharedString:
@@ -1512,7 +1544,7 @@ enum XLSXReader {
                 if cellCol > maxNonEmptyCol { maxNonEmptyCol = cellCol }
                 if cellRow == 0 {
                     headerCells[cellCol] = resolved
-                } else if cellRow > 0 {
+                } else if cellRow > 0, cellRow < FastXMLScanner.maxRows {
                     currentRowCells.append((cellCol, resolved))
                 }
             }
@@ -1530,18 +1562,28 @@ enum XLSXReader {
                     if !inRow {
                         if scanner.equalsASCII(local, "row") {
                             var explicitRow: Int?
+                            var explicitInvalid = false
                             scanner.forEachAttribute(start: attrStart, end: attrEnd) { name, val in
-                                if scanner.localEqualsASCII(name, "r"), let r = scanner.parseASCIIInt(val), r > 0 {
-                                    explicitRow = r - 1
+                                if scanner.localEqualsASCII(name, "r") {
+                                    if let r = scanner.parseASCIIInt(val), r > 0, r <= FastXMLScanner.maxRows {
+                                        explicitRow = r - 1
+                                    } else {
+                                        explicitInvalid = true
+                                    }
                                 }
                             }
-                            currentRowIndex = explicitRow ?? (currentRowIndex + 1)
+                            if explicitInvalid {
+                                rowValid = false
+                                rowHasExplicitIndex = true
+                            } else {
+                                rowHasExplicitIndex = explicitRow != nil
+                                currentRowIndex = explicitRow ?? (currentRowIndex + 1)
+                                rowValid = currentRowIndex >= 0 && currentRowIndex < FastXMLScanner.maxRows
+                            }
                             nextCol = 0
                             if !selfClosing {
                                 inRow = true
                                 currentRowCells.removeAll(keepingCapacity: true)
-                            } else if currentRowIndex > 0 {
-                                dataRows.append([])
                             }
                         }
                         continue
@@ -1551,6 +1593,7 @@ enum XLSXReader {
                         if scanner.equalsASCII(local, "c") {
                             cellRow = currentRowIndex
                             cellCol = nextCol
+                            cellValid = rowValid && cellRow >= 0 && cellRow < FastXMLScanner.maxRows && cellCol < FastXMLScanner.maxColumns
                             cellType = .number
                             cellStyle = 0
 
@@ -1559,6 +1602,13 @@ enum XLSXReader {
                                     if let parsed = scanner.parseCellRef(val) {
                                         cellRow = parsed.row
                                         cellCol = parsed.col
+                                        if !rowHasExplicitIndex {
+                                            currentRowIndex = parsed.row
+                                            rowValid = true
+                                        }
+                                        cellValid = rowValid
+                                    } else {
+                                        cellValid = false
                                     }
                                 } else if scanner.localEqualsASCII(name, "t") {
                                     if scanner.equalsASCII(val, "s") { cellType = .sharedString }
@@ -1574,7 +1624,9 @@ enum XLSXReader {
                                     }
                                 }
                             }
-                            nextCol = cellCol + 1
+                            if cellValid {
+                                nextCol = cellCol + 1
+                            }
                             if !selfClosing {
                                 inCell = true
                                 inV = false
@@ -1619,8 +1671,17 @@ enum XLSXReader {
                             inT = false
                         }
                     } else if inRow && scanner.equalsASCII(local, "row") {
-                        if currentRowIndex > 0 {
-                            dataRows.append(currentRowCells)
+                        if rowValid, currentRowIndex > 0, currentRowIndex < FastXMLScanner.maxRows, !currentRowCells.isEmpty {
+                            let targetIndex = currentRowIndex - 1
+                            // Pad skipped blank rows so data row indices stay aligned with Excel row numbers & comments.
+                            if targetIndex > dataRows.count {
+                                dataRows.append(contentsOf: repeatElement([], count: targetIndex - dataRows.count))
+                            }
+                            if targetIndex == dataRows.count {
+                                dataRows.append(currentRowCells)
+                            } else {
+                                dataRows[targetIndex].append(contentsOf: currentRowCells)
+                            }
                         }
                         inRow = false
                     } else if scanner.equalsASCII(local, "sheetData") {
@@ -1679,11 +1740,14 @@ enum XLSXReader {
 
     private static let posixLocale = Locale(identifier: "en_US_POSIX")
 
+    /// Excel's maximum valid date serial (exclusive, corresponds to 9999-12-31 in the 1900 date system).
+    private static let maxExcelDateSerial: Double = 2_958_466.0
+
     static func formatNumericValue(_ raw: String, isDate: Bool, use1904: Bool) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let num = Double(trimmed) else { return raw }
 
-        if isDate, num.isFinite, num >= 0 {
+        if isDate, num.isFinite, num >= 0, num < maxExcelDateSerial {
             return formatExcelDate(num, use1904: use1904)
         }
 
@@ -1723,6 +1787,9 @@ enum XLSXReader {
     /// Converts an Excel serial date number into `yyyy-MM-dd`, `HH:mm:ss`, or `yyyy-MM-dd HH:mm:ss`
     /// using exact Gregorian civil-date math (supporting both 1900 and 1904 date systems).
     static func formatExcelDate(_ serial: Double, use1904: Bool) -> String {
+        guard serial.isFinite, serial >= 0, serial < maxExcelDateSerial else {
+            return String(serial)
+        }
         var wholeDays = Int64(floor(serial))
         let fraction = serial - Double(wholeDays)
         var totalSeconds = Int((fraction * 86_400.0).rounded())
