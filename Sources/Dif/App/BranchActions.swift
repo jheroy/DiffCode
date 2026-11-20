@@ -586,3 +586,168 @@ extension AppStore {
         ask(request)
     }
 }
+
+// MARK: - Tags
+
+extension AppStore {
+    /// Opens a dialog to create a local tag (lightweight or annotated) at `start` (HEAD when nil).
+    func newTag(from start: String? = nil, startTitle: String? = nil, in project: Project? = nil) {
+        guard let project = project ?? currentProject else { return }
+        let target = start ?? "HEAD"
+        Task { @MainActor [weak self] in
+            guard await Git.resolveCommit(target, in: project.url) != nil else {
+                self?.showToast(L("Cannot create a tag · this repository has no commits yet", "无法创建标签 · 该仓库还没有任何提交"))
+                return
+            }
+            let existing = Set(((try? await Git.refs(in: project.url)) ?? []).filter { $0.kind == .tag }.map(\.shortName))
+            guard let self else { return }
+            let targetLabel = startTitle ?? project.status.branch.map { "HEAD (\($0))" } ?? "HEAD"
+            let form = TagDialogForm(targetLabel: targetLabel, existingTagNames: existing)
+            var request = DialogRequest(style: .info, symbol: "tag",
+                                        title: startTitle.map { L("New tag on \($0)", "在 \($0) 上新建标签") } ?? L("New tag", "新建标签"),
+                                        message: L("Creates a tag on \(targetLabel). Add a message for an annotated tag, or leave it empty for a lightweight tag.",
+                                                   "将在 \(targetLabel) 上创建标签。填写附注消息可创建附注标签，留空则创建轻量标签。"),
+                                        confirmTitle: L("Create", "创建"))
+            request.tagForm = form
+            request.onConfirm = { [weak self] in
+                let name = form.trimmedName
+                let message = form.trimmedMessage
+                self?.createTag(name, at: target, message: message.isEmpty ? nil : message, in: project)
+            }
+            self.ask(request)
+        }
+    }
+
+    private func createTag(_ name: String, at target: String, message: String?, in project: Project) {
+        runActivity(L("Creating tag \(name)…", "正在创建标签 \(name)…"), in: project) { [weak self] in
+            do {
+                try await Git.createTag(name, at: target, message: message, in: project.url)
+                guard let self else { return }
+                self.afterBranchesChanged(project)
+                self.showToast(L("Created tag \(name)", "已创建标签 \(name)"))
+            } catch {
+                self?.afterBranchesChanged(project)
+                self?.showFailure(L("Could not create tag \(name)", "无法创建标签 \(name)"), error)
+            }
+        }
+    }
+
+    /// Prompts for a new name and renames a local tag, preserving lightweight vs annotated type and message.
+    func renameTag(_ ref: GitRef, in project: Project) {
+        guard ref.kind == .tag else { return }
+        Task { @MainActor [weak self] in
+            let existing = Set(((try? await Git.refs(in: project.url)) ?? []).filter { $0.kind == .tag && $0.name != ref.name }.map(\.shortName))
+            let info = try? await Git.tagInfo(ref.shortName, in: project.url)
+            guard let self else { return }
+            let message = info?.isAnnotated == true
+                ? L("The annotated tag's message and tagger details are preserved. Remote tags are not changed.",
+                    "附注标签的消息和创建者信息会被保留，不会修改远程标签。")
+                : L("Renames the local tag. Remote tags are not changed.",
+                    "重命名本地标签，不会修改远程标签。")
+            var request = DialogRequest(style: .info, symbol: "pencil",
+                                        title: L("Rename tag \(ref.shortName)", "重命名标签 \(ref.shortName)"),
+                                        message: message,
+                                        confirmTitle: L("Rename", "重命名"))
+            request.input = .init(placeholder: L("Tag name", "标签名"), text: ref.shortName, problem: { candidate in
+                let trimmed = candidate.trimmingCharacters(in: .whitespaces)
+                if trimmed == ref.shortName {
+                    return L("Enter a different tag name", "请输入不同的标签名")
+                }
+                return Git.tagNameProblem(trimmed, existing: existing)
+            })
+            request.onSubmit = { [weak self] newName in
+                guard newName != ref.shortName else { return }
+                self?.performRenameTag(ref.shortName, to: newName, in: project, undoable: true)
+            }
+            self.ask(request)
+        }
+    }
+
+    private func performRenameTag(_ oldName: String, to newName: String, in project: Project, undoable: Bool) {
+        runActivity(L("Renaming tag \(oldName)…", "正在重命名标签 \(oldName)…"), in: project) { [weak self] in
+            do {
+                try await Git.renameTag(oldName, to: newName, in: project.url)
+                guard let self else { return }
+                self.syncTagSelectionAfterRename(oldName, to: newName, in: project)
+                self.afterBranchesChanged(project)
+                let text = L("Renamed tag \(oldName) to \(newName)", "已将标签 \(oldName) 重命名为 \(newName)")
+                if undoable {
+                    self.showToast(text, action: ToastAction(title: L("Undo", "撤销")) { [weak self] in
+                        self?.performRenameTag(newName, to: oldName, in: project, undoable: false)
+                    })
+                } else {
+                    self.showToast(text)
+                }
+            } catch {
+                self?.afterBranchesChanged(project)
+                self?.showFailure(L("Could not rename tag \(oldName)", "无法重命名标签 \(oldName)"), error)
+            }
+        }
+    }
+
+    /// Confirms and deletes a local tag; Undo in the toast restores it (including annotation metadata).
+    func deleteTag(_ ref: GitRef, in project: Project) {
+        guard ref.kind == .tag else { return }
+        var request = DialogRequest(style: .destructive, symbol: "trash",
+                                    title: L("Delete tag \(ref.shortName)?", "删除标签 \(ref.shortName)？"),
+                                    message: L("The local tag is removed. The commit itself stays, and remote tags are not changed.",
+                                               "将删除本地标签。提交本身不受影响，远程标签也不会改变。"),
+                                    confirmTitle: L("Delete", "删除"))
+        request.onConfirm = { [weak self] in
+            self?.runActivity(L("Deleting tag \(ref.shortName)…", "正在删除标签 \(ref.shortName)…"), in: project) { [weak self] in
+                let backup = try? await Git.tagInfo(ref.shortName, in: project.url)
+                do {
+                    try await Git.deleteTag(ref.shortName, in: project.url)
+                    guard let self else { return }
+                    self.syncTagSelectionAfterDelete(ref.shortName, in: project)
+                    self.afterBranchesChanged(project)
+                    let text = L("Deleted tag \(ref.shortName)", "已删除标签 \(ref.shortName)")
+                    if let backup {
+                        self.showToast(text, action: ToastAction(title: L("Undo", "撤销")) { [weak self] in
+                            self?.restoreTag(backup, in: project)
+                        })
+                    } else {
+                        self.showToast(text)
+                    }
+                } catch {
+                    self?.afterBranchesChanged(project)
+                    self?.showFailure(L("Could not delete tag \(ref.shortName)", "无法删除标签 \(ref.shortName)"), error)
+                }
+            }
+        }
+        ask(request)
+    }
+
+    private func restoreTag(_ info: GitTagInfo, in project: Project) {
+        runActivity(L("Restoring tag \(info.name)…", "正在恢复标签 \(info.name)…"), in: project) { [weak self] in
+            do {
+                try await Git.restoreTag(info, in: project.url)
+                guard let self else { return }
+                self.afterBranchesChanged(project)
+                self.showToast(L("Restored tag \(info.name)", "已恢复标签 \(info.name)"))
+            } catch {
+                self?.afterBranchesChanged(project)
+                self?.showFailure(L("Could not restore tag \(info.name)", "无法恢复标签 \(info.name)"), error)
+            }
+        }
+    }
+
+    private func syncTagSelectionAfterRename(_ oldName: String, to newName: String, in project: Project) {
+        let oldRef = "refs/tags/\(oldName)"
+        let newRef = "refs/tags/\(newName)"
+        if project.logRef == oldRef { project.logRef = newRef }
+        if gitGraph.projectID == project.id, gitGraph.scope == .ref(oldRef) {
+            gitGraph.scope = .ref(newRef)
+            gitGraph.selectedBranchID = "ref:" + newRef
+        }
+    }
+
+    private func syncTagSelectionAfterDelete(_ name: String, in project: Project) {
+        let deletedRef = "refs/tags/\(name)"
+        if project.logRef == deletedRef { project.logRef = nil }
+        if gitGraph.projectID == project.id, gitGraph.scope == .ref(deletedRef) {
+            gitGraph.scope = .all
+            gitGraph.selectedBranchID = "scope:all"
+        }
+    }
+}

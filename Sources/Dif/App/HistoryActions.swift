@@ -260,7 +260,7 @@ extension AppStore {
     }
 
     func showCompared(_ change: FileChange, with comparison: Comparison, in project: Project) {
-        let request = project.request(compared: change, with: comparison, ignoreWhitespace: settings.ignoreWhitespace)
+        let request = resolvedRequest(project.request(compared: change, with: comparison, ignoreWhitespace: settings.ignoreWhitespace))
         if request == viewer.request {
             viewer.reloadIfStale(base: comparison.base)
         } else {

@@ -760,3 +760,158 @@ extension Git {
                        text: String(decoding: textData, as: UTF8.self))
     }
 }
+
+// MARK: - Tags
+
+/// Metadata for a local Git tag, capturing enough detail to rename or restore both lightweight and annotated tags.
+struct GitTagInfo: Equatable, Sendable {
+    var name: String
+    /// Peeled target object hash (usually a commit SHA).
+    var target: String
+    /// True for an annotated tag object (`objecttype == "tag"`), false for a lightweight tag.
+    var isAnnotated: Bool
+    /// Raw annotation message for annotated tags; nil for lightweight tags.
+    var message: String?
+    var taggerName: String?
+    var taggerEmail: String?
+    var taggerDate: String?
+}
+
+extension Git {
+    /// Why `name` cannot be used as a tag name, or nil when valid. Mirrors `git check-ref-format refs/tags/<name>`.
+    static func tagNameProblem(_ name: String, existing: Set<String>) -> String? {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return L("Type a name", "请输入名称") }
+        if existing.contains(trimmed) { return L("A tag named “\(trimmed)” already exists", "已有名为“\(trimmed)”的标签") }
+        let components = trimmed.split(separator: "/", omittingEmptySubsequences: false)
+        let bad = trimmed.hasPrefix("-") || trimmed.hasPrefix("/") || trimmed.hasSuffix("/") || trimmed.hasSuffix(".")
+            || trimmed.hasSuffix(".lock") || trimmed.contains("..") || trimmed.contains("//") || trimmed.contains("@{")
+            || trimmed == "@" || trimmed == "HEAD"
+            || components.contains { $0.isEmpty || $0.hasPrefix(".") || $0.hasSuffix(".lock") }
+            || trimmed.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7F || " ~^:?*[\\".unicodeScalars.contains($0) }
+        return bad ? L("Not a valid tag name", "不是有效的标签名") : nil
+    }
+
+    /// Reads whether a local tag exists.
+    static func tagExists(_ name: String, in dir: URL) async -> Bool {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("-") else { return false }
+        return (try? await run(["rev-parse", "--verify", "--quiet", "refs/tags/\(trimmed)"], in: dir)) != nil
+    }
+
+    /// Inspects a local tag (lightweight or annotated), including its peeled target commit and annotation metadata.
+    static func tagInfo(_ name: String, in dir: URL) async throws -> GitTagInfo {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("-") else {
+            throw WorkingTree.Failure(message: L("Not a valid tag name.", "不是有效的标签名。"))
+        }
+        let fullRef = "refs/tags/\(trimmed)"
+        let format = "%(refname)%1f%(objecttype)%1f%(objectname)%1f%(*objectname)%1f%(taggername)%1f%(taggeremail)%1f%(taggerdate:raw)%1f%(contents)%00"
+        let data = try await run(["for-each-ref", "--format=\(format)", fullRef], in: dir)
+        for record in data.split(separator: 0, omittingEmptySubsequences: true) {
+            let fields = record.split(separator: 0x1f, maxSplits: 7, omittingEmptySubsequences: false).map {
+                String(decoding: $0, as: UTF8.self)
+            }
+            guard fields.count == 8 else { continue }
+            let refName = fields[0].trimmingCharacters(in: .whitespacesAndNewlines)
+            guard refName == fullRef else { continue }
+            let objectType = fields[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            let objectHash = fields[2].trimmingCharacters(in: .whitespacesAndNewlines)
+            let peeledHash = fields[3].trimmingCharacters(in: .whitespacesAndNewlines)
+            let target = peeledHash.isEmpty ? objectHash : peeledHash
+            if objectType == "tag" {
+                let taggerName = fields[4].trimmingCharacters(in: .whitespacesAndNewlines)
+                var taggerEmail = fields[5].trimmingCharacters(in: .whitespacesAndNewlines)
+                if taggerEmail.hasPrefix("<") { taggerEmail.removeFirst() }
+                if taggerEmail.hasSuffix(">") { taggerEmail.removeLast() }
+                let taggerDate = fields[6].trimmingCharacters(in: .whitespacesAndNewlines)
+                return GitTagInfo(
+                    name: trimmed,
+                    target: target,
+                    isAnnotated: true,
+                    message: fields[7],
+                    taggerName: taggerName.isEmpty ? nil : taggerName,
+                    taggerEmail: taggerEmail.isEmpty ? nil : taggerEmail,
+                    taggerDate: taggerDate.isEmpty ? nil : taggerDate
+                )
+            }
+            return GitTagInfo(name: trimmed, target: target, isAnnotated: false)
+        }
+        throw WorkingTree.Failure(message: L("Tag “\(trimmed)” does not exist.", "标签“\(trimmed)”不存在。"))
+    }
+
+    /// Creates a local tag at `target` (default `HEAD`). A non-empty `message` creates an annotated tag;
+    /// nil or whitespace-only creates a lightweight tag.
+    static func createTag(_ name: String, at target: String = "HEAD", message: String? = nil, in dir: URL) async throws {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        if let problem = tagNameProblem(trimmed, existing: []) {
+            throw WorkingTree.Failure(message: problem)
+        }
+        if await tagExists(trimmed, in: dir) {
+            throw WorkingTree.Failure(message: L("A tag named “\(trimmed)” already exists", "已有名为“\(trimmed)”的标签"))
+        }
+        let trimmedTarget = target.trimmingCharacters(in: .whitespaces)
+        let rev = trimmedTarget.isEmpty ? "HEAD" : trimmedTarget
+        guard !rev.hasPrefix("-") else {
+            throw WorkingTree.Failure(message: L("Invalid tag target.", "无效的标签目标。"))
+        }
+        let note = message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if note.isEmpty {
+            _ = try await run(["tag", trimmed, rev], in: dir)
+        } else {
+            _ = try await run(["tag", "-a", "--cleanup=verbatim", trimmed, "-m", note, rev], in: dir)
+        }
+    }
+
+    /// Deletes a local tag.
+    static func deleteTag(_ name: String, in dir: URL) async throws {
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty, !trimmed.hasPrefix("-") else {
+            throw WorkingTree.Failure(message: L("Not a valid tag name.", "不是有效的标签名。"))
+        }
+        _ = try await run(["tag", "-d", trimmed], in: dir)
+    }
+
+    /// Restores a deleted local tag (lightweight or annotated, preserving message and tagger metadata).
+    static func restoreTag(_ info: GitTagInfo, in dir: URL) async throws {
+        if let problem = tagNameProblem(info.name, existing: []) {
+            throw WorkingTree.Failure(message: problem)
+        }
+        if await tagExists(info.name, in: dir) {
+            throw WorkingTree.Failure(message: L("A tag named “\(info.name)” already exists", "已有名为“\(info.name)”的标签"))
+        }
+        if info.isAnnotated {
+            var env: [String: String] = [:]
+            if let taggerName = info.taggerName, !taggerName.isEmpty { env["GIT_COMMITTER_NAME"] = taggerName }
+            if let taggerEmail = info.taggerEmail, !taggerEmail.isEmpty { env["GIT_COMMITTER_EMAIL"] = taggerEmail }
+            if let taggerDate = info.taggerDate, !taggerDate.isEmpty { env["GIT_COMMITTER_DATE"] = taggerDate }
+            _ = try await run(["tag", "-a", "--cleanup=verbatim", info.name, "-m", info.message ?? "", info.target],
+                              in: dir, environment: env)
+        } else {
+            _ = try await run(["tag", info.name, info.target], in: dir)
+        }
+    }
+
+    /// Renames a local tag by creating the new tag first (preserving lightweight vs annotated type, message,
+    /// and tagger metadata) and deleting the old tag only after creation succeeds.
+    static func renameTag(_ oldName: String, to newName: String, in dir: URL) async throws {
+        let oldTrimmed = oldName.trimmingCharacters(in: .whitespaces)
+        let newTrimmed = newName.trimmingCharacters(in: .whitespaces)
+        guard !oldTrimmed.isEmpty, !oldTrimmed.hasPrefix("-") else {
+            throw WorkingTree.Failure(message: L("Not a valid tag name.", "不是有效的标签名。"))
+        }
+        if let problem = tagNameProblem(newTrimmed, existing: []) {
+            throw WorkingTree.Failure(message: problem)
+        }
+        if oldTrimmed == newTrimmed {
+            throw WorkingTree.Failure(message: L("Enter a different tag name", "请输入不同的标签名"))
+        }
+        if await tagExists(newTrimmed, in: dir) {
+            throw WorkingTree.Failure(message: L("A tag named “\(newTrimmed)” already exists", "已有名为“\(newTrimmed)”的标签"))
+        }
+        var info = try await tagInfo(oldTrimmed, in: dir)
+        info.name = newTrimmed
+        try await restoreTag(info, in: dir)
+        try await deleteTag(oldTrimmed, in: dir)
+    }
+}

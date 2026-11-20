@@ -110,6 +110,12 @@ struct DialogView: View {
                     .padding(.top, 14)
             }
 
+            if let tagForm = request.tagForm {
+                TagFormView(form: tagForm)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 14)
+            }
+
             if let option = request.option {
                 Toggle(isOn: Binding(get: { option.isOn }, set: { _ in store.toggleDialogOption() })) {
                     Text(option.title)
@@ -147,7 +153,7 @@ struct DialogView: View {
                 }
                 let inputBlocked = request.input.map { $0.problem(text.trimmingCharacters(in: .whitespaces)) != nil } ?? false
                 let optionBlocked = request.option.map { $0.required && !$0.isOn } ?? false
-                let formBlocked = request.worktreeForm?.problem != nil
+                let formBlocked = request.worktreeForm?.problem != nil || request.tagForm?.problem != nil
                 let blocked = inputBlocked || optionBlocked || formBlocked
                 let destructive = request.style == .destructive
                     || (request.choices.indices.contains(request.choice) && request.choices[request.choice].destructive)
@@ -413,6 +419,65 @@ private struct WorktreeFormView: View {
         .onAppear {
             guard form.mode == .newBranch else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { branchFocused = true }
+        }
+    }
+
+    private func fieldLabel(_ text: String) -> some View {
+        Text(text)
+            .font(.ui(size: 11.5, weight: .medium))
+            .foregroundStyle(Color.difText2)
+    }
+}
+
+private struct TagFormView: View {
+    @Bindable var form: TagDialogForm
+    @Environment(AppStore.self) private var store
+    @FocusState private var nameFocused: Bool
+    @FocusState private var messageFocused: Bool
+
+    var body: some View {
+        let nameError = form.name.isEmpty ? nil : form.problem
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 5) {
+                fieldLabel(L("Tag name", "标签名"))
+                TextField(L("e.g. v1.0.0", "例如 v1.0.0"), text: $form.name)
+                    .textFieldStyle(.plain)
+                    .font(.ui(size: 13))
+                    .padding(.horizontal, 10)
+                    .frame(height: UI.s(30))
+                    .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.difChip))
+                    .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .strokeBorder(nameError != nil ? Color.difRemoved.opacity(0.8)
+                                                       : Color.difAccent.opacity(nameFocused ? 0.7 : 0),
+                                      lineWidth: 1.5))
+                    .focused($nameFocused)
+                    .onSubmit { store.answerDialog(confirmed: true) }
+                    .onExitCommand { store.answerDialog(confirmed: false) }
+                Text(nameError ?? " ")
+                    .font(.ui(size: 11))
+                    .foregroundStyle(Color.difRemoved)
+                    .lineLimit(1)
+            }
+
+            VStack(alignment: .leading, spacing: 5) {
+                fieldLabel(L("Message (optional)", "附注消息（可选）"))
+                TextField(L("Leave empty for a lightweight tag", "留空则创建轻量标签"),
+                          text: $form.message, axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .font(.ui(size: 12.5))
+                    .lineLimit(2...4)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 7)
+                    .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.difChip))
+                    .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .strokeBorder(Color.difAccent.opacity(messageFocused ? 0.7 : 0), lineWidth: 1.5))
+                    .focused($messageFocused)
+                    .onSubmit { store.answerDialog(confirmed: true) }
+                    .onExitCommand { store.answerDialog(confirmed: false) }
+            }
+        }
+        .onAppear {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { nameFocused = true }
         }
     }
 

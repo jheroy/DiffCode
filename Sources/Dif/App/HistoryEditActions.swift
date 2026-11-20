@@ -569,7 +569,9 @@ extension AppStore {
             menu.addItem(delete)
             menu.addItem(.separator())
         case .tag:
-            break
+            menu.addItem(ClosureMenuItem(L("Rename…", "重命名…")) { [weak self] in self?.renameTag(ref, in: project) })
+            menu.addItem(ClosureMenuItem(L("Delete…", "删除…")) { [weak self] in self?.deleteTag(ref, in: project) })
+            menu.addItem(.separator())
         }
     }
 }

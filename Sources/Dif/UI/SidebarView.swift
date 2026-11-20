@@ -75,6 +75,7 @@ struct SidebarView: View {
                 SectionLabel(text: L("Projects", "项目"))
                 Spacer()
                 IconButton(symbol: "plus", help: L("Add Project (⌘N)", "添加项目 (⌘N)"), size: 12) { store.presentAddProject() }
+                    .titlebarClickGuard(horizontalOutset: 4)
             }
             .padding(.leading, 16)
             .padding(.trailing, 8)

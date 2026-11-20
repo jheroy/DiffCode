@@ -164,7 +164,7 @@ private struct BranchList: View {
                          onClick: { row in if !row.isSelectable { model.pick(row) } },
                          canSelect: { $0.isSelectable },
                          menu: { row in model.branchMenu(for: row) }) { row, _, _ in
-                BranchRowView(row: row)
+                BranchRowView(row: row, projectID: model.projectID)
             }
         }
     }
@@ -172,6 +172,9 @@ private struct BranchList: View {
 
 private struct BranchRowView: View {
     var row: GitGraphModel.BranchRow
+    var projectID: UUID?
+    @Environment(AppStore.self) private var store
+    @State private var hovering = false
 
     var body: some View {
         HStack(spacing: 6) {
@@ -207,14 +210,28 @@ private struct BranchRowView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 4)
-                if ref.ahead > 0 { Text("↑\(ref.ahead)").font(.ui(size: 10.5, weight: .medium)).foregroundStyle(Color.difText2) }
-                if ref.behind > 0 { Text("↓\(ref.behind)").font(.ui(size: 10.5, weight: .medium)).foregroundStyle(Color.difText2) }
-                if ref.upstreamGone {
-                    Image(systemName: "cloud.slash").font(.ui(size: 10)).foregroundStyle(Color.difText3)
+                if ref.kind == .tag, hovering, let project = projectID.flatMap({ store.project($0) }) {
+                    HStack(spacing: 2) {
+                        TagRowActionButton(symbol: "pencil", help: L("Rename Tag…", "重命名标签…")) {
+                            store.renameTag(ref, in: project)
+                        }
+                        TagRowActionButton(symbol: "trash", help: L("Delete Tag…", "删除标签…"), destructive: true) {
+                            store.deleteTag(ref, in: project)
+                        }
+                    }
+                } else {
+                    if ref.ahead > 0 { Text("↑\(ref.ahead)").font(.ui(size: 10.5, weight: .medium)).foregroundStyle(Color.difText2) }
+                    if ref.behind > 0 { Text("↓\(ref.behind)").font(.ui(size: 10.5, weight: .medium)).foregroundStyle(Color.difText2) }
+                    if ref.upstreamGone {
+                        Image(systemName: "cloud.slash").font(.ui(size: 10)).foregroundStyle(Color.difText3)
+                    }
                 }
             }
         }
         .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
         .help(help)
     }
 
@@ -234,6 +251,31 @@ private struct BranchRowView: View {
             lines.append(ref.upstreamGone ? L("Upstream \(upstream) is gone", "上游 \(upstream) 已不存在") : L("Tracking \(upstream)", "跟踪 \(upstream)"))
         }
         return lines.joined(separator: "\n")
+    }
+}
+
+private struct TagRowActionButton: View {
+    var symbol: String
+    var help: String
+    var destructive = false
+    var action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.ui(size: 10, weight: .medium))
+                .foregroundStyle(hovering ? (destructive ? Color.difRemoved : Color.difText) : Color.difText2)
+                .frame(width: UI.s(18), height: UI.s(18))
+                .background(
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(hovering ? Color.difText.opacity(0.12) : Color.clear)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help(help)
     }
 }
 

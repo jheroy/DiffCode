@@ -128,6 +128,26 @@ final class WorktreeDialogForm {
     }
 }
 
+/// Live form state for the New Tag dialog, rendered inside `DialogView`.
+@MainActor
+@Observable
+final class TagDialogForm {
+    let targetLabel: String
+    let existingTagNames: Set<String>
+
+    var name = ""
+    var message = ""
+
+    init(targetLabel: String, existingTagNames: Set<String>) {
+        self.targetLabel = targetLabel
+        self.existingTagNames = existingTagNames
+    }
+
+    var trimmedName: String { name.trimmingCharacters(in: .whitespaces) }
+    var trimmedMessage: String { message.trimmingCharacters(in: .whitespacesAndNewlines) }
+    var problem: String? { Git.tagNameProblem(name, existing: existingTagNames) }
+}
+
 /// A question or a notice shown inside the window, in DiffCode's own style, instead of a system alert.
 struct DialogRequest {
     enum Style {
@@ -184,6 +204,8 @@ struct DialogRequest {
     var option: Option?
     /// Rich form for creating a linked Git work tree.
     var worktreeForm: WorktreeDialogForm?
+    /// Rich form for creating a Git tag (name + optional annotation message).
+    var tagForm: TagDialogForm?
     /// Called on confirm with everything that was answered, in place of `onConfirm` and `onSubmit`.
     var onAnswer: ((Answer) -> Void)?
 
@@ -241,6 +263,7 @@ extension AppStore {
             }
             if let option = request.option, option.required, !option.isOn { return }
             if let form = request.worktreeForm, form.problem != nil { return }
+            if let tagForm = request.tagForm, tagForm.problem != nil { return }
         }
         dialog = nil
         dismissPopup()
