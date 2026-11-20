@@ -282,48 +282,35 @@ private struct ViewerHeader: View {
                         } else if viewer.isTextDocument {
                             Divider().frame(height: 14)
                         }
-                        IconButton(symbol: "rectangle.split.1x2",
-                                   help: L("Toggle inline line diff", "显示/隐藏底部行内对比"),
-                                   isActive: store.settings.showLineDiffBar) {
-                            store.settings.showLineDiffBar.toggle()
-                            store.settings.save()
-                            if store.settings.showLineDiffBar {
-                                viewer.refreshLineDiff()
+                        if viewer.isTextDocument {
+                            let available = viewer.annotating || viewer.canAnnotate
+                            IconButton(symbol: "person.text.rectangle", help: L("Annotate with Git Blame", "逐行追溯 (Blame)：每行最后由谁在何时修改"),
+                                       isActive: viewer.annotating, size: 12.5) {
+                                viewer.toggleAnnotate()
+                            }
+                            .disabled(!available)
+                            .opacity(available ? 1 : 0.35)
+                            .overlay(alignment: .bottomTrailing) {
+                                if viewer.isBlaming {
+                                    ProgressView().controlSize(.mini).scaleEffect(0.5).offset(x: 3, y: 3).allowsHitTesting(false)
+                                }
                             }
                         }
-                    }
-                    IconButton(symbol: "space", help: L("Ignore Whitespace (⌥⌘W)", "忽略空白差异 (⌥⌘W)"), isActive: store.settings.ignoreWhitespace) {
-                        viewer.toggleWhitespace()
-                    }
-                    Divider().frame(height: 14)
-                } else if viewer.isTextDocument {
-                    Divider().frame(height: 14)
-                }
-                if viewer.isTextDocument {
-                    let available = viewer.annotating || viewer.canAnnotate
-                    IconButton(symbol: "person.text.rectangle", help: L("Annotate with Git Blame", "逐行追溯 (Blame)：每行最后由谁在何时修改"),
-                               isActive: viewer.annotating, size: 12.5) {
-                        viewer.toggleAnnotate()
-                    }
-                    .disabled(!available)
-                    .opacity(available ? 1 : 0.35)
-                    .overlay(alignment: .bottomTrailing) {
-                        if viewer.isBlaming {
-                            ProgressView().controlSize(.mini).scaleEffect(0.5).offset(x: 3, y: 3).allowsHitTesting(false)
+                        if !viewer.isSpreadsheet {
+                            IconButton(symbol: "magnifyingglass", help: L("Find in File (⌃⇧⌘F)", "在文件中查找 (⌃⇧⌘F)"), isActive: viewer.findVisible) {
+                                if viewer.findVisible { viewer.hideFind() } else { viewer.showFind() }
+                            }
+                        }
+                        if AppEnvironment.hasTerminal {
+                            Divider().frame(height: 14)
                         }
                     }
-                }
-                if !viewer.isSpreadsheet {
-                    IconButton(symbol: "magnifyingglass", help: L("Find in File (⌃⇧⌘F)", "在文件中查找 (⌃⇧⌘F)"), isActive: viewer.findVisible) {
-                        if viewer.findVisible { viewer.hideFind() } else { viewer.showFind() }
+                    if AppEnvironment.hasTerminal {
+                        TerminalToggle(project: project)
                     }
                 }
-                if AppEnvironment.hasTerminal {
-                    Divider().frame(height: 14)
-                }
-            }
-            if AppEnvironment.hasTerminal {
-                TerminalToggle(project: project)
+                .frame(maxHeight: .infinity)
+                .titlebarClickGuard(horizontalOutset: 4)
             }
         }
         .padding(.leading, leadingInset)
@@ -534,6 +521,20 @@ private struct ViewerEmptyState: View {
                         .font(.ui(size: 15, weight: .medium))
                         .foregroundStyle(Color.difText2)
                 }
+            } else if project.tab == .groups {
+                VStack(spacing: 8) {
+                    Image(systemName: "square.stack.3d.up")
+                        .font(.ui(size: 32))
+                        .foregroundStyle(Color.difAccent.opacity(0.8))
+                    Text(L("Select a file or hunk in a group", "在左侧点击分组内的文件或改动块查看代码"))
+                        .font(.ui(size: 14, weight: .medium))
+                        .foregroundStyle(Color.difText2)
+                    Text(L("Only hunks belonging to the selected group are shown in the diff.", "右侧仅显示当前选中分组的改动，其他改动自动隐藏。"))
+                        .font(.ui(size: 12))
+                        .foregroundStyle(Color.difText3)
+                        .multilineTextAlignment(.center)
+                }
+                .padding(.horizontal, 24)
             }
             Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 9) {
                 ForEach(hints, id: \.0) { hint in
@@ -721,5 +722,354 @@ private struct VimStatusBar: View {
         .frame(height: UI.s(22))
         .background(Color.difPanel)
         .overlay(alignment: .top) { Rectangle().fill(Color.difHairline).frame(height: 1) }
+    }
+}
+
+// MARK: - SemanticDiff toolbar menu & status strip
+
+/// Compact menu in `ViewerHeader` exposing all Stage 1 SemanticDiff toggles and fold actions.
+private struct SemanticOptionsMenu: View {
+    let viewer: ViewerModel
+    @Environment(AppStore.self) private var store
+    @State private var hovered = false
+
+    private var hasActiveFilter: Bool {
+        store.settings.ignoreComments
+            || (viewer.isJSONDocument && store.settings.normalizeJSON)
+            || store.settings.collapseUnchanged
+    }
+
+    var body: some View {
+        Menu {
+            Toggle(L("Ignore Comment Changes", "忽略注释变更"), isOn: Binding(
+                get: { store.settings.ignoreComments },
+                set: { _ in viewer.toggleIgnoreComments() }
+            ))
+            Toggle(L("Collapse Unchanged Lines", "折叠未变更行"), isOn: Binding(
+                get: { store.settings.collapseUnchanged },
+                set: { _ in viewer.toggleCollapseUnchanged() }
+            ))
+            Toggle(L("Detect Moved Code Blocks", "检测移动代码块"), isOn: Binding(
+                get: { store.settings.detectMoves },
+                set: { _ in viewer.toggleDetectMoves() }
+            ))
+            Toggle(L("Highlight Cross-Hunk Renames", "高亮跨区块重命名"), isOn: Binding(
+                get: { store.settings.detectRenames },
+                set: { _ in viewer.toggleDetectRenames() }
+            ))
+            if viewer.isJSONDocument {
+                Divider()
+                Toggle(L("Normalize JSON Structure (Read-Only)", "JSON 语义规范化（只读）"), isOn: Binding(
+                    get: { store.settings.normalizeJSON },
+                    set: { _ in viewer.toggleNormalizeJSON() }
+                ))
+            }
+            if viewer.activeFoldRegionCount > 0 || !viewer.expandedFoldSegments.isEmpty {
+                Divider()
+                Button(L("Expand All Folds", "展开全部折叠")) {
+                    viewer.expandAllFolds()
+                }
+                .disabled(viewer.activeFoldRegionCount == 0)
+                Button(L("Collapse All Unchanged", "重新折叠未变更行")) {
+                    viewer.collapseAllFolds()
+                }
+                .disabled(!viewer.canCollapseUnchanged || viewer.expandedFoldSegments.isEmpty)
+            }
+        } label: {
+            Image(systemName: "slider.horizontal.3")
+                .font(.system(size: 12 * UI.scale, weight: .medium))
+                .foregroundStyle(hasActiveFilter ? Color.difAccent : (hovered ? Color.difText : Color.difText2))
+                .frame(width: UI.s(26), height: UI.s(24))
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(hasActiveFilter ? Color.difAccent.opacity(0.14) : (hovered ? Color.difHover : Color.clear))
+                )
+                .overlay(alignment: .topTrailing) {
+                    if hasActiveFilter {
+                        Circle()
+                            .fill(Color.difAccent)
+                            .frame(width: 5, height: 5)
+                            .offset(x: -3, y: 3)
+                            .allowsHitTesting(false)
+                    }
+                }
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .onHover { hovered = $0 }
+        .help(L("Semantic Diff Options", "语义 Diff 选项"))
+    }
+}
+
+/// Slim status bar shown above the canvas only when SemanticDiff metadata or changed symbols are present.
+private struct SemanticStatusBar: View {
+    let viewer: ViewerModel
+    let doc: DiffDocument
+    @Environment(AppStore.self) private var store
+    @State private var showRenamePopover = false
+
+    private var hasItems: Bool {
+        doc.isGroupFiltered
+            || doc.hiddenCommentHunkCount > 0
+            || doc.isJSONNormalized
+            || viewer.movedPairCount > 0
+            || !doc.renameGroups.isEmpty
+            || viewer.hiddenFoldLineCount > 0
+            || !viewer.changedSymbols.isEmpty
+    }
+
+    var body: some View {
+        let _ = viewer.diffRevision
+        if hasItems {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    if doc.isGroupFiltered {
+                        HStack(spacing: 4) {
+                            Image(systemName: "square.stack.3d.up")
+                                .font(.system(size: 9.5 * UI.scale, weight: .semibold))
+                            Text(L("Group view (current group only · read-only)", "分组视图（仅显示本组改动 · 只读）"))
+                                .font(.ui(size: 10.5, weight: .medium))
+                                .lineLimit(1)
+                        }
+                        .foregroundStyle(Color.difAccent)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 2.5)
+                        .background(Capsule().fill(Color.difAccent.opacity(0.10)))
+                        .overlay(Capsule().strokeBorder(Color.difAccent.opacity(0.28), lineWidth: 0.75))
+                        .fixedSize()
+                        .help(L("Showing only changes belonging to the selected AI group", "当前仅展示所选 AI 分组的改动，其他改动已完全隐藏"))
+                    }
+
+                    if doc.hiddenCommentHunkCount > 0 {
+                        let count = doc.hiddenCommentHunkCount
+                        SemanticPill(
+                            symbol: "text.bubble",
+                            label: count == 1
+                                ? L("1 comment change hidden", "已隐藏 1 处注释变更")
+                                : L("\(count) comment changes hidden", "已隐藏 \(count) 处注释变更"),
+                            tint: Color.difAccent,
+                            bg: Color.difAccent.opacity(0.10),
+                            border: Color.difAccent.opacity(0.28),
+                            help: L("Click to show comment changes", "点击取消隐藏，显示注释变更")
+                        ) {
+                            viewer.toggleIgnoreComments()
+                        }
+                    }
+
+                    if doc.isJSONNormalized {
+                        SemanticPill(
+                            symbol: "curlybraces",
+                            label: L("JSON Normalized (Read-Only)", "JSON 已规范化（只读）"),
+                            tint: Color.difAccent,
+                            bg: Color.difAccent.opacity(0.10),
+                            border: Color.difAccent.opacity(0.28),
+                            help: L("Click to return to raw editable JSON", "点击关闭规范化，恢复原始可编辑 JSON")
+                        ) {
+                            viewer.toggleNormalizeJSON()
+                        }
+                    }
+
+                    if viewer.movedPairCount > 0 {
+                        let count = viewer.movedPairCount
+                        SemanticPill(
+                            symbol: "arrow.left.arrow.right",
+                            label: count == 1
+                                ? L("1 moved block", "检测到 1 处移动")
+                                : L("\(count) moved blocks", "检测到 \(count) 处移动"),
+                            tint: Color.difMovedAccent,
+                            bg: Color.difMovedBg,
+                            border: Color.difMovedBorder.opacity(0.65),
+                            help: L("Click to jump between moved blocks", "点击在移动代码块之间跳转")
+                        ) {
+                            viewer.stepMovedHunk()
+                        }
+                    }
+
+                    if !doc.renameGroups.isEmpty {
+                        let count = doc.renameGroups.count
+                        SemanticPill(
+                            symbol: "tag",
+                            label: count == 1
+                                ? L("1 rename group", "1 组重命名")
+                                : L("\(count) rename groups", "\(count) 组重命名"),
+                            tint: Color.difRenameAccent(at: doc.renameGroups[0].colorIndex),
+                            bg: Color.difRenameAccent(at: doc.renameGroups[0].colorIndex).opacity(0.12),
+                            border: Color.difRenameAccent(at: doc.renameGroups[0].colorIndex).opacity(0.35),
+                            help: L("Inspect and jump to cross-hunk identifier renames", "查看并跳转到跨区块标识符重命名")
+                        ) {
+                            showRenamePopover.toggle()
+                        }
+                        .popover(isPresented: $showRenamePopover, arrowEdge: .bottom) {
+                            RenameGroupsPopover(groups: doc.renameGroups) { group in
+                                showRenamePopover = false
+                                viewer.jumpToRenameGroup(group)
+                            }
+                        }
+                    }
+
+                    if viewer.hiddenFoldLineCount > 0 {
+                        let hidden = viewer.hiddenFoldLineCount
+                        SemanticPill(
+                            symbol: "rectangle.expand.vertical",
+                            label: L("\(hidden) lines folded · Expand", "已折叠 \(hidden) 行 · 展开"),
+                            tint: Color.difFoldText,
+                            bg: Color.difFoldBg,
+                            border: Color.difHairline,
+                            help: L("Expand all collapsed unchanged sections", "展开全部折叠的未变更代码段")
+                        ) {
+                            viewer.expandAllFolds()
+                        }
+                    }
+
+                    if !viewer.changedSymbols.isEmpty {
+                        ChangedSymbolsMenu(symbols: viewer.changedSymbols) { item in
+                            viewer.jumpToChangedSymbol(item)
+                        } onShowAll: {
+                            store.showFileSymbols()
+                        }
+                    }
+                }
+                .padding(.horizontal, 10)
+            }
+            .frame(height: UI.s(26))
+            .background(Color.difPanel.opacity(0.65))
+            .overlay(alignment: .bottom) { Rectangle().fill(Color.difHairline.opacity(0.75)).frame(height: 1) }
+        }
+    }
+}
+
+private struct SemanticPill: View {
+    var symbol: String
+    var label: String
+    var tint: Color
+    var bg: Color
+    var border: Color
+    var help: String
+    var action: () -> Void
+    @State private var hovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: symbol)
+                    .font(.system(size: 9.5 * UI.scale, weight: .semibold))
+                Text(label)
+                    .font(.ui(size: 10.5, weight: .medium))
+                    .lineLimit(1)
+            }
+            .foregroundStyle(tint)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2.5)
+            .background(Capsule().fill(hovered ? tint.opacity(0.18) : bg))
+            .overlay(Capsule().strokeBorder(border, lineWidth: 0.75))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+        .onHover { hovered = $0 }
+        .help(help)
+    }
+}
+
+private struct RenameGroupsPopover: View {
+    let groups: [RenameGroup]
+    let onSelect: (RenameGroup) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(L("Detected Cross-Hunk Renames", "检测到的跨区块重命名"))
+                .font(.ui(size: 11.5, weight: .semibold))
+                .foregroundStyle(Color.difText2)
+                .padding(.horizontal, 4)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(groups) { group in
+                        Button {
+                            onSelect(group)
+                        } label: {
+                            HStack(spacing: 7) {
+                                Circle()
+                                    .fill(Color.difRenameAccent(at: group.colorIndex))
+                                    .frame(width: 7, height: 7)
+                                Text(group.oldName)
+                                    .font(.code(11))
+                                    .foregroundStyle(Color.difText2)
+                                    .lineLimit(1)
+                                Image(systemName: "arrow.right")
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundStyle(Color.difText3)
+                                Text(group.newName)
+                                    .font(.code(11, weight: .semibold))
+                                    .foregroundStyle(Color.difText)
+                                    .lineLimit(1)
+                                Spacer(minLength: 8)
+                                Text("×\(group.occurrenceCount)")
+                                    .font(.ui(size: 10, weight: .medium, design: .rounded))
+                                    .foregroundStyle(Color.difRenameAccent(at: group.colorIndex))
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(Capsule().fill(Color.difRenameAccent(at: group.colorIndex).opacity(0.14)))
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.difHover))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .frame(maxHeight: 240)
+        }
+        .padding(10)
+        .frame(minWidth: 260, maxWidth: 380)
+    }
+}
+
+private struct ChangedSymbolsMenu: View {
+    let symbols: [ChangedFileSymbol]
+    let onSelect: (ChangedFileSymbol) -> Void
+    let onShowAll: () -> Void
+    @State private var hovered = false
+
+    var body: some View {
+        let count = symbols.count
+        Menu {
+            ForEach(symbols.prefix(40)) { item in
+                Button {
+                    onSelect(item)
+                } label: {
+                    let hunks = item.hunkIndices.count
+                    let suffix = hunks == 1 ? L("1 change", "1 处改动") : L("\(hunks) changes", "\(hunks) 处改动")
+                    Text("\(item.symbol.name)  ·  L\(item.symbol.lineNumber) (\(suffix))")
+                }
+            }
+            Divider()
+            Button(L("All File Symbols… (⌘R)", "全部文件符号… (⌘R)")) {
+                onShowAll()
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "function")
+                    .font(.system(size: 9.5 * UI.scale, weight: .semibold))
+                Text(count == 1 ? L("1 changed symbol", "1 个变更符号") : L("\(count) changed symbols", "\(count) 个变更符号"))
+                    .font(.ui(size: 10.5, weight: .medium))
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8 * UI.scale, weight: .semibold))
+            }
+            .foregroundStyle(Color.difText2)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 2.5)
+            .background(Capsule().fill(hovered ? Color.difHover : Color.difChip))
+            .overlay(Capsule().strokeBorder(Color.difHairline, lineWidth: 0.75))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .onHover { hovered = $0 }
+        .help(L("Jump to symbols modified in this diff", "跳转到本次变更涉及的符号"))
     }
 }

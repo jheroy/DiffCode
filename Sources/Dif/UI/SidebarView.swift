@@ -315,6 +315,7 @@ private struct ProjectRow: View {
         .contextMenu {
             if !project.needsAccess, !store.gitMissing {
                 Button(L("New Branch…", "新建分支…")) { store.newBranch(in: project) }
+                Button(L("New Tag…", "新建标签…")) { store.newTag(in: project) }
                 Button(L("New Worktree…", "新建工作树…")) { store.presentNewWorktree(for: project) }
                 Divider()
             }
@@ -498,6 +499,7 @@ struct WelcomeView: View {
                 .foregroundStyle(Color.difText)
             }
             .buttonStyle(.plain)
+            .titlebarClickGuard()
             Text(L("…or drop folders anywhere in this window", "…或者把文件夹拖进这个窗口"))
                 .font(.ui(size: 12))
                 .foregroundStyle(Color.difText3)

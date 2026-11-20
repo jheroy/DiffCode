@@ -87,6 +87,7 @@ private struct NoticeView<Buttons: View>: View {
             }
             .frame(maxWidth: 440)
             HStack(spacing: 10) { buttons() }
+                .titlebarClickGuard()
         }
         .padding(32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)

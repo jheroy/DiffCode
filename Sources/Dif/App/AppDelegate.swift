@@ -204,9 +204,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: Window
 
     private func makeWindow() {
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1360, height: 840),
-                              styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-                              backing: .buffered, defer: false)
+        let window = TitlebarWindow(contentRect: NSRect(x: 0, y: 0, width: 1360, height: 840),
+                                    styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                                    backing: .buffered, defer: false)
         window.title = appName
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true

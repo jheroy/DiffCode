@@ -19,10 +19,172 @@ struct VisualEffect: NSViewRepresentable {
     }
 }
 
+/// Main window subclass that prevents rapid clicks on interactive title-bar controls
+/// (including gaps between buttons and buttons that just became disabled) from triggering
+/// AppKit's title-bar drag or double-click zoom/fill/minimize gestures, while keeping
+/// blank title-bar regions fully draggable and double-click zoomable.
+final class TitlebarWindow: NSWindow {
+    private let interactionGuards = NSHashTable<NSView>.weakObjects()
+    /// Whether the current press (`leftMouseDown` .. `leftMouseUp`) started inside a guard.
+    private var mouseDownInGuard = false
+    /// Whether the active multi-click sequence (`clickCount == 1, 2, ...`) started inside a guard,
+    /// so slight cursor drift on click 2 cannot turn rapid button tapping into a title-bar zoom.
+    private var clickSequenceStartedInGuard = false
+    /// True while `super.sendEvent` is dispatching an event guarded against title-bar actions.
+    private var isDispatchingGuardedEvent = false
+
+    func registerInteractionGuard(_ view: NSView) {
+        interactionGuards.add(view)
+    }
+
+    func unregisterInteractionGuard(_ view: NSView) {
+        interactionGuards.remove(view)
+    }
+
+    func isPointInInteractionGuard(_ windowPoint: NSPoint) -> Bool {
+        for view in interactionGuards.allObjects {
+            guard view.window === self,
+                  !view.isHiddenOrHasHiddenAncestor,
+                  !view.bounds.isEmpty else { continue }
+            let local = view.convert(windowPoint, from: nil)
+            // On macOS 14+, `clipsToBounds` defaults to `false`, so `visibleRect` can exceed `bounds`;
+            // require containment in both to match the view's actual visible footprint.
+            if view.bounds.contains(local) && view.visibleRect.contains(local) {
+                return true
+            }
+        }
+        return false
+    }
+
+    func shouldBlockTitlebarAction(at windowPoint: NSPoint, clickCount: Int) -> Bool {
+        if isDispatchingGuardedEvent || isPointInInteractionGuard(windowPoint) { return true }
+        return clickCount >= 2 && clickSequenceStartedInGuard
+    }
+
+    override func performDrag(with event: NSEvent) {
+        if shouldBlockTitlebarAction(at: event.locationInWindow, clickCount: event.clickCount) { return }
+        super.performDrag(with: event)
+    }
+
+    override func performZoom(_ sender: Any?) {
+        if isDispatchingGuardedEvent { return }
+        super.performZoom(sender)
+    }
+
+    override func zoom(_ sender: Any?) {
+        if isDispatchingGuardedEvent { return }
+        super.zoom(sender)
+    }
+
+    override func performMiniaturize(_ sender: Any?) {
+        if isDispatchingGuardedEvent { return }
+        super.performMiniaturize(sender)
+    }
+
+    override func sendEvent(_ event: NSEvent) {
+        let isLeftMouse = event.type == .leftMouseDown || event.type == .leftMouseUp || event.type == .leftMouseDragged
+        guard isLeftMouse else {
+            super.sendEvent(event)
+            return
+        }
+
+        let inGuard = isPointInInteractionGuard(event.locationInWindow)
+        if event.type == .leftMouseDown {
+            if event.clickCount <= 1 {
+                clickSequenceStartedInGuard = inGuard
+            } else if inGuard {
+                clickSequenceStartedInGuard = true
+            }
+            mouseDownInGuard = inGuard || (event.clickCount >= 2 && clickSequenceStartedInGuard)
+        }
+
+        let guarded = mouseDownInGuard || inGuard || (event.clickCount >= 2 && clickSequenceStartedInGuard)
+        defer {
+            if event.type == .leftMouseUp {
+                mouseDownInGuard = false
+            }
+        }
+
+        guard guarded else {
+            super.sendEvent(event)
+            return
+        }
+
+        let wasDispatching = isDispatchingGuardedEvent
+        isDispatchingGuardedEvent = true
+        var disabledRecognizers: [NSGestureRecognizer] = []
+        if let frameView = contentView?.superview {
+            disableTitlebarRecognizers(in: frameView, collecting: &disabledRecognizers)
+        }
+        defer {
+            for recognizer in disabledRecognizers {
+                recognizer.isEnabled = true
+            }
+            isDispatchingGuardedEvent = wasDispatching
+        }
+        super.sendEvent(event)
+    }
+
+    /// Temporarily disables enabled gesture recognizers on the window frame and titlebar chrome
+    /// (excluding `contentView` and its descendants) so AppKit's titlebar double-click and drag
+    /// recognizers never fire for events targeting guarded toolbar controls.
+    private func disableTitlebarRecognizers(in view: NSView, collecting disabled: inout [NSGestureRecognizer]) {
+        for recognizer in view.gestureRecognizers where recognizer.isEnabled {
+            recognizer.isEnabled = false
+            disabled.append(recognizer)
+        }
+        for subview in view.subviews where subview !== contentView {
+            disableTitlebarRecognizers(in: subview, collecting: &disabled)
+        }
+    }
+}
+
+/// Marks a region inside a custom title bar (such as a toolbar button group) as interactive so rapid
+/// clicks, clicks on gaps between buttons, or clicks on freshly disabled buttons never bubble up to
+/// AppKit's title-bar drag or double-click-to-zoom gestures.
+struct TitlebarClickGuard: NSViewRepresentable {
+    final class GuardView: NSView {
+        override var mouseDownCanMoveWindow: Bool { false }
+
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            (window as? TitlebarWindow)?.unregisterInteractionGuard(self)
+            super.viewWillMove(toWindow: newWindow)
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            (window as? TitlebarWindow)?.registerInteractionGuard(self)
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            // Absorb stray clicks inside the guarded toolbar strip instead of bubbling up to
+            // NSThemeFrame or an underlying WindowDragArea.
+        }
+    }
+
+    func makeNSView(context: Context) -> GuardView { GuardView() }
+    func updateNSView(_ view: GuardView, context: Context) {}
+}
+
+extension View {
+    /// Protects interactive controls inside a title-bar / `WindowDragArea` from accidental
+    /// window drags or double-click zoom.
+    func titlebarClickGuard(horizontalOutset: CGFloat = 0) -> some View {
+        background {
+            TitlebarClickGuard()
+                .padding(.horizontal, -horizontalOutset)
+        }
+    }
+}
+
 /// Lets a custom header act like a title bar: drag to move, double-click to zoom.
 struct WindowDragArea: NSViewRepresentable {
     final class DragView: NSView {
         override func mouseDown(with event: NSEvent) {
+            if let window = window as? TitlebarWindow,
+               window.shouldBlockTitlebarAction(at: event.locationInWindow, clickCount: event.clickCount) {
+                return
+            }
             if event.clickCount == 2 {
                 window?.performZoom(nil)
             } else {

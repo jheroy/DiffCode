@@ -722,6 +722,14 @@ struct ChangeRowView: View {
                     Text(change.directory).font(.ui(size: 11)).foregroundStyle(Color.difText3).lineLimit(1).truncationMode(.head)
                 }
                 Spacer(minLength: 4)
+                if let hunks = groupHunks, hunks.count > 1, let onSelectGroupHunk {
+                    GroupHunkBadges(
+                        hunks: hunks,
+                        activeHunk: activeGroupHunk,
+                        fileName: change.name,
+                        onSelect: onSelectGroupHunk
+                    )
+                }
                 StatBadge(additions: change.additions, deletions: change.deletions, size: 10.5)
                 Text(change.kind.letter)
                     .font(.ui(size: 10.5, weight: .bold, design: .rounded))
@@ -754,6 +762,71 @@ struct ChangeRowView: View {
             .frame(width: UI.s(12), height: UI.s(16))
             .contentShape(Rectangle())
             .onTapGesture(perform: onToggle)
+    }
+}
+
+/// Compact inline `#1` `#2` hunk jump badges shown on multi-hunk files in the Groups tab's changes list.
+private struct GroupHunkBadges: View {
+    var hunks: [Int]
+    var activeHunk: Int?
+    var fileName: String
+    var onSelect: (Int) -> Void
+
+    private static let maxInline = 3
+
+    var body: some View {
+        let inline = hunks.count <= Self.maxInline ? hunks : Array(hunks.prefix(2))
+        let overflowCount = hunks.count - inline.count
+        HStack(spacing: 3) {
+            ForEach(inline, id: \.self) { hunkIdx in
+                let isActive = activeHunk == hunkIdx
+                Text("#\(hunkIdx + 1)")
+                    .font(.ui(size: 9.5, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(isActive ? Color.white : Color.difText2)
+                    .padding(.horizontal, 4.5)
+                    .padding(.vertical, 1)
+                    .background(
+                        RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                            .fill(isActive ? Color.difAccent : Color.difChip)
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture { onSelect(hunkIdx) }
+                    .help(L("Jump to hunk #\(hunkIdx + 1) in \(fileName)",
+                            "跳转到 \(fileName) 的第 \(hunkIdx + 1) 处变更"))
+            }
+            if overflowCount > 0 {
+                let overflowActive = activeHunk.map { !inline.contains($0) } ?? false
+                Menu {
+                    ForEach(hunks, id: \.self) { hunkIdx in
+                        Button {
+                            onSelect(hunkIdx)
+                        } label: {
+                            if activeHunk == hunkIdx {
+                                Label("#\(hunkIdx + 1)", systemImage: "checkmark")
+                            } else {
+                                Text("#\(hunkIdx + 1)")
+                            }
+                        }
+                    }
+                } label: {
+                    Text("+\(overflowCount)")
+                        .font(.ui(size: 9.5, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(overflowActive ? Color.white : Color.difText3)
+                        .padding(.horizontal, 4.5)
+                        .padding(.vertical, 1)
+                        .background(
+                            RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                                .fill(overflowActive ? Color.difAccent : Color.difChip)
+                        )
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help(L("All \(hunks.count) hunks in \(fileName)",
+                        "\(fileName) 的全部 \(hunks.count) 处变更"))
+            }
+        }
+        .fixedSize()
     }
 }
 
