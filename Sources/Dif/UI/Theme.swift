@@ -116,11 +116,11 @@ struct CanvasTheme {
     /// GoLand-inspired palette for Go files, indexed by `TokenKind.rawValue` (0...25).
     let goSyntax: [TokenStyle]
     // Side-by-side follows the IntelliJ convention: blue = modified, green = inserted, grey = deleted.
-    let modified: CGColor, modifiedWord: CGColor, modifiedMark: CGColor
-    let added: CGColor, addedWord: CGColor, addedMark: CGColor
-    let deleted: CGColor, deletedWord: CGColor, deletedMark: CGColor
+    let modified: CGColor, modifiedWord: CGColor, modifiedMark: CGColor, modifiedBorder: CGColor
+    let added: CGColor, addedWord: CGColor, addedMark: CGColor, addedBorder: CGColor
+    let deleted: CGColor, deletedWord: CGColor, deletedMark: CGColor, deletedBorder: CGColor
     // Unified view uses the universal red/green.
-    let removedLine: CGColor, removedWord: CGColor
+    let removedLine: CGColor, removedWord: CGColor, removedBorder: CGColor
     let selection: CGColor
     let searchMatch: CGColor
     let searchCurrent: CGColor
@@ -265,10 +265,10 @@ struct CanvasTheme {
         gutterTextStrong: c(0xA1A5AD),
         syntax: darkSyntaxPalette,
         goSyntax: darkGoLandPalette,
-        modified: c(0x3574F0, 0.20), modifiedWord: c(0x3574F0, 0.40), modifiedMark: c(0x5C92F7),
-        added: c(0x3FA65A, 0.20), addedWord: c(0x3FA65A, 0.42), addedMark: c(0x57B46F),
-        deleted: c(0x868A93, 0.20), deletedWord: c(0x868A93, 0.40), deletedMark: c(0x8E929B),
-        removedLine: c(0xE5534B, 0.17), removedWord: c(0xE5534B, 0.38),
+        modified: c(0x3574F0, 0.20), modifiedWord: c(0x3574F0, 0.40), modifiedMark: c(0x5C92F7), modifiedBorder: c(0x5C92F7, 0.55),
+        added: c(0x3FA65A, 0.20), addedWord: c(0x3FA65A, 0.42), addedMark: c(0x57B46F), addedBorder: c(0x57B46F, 0.55),
+        deleted: c(0x868A93, 0.20), deletedWord: c(0x868A93, 0.40), deletedMark: c(0x8E929B), deletedBorder: c(0x8E929B, 0.52),
+        removedLine: c(0xE5534B, 0.17), removedWord: c(0xE5534B, 0.38), removedBorder: c(0xE5534B, 0.55),
         selection: c(0x2F65CA, 0.55),
         searchMatch: c(0xE8B339, 0.35),
         searchCurrent: c(0xF5A623, 0.85),
@@ -286,10 +286,10 @@ struct CanvasTheme {
         gutterTextStrong: c(0x5A5E69),
         syntax: lightSyntaxPalette,
         goSyntax: lightGoLandPalette,
-        modified: c(0x3574F0, 0.13), modifiedWord: c(0x3574F0, 0.28), modifiedMark: c(0x3574F0),
-        added: c(0x2DA44E, 0.15), addedWord: c(0x2DA44E, 0.32), addedMark: c(0x2DA44E),
-        deleted: c(0x6E7481, 0.14), deletedWord: c(0x6E7481, 0.28), deletedMark: c(0x868B97),
-        removedLine: c(0xE5534B, 0.12), removedWord: c(0xE5534B, 0.28),
+        modified: c(0x3574F0, 0.13), modifiedWord: c(0x3574F0, 0.28), modifiedMark: c(0x3574F0), modifiedBorder: c(0x3574F0, 0.48),
+        added: c(0x2DA44E, 0.15), addedWord: c(0x2DA44E, 0.32), addedMark: c(0x2DA44E), addedBorder: c(0x2DA44E, 0.50),
+        deleted: c(0x6E7481, 0.14), deletedWord: c(0x6E7481, 0.28), deletedMark: c(0x868B97), deletedBorder: c(0x6E7481, 0.46),
+        removedLine: c(0xE5534B, 0.12), removedWord: c(0xE5534B, 0.28), removedBorder: c(0xE5534B, 0.48),
         selection: c(0x3574F0, 0.28),
         searchMatch: c(0xF5C542, 0.45),
         searchCurrent: c(0xF59E0B, 0.90),
@@ -320,6 +320,14 @@ struct CanvasTheme {
         case .modified: return modifiedMark
         case .added: return addedMark
         case .deleted: return deletedMark
+        }
+    }
+
+    func focusedBorder(_ kind: Hunk.Kind) -> CGColor {
+        switch kind {
+        case .modified: return modifiedBorder
+        case .added: return addedBorder
+        case .deleted: return deletedBorder
         }
     }
 }

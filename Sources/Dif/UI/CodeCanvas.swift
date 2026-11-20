@@ -167,6 +167,8 @@ private final class Pane {
     /// Pales the bands of lines that stay out of the commit.
     let excluded: RectGroup
     let marks: [RectGroup]
+    let focusedTop: RectGroup
+    let focusedBottom: RectGroup
     let words: [RectGroup]
     let hits: RectGroup
     let currentHit: RectGroup
@@ -185,6 +187,8 @@ private final class Pane {
         lines = (0..<3).map { _ in RectGroup(host: band, z: 0) }
         excluded = RectGroup(host: band, z: 0.5)
         marks = (0..<3).map { _ in RectGroup(host: band, z: 1) }
+        focusedTop = RectGroup(host: band, z: 1.5)
+        focusedBottom = RectGroup(host: band, z: 1.5)
         words = (0..<3).map { _ in RectGroup(host: text, z: 0) }
         hits = RectGroup(host: text, z: 1)
         currentHit = RectGroup(host: text, z: 2)
@@ -216,7 +220,7 @@ private final class Pane {
     }
 
     func clearDecor() {
-        (lines + marks + words + [excluded, hits, currentHit, selection]).forEach { $0.clear() }
+        (lines + marks + words + [excluded, focusedTop, focusedBottom, hits, currentHit, selection]).forEach { $0.clear() }
         focus.isHidden = true
         decorRows = 0..<0
     }
@@ -415,6 +419,7 @@ final class CodeCanvasView: NSView {
     private let panes = [Pane(side: .left), Pane(side: .right)]
     private let connector = StillLayer()
     private var ribbons: [StillShapeLayer] = []
+    private let ribbonOutline = StillShapeLayer()
     private let ruler = StillLayer()
     private let rulerThumb = StillLayer()
     private var rulerMarks: [StillShapeLayer] = []
@@ -541,6 +546,9 @@ final class CodeCanvasView: NSView {
             connector.addSublayer(ribbon)
             ribbons.append(ribbon)
         }
+        ribbonOutline.fillColor = nil
+        ribbonOutline.lineWidth = 1
+        connector.addSublayer(ribbonOutline)
         root.addSublayer(connector)
 
         ruler.anchorPoint = .zero
@@ -1811,9 +1819,11 @@ final class CodeCanvasView: NSView {
         var lines = [[CGRect]](repeating: [], count: 3)
         var marks = lines, words = lines
         var excluded: [CGRect] = []
+        var focusedTopRects: [CGRect] = [], focusedBottomRects: [CGRect] = []
+        var focusedTopColor = theme.focusedBorder(.modified), focusedBottomColor = theme.focusedBorder(.modified)
         let ticks = commitTicks
         var lineColors = Self.kinds.map { theme.line($0) }
-        let markColors = Self.kinds.map { theme.mark($0) }
+        let markColors = lineColors
         var wordColors = Self.kinds.map { theme.word($0) }
 
         switch mode {
@@ -1826,14 +1836,32 @@ final class CodeCanvasView: NSView {
                 let n = side == .left ? hunk.leftCount : hunk.rightCount
                 if start > rows.upperBound { break }
                 let k = kindIndex(hunk.kind)
+                let isFocused = focusedHunk == index
                 if n == 0 {
-                    marks[k].append(CGRect(x: 0, y: CGFloat(start) * lh - 1, width: bandWidth, height: 2))
+                    let rect = CGRect(x: 0, y: CGFloat(start) * lh - 1, width: bandWidth, height: 2)
+                    if isFocused {
+                        focusedTopRects.append(rect)
+                        focusedTopColor = theme.focusedBorder(hunk.kind)
+                    } else {
+                        marks[k].append(rect)
+                    }
                 } else {
                     // Clipped to the window so a huge hunk never makes a huge layer.
                     let a = max(start, rows.lowerBound), b = min(start + n, rows.upperBound)
                     if a < b {
                         let y = CGFloat(a) * lh, height = CGFloat(b - a) * lh
                         lines[k].append(CGRect(x: 0, y: y, width: bandWidth, height: height))
+                        if isFocused {
+                            let borderColor = theme.focusedBorder(hunk.kind)
+                            if start >= rows.lowerBound {
+                                focusedTopRects.append(CGRect(x: 0, y: CGFloat(start) * lh, width: bandWidth, height: 1))
+                                focusedTopColor = borderColor
+                            }
+                            if start + n <= rows.upperBound {
+                                focusedBottomRects.append(CGRect(x: 0, y: CGFloat(start + n) * lh - 1, width: bandWidth, height: 1))
+                                focusedBottomColor = borderColor
+                            }
+                        }
                         if let ticks { appendExcluded(ticks, side: side, lines: a..<b, row: a, width: bandWidth, to: &excluded) }
                         let inline = side == .left ? hunk.leftInline : hunk.rightInline
                         // `inline` may be empty or shorter than the hunk.
@@ -1888,6 +1916,21 @@ final class CodeCanvasView: NSView {
                 }
                 row = next
             }
+            if let focused = focusedHunk, doc.hunks.indices.contains(focused), focused < hunkRows.count {
+                let hunk = doc.hunks[focused]
+                let hunkStart = hunkRows[focused]
+                let hunkEnd = hunkStart + hunk.leftCount + hunk.rightCount
+                if hunkStart < hunkEnd, hunkEnd <= data.count, hunkStart < end, hunkEnd > rows.lowerBound {
+                    if hunkStart >= rows.lowerBound {
+                        focusedTopRects.append(CGRect(x: 0, y: CGFloat(hunkStart) * lh, width: bandWidth, height: 1))
+                        focusedTopColor = hunk.leftCount > 0 ? theme.removedBorder : theme.addedBorder
+                    }
+                    if hunkEnd <= end {
+                        focusedBottomRects.append(CGRect(x: 0, y: CGFloat(hunkEnd) * lh - 1, width: bandWidth, height: 1))
+                        focusedBottomColor = hunk.rightCount > 0 ? theme.addedBorder : theme.removedBorder
+                    }
+                }
+            }
 
         case .single:
             break
@@ -1928,6 +1971,8 @@ final class CodeCanvasView: NSView {
             pane.marks[k].set(marks[k], color: markColors[k])
             pane.words[k].set(words[k], color: wordColors[k], radius: 2.5)
         }
+        pane.focusedTop.set(focusedTopRects, color: focusedTopColor)
+        pane.focusedBottom.set(focusedBottomRects, color: focusedBottomColor)
         pane.excluded.set(excluded, color: theme.background.copy(alpha: 0.62) ?? theme.background)
         pane.hits.set(hits, color: theme.searchMatch, radius: 2.5)
         pane.currentHit.set(current, color: theme.searchCurrent, radius: 2.5)
@@ -1990,6 +2035,8 @@ final class CodeCanvasView: NSView {
         var index = min(firstHunk(doc, side: .left, endingAtOrAfter: firstLeft),
                         firstHunk(doc, side: .right, endingAtOrAfter: firstRight))
         let fills = [CGMutablePath(), CGMutablePath(), CGMutablePath()]
+        var outlinePath: CGMutablePath?
+        var outlineColor: CGColor?
         while index < doc.hunks.count {
             let hunk = doc.hunks[index]
             var l0 = CGFloat(hunk.leftStart) * lh - scroll.left
@@ -2009,6 +2056,18 @@ final class CodeCanvasView: NSView {
                 path.addCurve(to: CGPoint(x: 0, y: l1), control1: CGPoint(x: x1 - bend, y: r1), control2: CGPoint(x: bend, y: l1))
                 path.closeSubpath()
                 fills[kindIndex(hunk.kind)].addPath(path)
+
+                if index == focusedHunk {
+                    let stroke = CGMutablePath()
+                    let topL = l0 + 0.5, topR = r0 + 0.5
+                    let botL = l1 - 0.5, botR = r1 - 0.5
+                    stroke.move(to: CGPoint(x: 0, y: topL))
+                    stroke.addCurve(to: CGPoint(x: x1, y: topR), control1: CGPoint(x: bend, y: topL), control2: CGPoint(x: x1 - bend, y: topR))
+                    stroke.move(to: CGPoint(x: 0, y: botL))
+                    stroke.addCurve(to: CGPoint(x: x1, y: botR), control1: CGPoint(x: bend, y: botL), control2: CGPoint(x: x1 - bend, y: botR))
+                    outlinePath = stroke
+                    outlineColor = theme.focusedBorder(hunk.kind)
+                }
             }
             index += 1
         }
@@ -2018,6 +2077,9 @@ final class CodeCanvasView: NSView {
             ribbons[k].fillColor = theme.line(Self.kinds[k])
             ribbons[k].path = fills[k].isEmpty ? nil : fills[k]
         }
+        ribbonOutline.contentsScale = scale
+        ribbonOutline.strokeColor = outlineColor
+        ribbonOutline.path = outlinePath
     }
 
     // MARK: Revert buttons
