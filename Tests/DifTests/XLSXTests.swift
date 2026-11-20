@@ -742,4 +742,232 @@ final class XLSXTests: XCTestCase {
         XCTAssertEqual(wb.sheets[0].rows[rowCount - 1][1], "SharedText_\((rowCount - 1 + 1) % 20)")
         XCTAssertLessThan(elapsed, 0.5, "Parsing 5,000x20 sheet took \(String(format: "%.3f", elapsed))s (budget: 0.5s)")
     }
+
+    // MARK: - 11. Security & Edge-Case Regressions
+
+    func testZip64TotalEntriesGreaterThanIntMaxDoesNotTrap() throws {
+        // Construct a stored ZIP with a ZIP64 EOCD whose totalEntries is UInt64.max (> Int.max).
+        let payload = Data("safe".utf8)
+        let name = Data("xl/ok.txt".utf8)
+
+        var out = Data()
+        func u16(_ v: UInt16) {
+            out.append(UInt8(v & 0xFF))
+            out.append(UInt8((v >> 8) & 0xFF))
+        }
+        func u32(_ v: UInt32) {
+            for shift in stride(from: 0, through: 24, by: 8) {
+                out.append(UInt8((v >> shift) & 0xFF))
+            }
+        }
+        func u64(_ v: UInt64) {
+            for shift in stride(from: 0, through: 56, by: 8) {
+                out.append(UInt8((v >> shift) & 0xFF))
+            }
+        }
+
+        // Local file header at offset 0
+        u32(0x04034b50); u16(45); u16(0); u16(0); u16(0); u16(0)
+        u32(0); u32(UInt32(payload.count)); u32(UInt32(payload.count))
+        u16(UInt16(name.count)); u16(0)
+        out.append(name)
+        out.append(payload)
+
+        // Central directory (1 valid entry)
+        let cdOffset = UInt64(out.count)
+        u32(0x02014b50); u16(45); u16(45); u16(0); u16(0); u16(0); u16(0)
+        u32(0); u32(UInt32(payload.count)); u32(UInt32(payload.count))
+        u16(UInt16(name.count)); u16(0); u16(0); u16(0); u16(0); u32(0); u32(0)
+        out.append(name)
+        let cdSize = UInt64(out.count) - cdOffset
+
+        // ZIP64 EOCD record (56 bytes) with totalEntries = UInt64.max
+        let zip64EOCDOffset = UInt64(out.count)
+        u32(0x06064b50)        // signature
+        u64(44)                // size of remaining record
+        u16(45); u16(45)       // versions
+        u32(0); u32(0)         // disk numbers
+        u64(UInt64.max)        // entries on this disk
+        u64(UInt64.max)        // totalEntries (> Int.max!)
+        u64(cdSize)
+        u64(cdOffset)
+
+        // ZIP64 EOCD Locator (20 bytes)
+        u32(0x07064b50)
+        u32(0)
+        u64(zip64EOCDOffset)
+        u32(1)
+
+        // Standard EOCD (22 bytes) with sentinels
+        u32(0x06054b50); u16(0); u16(0)
+        u16(0xFFFF); u16(0xFFFF)
+        u32(0xFFFFFFFF); u32(0xFFFFFFFF)
+        u16(0)
+
+        let archive = try XLSXZipArchive(data: out)
+        XCTAssertEqual(try archive.readEntry(named: "xl/ok.txt"), payload)
+    }
+
+    func testParseCellRefRejectsOverflowAndOutOfBoundsColumns() throws {
+        // Overflowing column letters, overflowing row digits, and columns past XFD (16,384) must not trap or OOM.
+        let sheetXML = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+          <sheetData>
+            <row r="1">
+              <c r="A1" t="inlineStr"><is><t>Valid</t></is></c>
+              <c r="AAAAAAAAAAAAAAAAAA1" t="inlineStr"><is><t>OverflowCol</t></is></c>
+              <c r="A99999999999999999999999" t="inlineStr"><is><t>OverflowRow</t></is></c>
+              <c r="XFE1" t="inlineStr"><is><t>Col16385</t></is></c>
+              <c r="ZZZZZ1" t="inlineStr"><is><t>HugeCol</t></is></c>
+            </row>
+            <row r="2">
+              <c r="A2"><v>99</v></c>
+              <c r="ZZZZZ2"><v>777</v></c>
+            </row>
+            <row r="99999999">
+              <c r="A99999999"><v>888</v></c>
+            </row>
+          </sheetData>
+        </worksheet>
+        """
+
+        let wb = try XLSXReader.parse(data: makeMinimalXLSX(sheets: [("Bounds", sheetXML, nil)]))
+        let sheet = wb.sheets[0]
+        XCTAssertEqual(sheet.headers, ["Valid"])
+        XCTAssertEqual(sheet.rows, [["99"]])
+    }
+
+    func testLargeNumberInDateStyledCellDoesNotTrap() throws {
+        let stylesXML = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+          <cellXfs count="2">
+            <xf numFmtId="0"/>
+            <xf numFmtId="14"/>
+          </cellXfs>
+        </styleSheet>
+        """
+        let sheetXML = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+          <sheetData>
+            <row r="1">
+              <c r="A1" t="inlineStr"><is><t>MaxValidDate</t></is></c>
+              <c r="B1" t="inlineStr"><is><t>PastMaxDate</t></is></c>
+              <c r="C1" t="inlineStr"><is><t>HugeOverflow</t></is></c>
+            </row>
+            <row r="2">
+              <c r="A2" s="1"><v>2958465</v></c>
+              <c r="B2" s="1"><v>2958466</v></c>
+              <c r="C2" s="1"><v>1e25</v></c>
+            </row>
+          </sheetData>
+        </worksheet>
+        """
+
+        let wb = try XLSXReader.parse(data: makeMinimalXLSX(sheets: [("BigDates", sheetXML, nil)], stylesXML: stylesXML))
+        let row = wb.sheets[0].rows[0]
+        XCTAssertEqual(row[0], "9999-12-31")
+        XCTAssertEqual(row[1], "2958466")
+        XCTAssertFalse(row[2].isEmpty)
+
+        // Direct call to formatExcelDate with out-of-range serial must also never trap.
+        XCTAssertFalse(XLSXReader.formatExcelDate(1e25, use1904: false).isEmpty)
+        XCTAssertFalse(XLSXReader.formatExcelDate(.infinity, use1904: false).isEmpty)
+    }
+
+    func testOmittedBlankRowsStayAlignedWithComments() throws {
+        // Row 1 is header, row 2 is omitted, row 3 has data + comment, row 4 is omitted, row 5 has data + comment,
+        // and row 500 is a trailing empty row that should NOT be padded.
+        let sheetXML = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+          <sheetData>
+            <row r="1">
+              <c r="A1" t="inlineStr"><is><t>Key</t></is></c>
+              <c r="B1" t="inlineStr"><is><t>Val</t></is></c>
+            </row>
+            <row r="3">
+              <c r="A3" t="inlineStr"><is><t>row3_key</t></is></c>
+              <c r="B3"><v>300</v></c>
+            </row>
+            <row r="5">
+              <c r="A5" t="inlineStr"><is><t>row5_key</t></is></c>
+              <c r="B5"><v>500</v></c>
+            </row>
+            <row r="500"/>
+          </sheetData>
+        </worksheet>
+        """
+        let commentsXML = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+          <commentList>
+            <comment ref="A1"><text><t>Header comment</t></text></comment>
+            <comment ref="A3"><text><t>Row 3 comment</t></text></comment>
+            <comment ref="B5"><text><t>Row 5 comment</t></text></comment>
+          </commentList>
+        </comments>
+        """
+
+        let wb = try XLSXReader.parse(data: makeMinimalXLSX(sheets: [("Gaps", sheetXML, commentsXML)]))
+        let sheet = wb.sheets[0]
+
+        XCTAssertEqual(sheet.headers, ["Key", "Val"])
+        // Rows: [0] blank (Excel row 2), [1] row 3, [2] blank (Excel row 4), [3] row 5; trailing row 500 trimmed.
+        XCTAssertEqual(sheet.rows.count, 4)
+        XCTAssertEqual(sheet.rows[0], ["", ""])
+        XCTAssertEqual(sheet.rows[1], ["row3_key", "300"])
+        XCTAssertEqual(sheet.rows[2], ["", ""])
+        XCTAssertEqual(sheet.rows[3], ["row5_key", "500"])
+
+        // Comments align 1-to-1 with row indices!
+        XCTAssertEqual(sheet.comment(row: -1, col: 0), "Header comment")
+        XCTAssertEqual(sheet.comment(row: 1, col: 0), "Row 3 comment")
+        XCTAssertEqual(sheet.cellValue(row: 1, col: 0), "row3_key")
+        XCTAssertEqual(sheet.comment(row: 3, col: 1), "Row 5 comment")
+        XCTAssertEqual(sheet.cellValue(row: 3, col: 1), "500")
+    }
+
+    func testDeflateMaxSizeCapAndTruncatedStreamRejection() throws {
+        // 1. Compress a 4 KB repetitive buffer (tiny compressed size, 4096 bytes decompressed).
+        let payload = Data(repeating: 0x58, count: 4096)
+        let zip = XLSXZipArchive.create(entries: [("xl/bomb.txt", payload)], compress: true)
+        let archive = try XLSXZipArchive(data: zip)
+        XCTAssertEqual(try archive.readEntry(named: "xl/bomb.txt"), payload)
+
+        // Locate raw deflate slice directly from the single-entry local file header (30 + nameLen).
+        let nameLen = Int(zip[26]) | (Int(zip[27]) << 8)
+        let compSize = Int(zip[18]) | (Int(zip[19]) << 8) | (Int(zip[20]) << 16) | (Int(zip[21]) << 24)
+        let deflateStart = 30 + nameLen
+        let deflateRange = deflateStart..<(deflateStart + compSize)
+
+        // Exact cap succeeds:
+        let exact = try XLSXZipArchive.inflateRaw(data: zip, range: deflateRange, expectedSize: 4096, maxOutputBytes: 4096)
+        XCTAssertEqual(exact, payload)
+
+        // Below uncompressed size throws decompressionFailed (zip-bomb protection):
+        XCTAssertThrowsError(
+            try XLSXZipArchive.inflateRaw(data: zip, range: deflateRange, expectedSize: 4096, maxOutputBytes: 1024)
+        ) { error in
+            if case XLSXError.decompressionFailed = error {
+                // expected
+            } else {
+                XCTFail("Expected XLSXError.decompressionFailed, got \(error)")
+            }
+        }
+
+        // 2. Truncated deflate stream (missing final bytes before Z_STREAM_END) throws decompressionFailed:
+        let truncatedRange = deflateStart..<(deflateStart + max(1, compSize - 4))
+        XCTAssertThrowsError(
+            try XLSXZipArchive.inflateRaw(data: zip, range: truncatedRange, expectedSize: 4096)
+        ) { error in
+            if case XLSXError.decompressionFailed = error {
+                // expected
+            } else {
+                XCTFail("Expected XLSXError.decompressionFailed for truncated stream, got \(error)")
+            }
+        }
+    }
 }
