@@ -74,4 +74,24 @@ final class DiscoveryTests: XCTestCase {
         let found = await Git.repositories(for: base.appendingPathComponent("workspace/web"))
         XCTAssertEqual(names(found), ["workspace/web"])
     }
+
+    /// Issue #7: a repository git refuses (here one it takes for another user's) says why, instead of "none there".
+    func testARefusedRepositorySaysWhy() async throws {
+        let workspace = base.appendingPathComponent("workspace")
+        // Without the machine's own settings, where `safe.directory = *` would trust every folder.
+        let empty = base.appendingPathComponent("empty.gitconfig")
+        try Data().write(to: empty)
+        let isolated = ["GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": empty.path, "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"]
+        let refused = await Git.refusal(at: workspace, environment: isolated)
+        XCTAssertTrue(refused?.message.hasPrefix("detected dubious ownership") ?? false, "\(String(describing: refused))")
+        XCTAssertEqual(refused?.trustCommand?.hasPrefix("git config --global --add safe.directory"), true)
+        // A repository git takes, and a folder that is none, have nothing to explain.
+        let fine = await Git.refusal(at: workspace)
+        XCTAssertNil(fine)
+        let plain = base.appendingPathComponent("plain")
+        try FileManager.default.createDirectory(at: plain, withIntermediateDirectories: true)
+        let none = await Git.refusal(at: plain)
+        XCTAssertNil(none)
+        XCTAssertEqual(Git.parseRefusal("fatal: something else went wrong\n")?.message, "something else went wrong")
+    }
 }

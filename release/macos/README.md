@@ -20,7 +20,7 @@
 3. `DRY_RUN=1 ./upgrade_macos.sh` 先看一遍签名和 appcast；没问题再 `./upgrade_macos.sh`。
 4. 首次下载的用户用 `DiffCode-<版本>.pkg`（或 `DiffCode.app.zip`）；装好后的版本会自己从 appcast 更新。
 
-线上 appcast：<https://r2-public.nanshanbei.com/diffcode/macos/stable/appcast.xml>（0.1.0 (1) 于 2026-11-13 发布；0.2.0 (2) 于 2026-11-14 发布；0.3.0 (3) 于 2026-11-14 发布；0.3.1 (4) 于 2026-11-15 发布；0.3.2 (5) 于 2026-11-16 发布，Intel 版从这一版开始（更新源 `diffcode/macos/stable-intel/appcast.xml`）；0.4.0 (7) 于 2026-11-17 发布；0.4.1 (8) 于 2026-11-18 发布；0.4.2 (9) 于 2026-11-18 发布；当前是 0.4.3 (10)，2026-11-18 发布，更新说明见 `release-notes/0.4.3.html`；GitHub Release 上传同一份 zip 和 pkg，固定文件名 `DiffCode.zip` / `DiffCode.pkg`，Intel 版是 `DiffCode-Intel.zip` / `DiffCode-Intel.pkg`，Windows 的安装包、zip 和 `SHA256SUMS-windows.txt` 由 `.github/workflows/windows.yml` 在发布后自动附加，见 `windows/PORTING.md`）。
+线上 appcast：<https://r2-public.nanshanbei.com/diffcode/macos/stable/appcast.xml>（0.1.0 (1) 于 2026-11-13 发布；0.2.0 (2) 于 2026-11-14 发布；0.3.0 (3) 于 2026-11-14 发布；0.3.1 (4) 于 2026-11-15 发布；0.3.2 (5) 于 2026-11-16 发布，Intel 版从这一版开始（更新源 `diffcode/macos/stable-intel/appcast.xml`）；0.4.0 (7) 于 2026-11-17 发布；0.4.1 (8) 于 2026-11-18 发布；0.4.2 (9) 于 2026-11-18 发布；0.4.3 (10) 于 2026-11-18 发布；当前是 0.4.4 (11)，2026-11-20 发布，更新说明见 `release-notes/0.4.4.html`；GitHub Release 上传同一份 zip 和 pkg，固定文件名 `DiffCode.zip` / `DiffCode.pkg`，Intel 版是 `DiffCode-Intel.zip` / `DiffCode-Intel.pkg`，Windows 的安装包、zip 和 `SHA256SUMS-windows.txt` 由 `.github/workflows/windows.yml` 在发布后自动附加，见 `windows/PORTING.md`）。
 
 ## Intel 版
 

@@ -213,8 +213,8 @@ pub fn commit_partial(
         let mut started = false;
         if let Ok(real) = git::run_string(root, ["rev-parse", "--git-path", "index"]) {
             let name = real.trim_end_matches(['\r', '\n']);
-            let p = Path::new(name);
-            let real_index = if p.is_absolute() { p.to_path_buf() } else { root.join(p) };
+            let p = git::path_from_git(root, name);
+            let real_index = if p.is_absolute() { p } else { root.join(p) };
             if std::fs::copy(&real_index, &index).is_ok()
                 && with_index(strings(&["read-tree", "-m", "HEAD"])).run().is_ok()
             {

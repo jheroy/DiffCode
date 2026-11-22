@@ -202,6 +202,11 @@ pub struct Project {
     pub compare_error: Option<String>,
 
     watcher: Option<FileWatcher>,
+    /// A repository inside WSL: Windows hears of no change on a distro's share, so its status is asked for again every
+    /// few seconds instead of watched (issue #7).
+    polls: bool,
+    /// Look again at the next tick, whatever the interval: the window came back to the front.
+    poll_due: bool,
     refresh_running: bool,
     refresh_queued: bool,
     refresh_at: Option<Instant>,
@@ -292,6 +297,8 @@ impl Project {
             is_loading_compare: false,
             compare_error: None,
             watcher: None,
+            polls: false,
+            poll_due: false,
             refresh_running: false,
             refresh_queued: false,
             refresh_at: None,
@@ -322,8 +329,9 @@ impl Project {
         self.git_directory.as_deref()
     }
 
-    /// Runs what finished in the background, and what is due. Returns when it next wants to run.
-    pub fn tick(&mut self, visible: bool) -> Option<Instant> {
+    /// Runs what finished in the background, and what is due. Returns when it next wants to run. A repository that
+    /// cannot be watched is looked at again every `poll_every`.
+    pub fn tick(&mut self, visible: bool, poll_every: Duration) -> Option<Instant> {
         Jobs::run(self, |p| &mut p.jobs);
         if self.refresh_at.is_some_and(|t| t <= Instant::now()) {
             self.refresh_at = None;
@@ -333,11 +341,31 @@ impl Project {
                 self.needs_refresh_when_visible = true;
             }
         }
+        // Not while a refresh runs: its end wakes the loop, and a deadline already past would spin it.
+        let polling = self.polls && !self.is_dormant && self.has_loaded && !self.refresh_running && self.refresh_at.is_none();
+        let mut poll_at = None;
+        if polling && visible {
+            let at = if self.poll_due { Instant::now() } else { self.last_refresh.map_or_else(Instant::now, |t| t + poll_every) };
+            if at <= Instant::now() {
+                self.poll_due = false;
+                self.run_refresh(true);
+            } else {
+                poll_at = Some(at);
+            }
+        }
         if self.tree_flash.as_ref().is_some_and(|(_, at)| at.elapsed() >= Duration::from_millis(900)) {
             self.tree_flash = None;
         }
         let flash = self.tree_flash.as_ref().map(|(_, at)| *at + Duration::from_millis(900));
-        [self.refresh_at, flash].into_iter().flatten().min()
+        [self.refresh_at, flash, poll_at].into_iter().flatten().min()
+    }
+
+    /// The window came back to the front: a repository that is not watched is looked at straight away, for what changed
+    /// while the user was elsewhere.
+    pub fn poll_soon(&mut self) {
+        if self.polls {
+            self.poll_due = true;
+        }
     }
 
     // MARK: Commit ticks
@@ -405,7 +433,12 @@ impl Project {
     // MARK: Watching and refresh
 
     pub fn start_watching(&mut self) {
-        if self.watcher.is_some() || self.is_dormant {
+        if self.watcher.is_some() || self.polls || self.is_dormant {
+            return;
+        }
+        // A watch on the share would start and never report anything.
+        if crate::core::wsl::location(&self.url).is_some() {
+            self.polls = true;
             return;
         }
         let poster = self.jobs.poster();
@@ -423,6 +456,7 @@ impl Project {
 
     pub fn stop_watching(&mut self) {
         self.watcher = None;
+        self.polls = false;
     }
 
     /// Coalesces bursts of file events (a build can produce thousands) into at most about one refresh a second.
@@ -436,6 +470,11 @@ impl Project {
     }
 
     pub fn refresh(&mut self) {
+        self.run_refresh(false);
+    }
+
+    /// `quietly`: a look taken every few seconds shows no spinner, which would otherwise blink all the time.
+    fn run_refresh(&mut self, quietly: bool) {
         if self.is_dormant {
             return;
         }
@@ -444,7 +483,7 @@ impl Project {
             return;
         }
         self.refresh_running = true;
-        self.is_refreshing = true;
+        self.is_refreshing = !quietly;
         self.needs_refresh_when_visible = false;
         let url = self.url.clone();
         let known = self.git_directory.clone();
@@ -479,6 +518,15 @@ impl Project {
                         p.commit_overrides.retain(|k, _| paths.contains(k.as_str()));
                         p.excluded_lines.retain(|k, _| paths.contains(k.as_str()));
                         if fresh != p.status {
+                            // Unwatched, a different status is the only sign that files came or went, or that HEAD
+                            // moved (a commit or a checkout in a terminal).
+                            if p.polls {
+                                p.file_index_stale = true;
+                                let moved = fresh.head_oid != p.status.head_oid || fresh.branch != p.status.branch;
+                                if moved && !p.commits.is_empty() {
+                                    p.log_stale = true;
+                                }
+                            }
                             p.status = fresh;
                         }
                         p.error_message = None;

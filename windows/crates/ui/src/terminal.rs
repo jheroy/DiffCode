@@ -99,9 +99,25 @@ impl Shell {
         }
     }
 
-    /// The program's name without its folder or `.exe`.
+    /// The shell for a terminal in `directory`: inside WSL, the distro's own shell, started in that folder.
+    pub fn for_directory(directory: &Path) -> Shell {
+        match crate::core::wsl::location(directory) {
+            Some(at) => Shell { program: "wsl.exe".into(), args: vec!["-d".into(), at.distro, "--cd".into(), at.linux], kind: ShellKind::Posix },
+            None => Shell::default_shell(),
+        }
+    }
+
+    /// The program's name without its folder or `.exe`; a distro's shell goes by the distro, which says more than "wsl".
     pub fn name(&self) -> String {
-        process_name(&self.program)
+        let name = process_name(&self.program);
+        if name.eq_ignore_ascii_case("wsl") {
+            if let [flag, distro, ..] = self.args.as_slice() {
+                if flag == "-d" {
+                    return distro.clone();
+                }
+            }
+        }
+        name
     }
 
     /// Quotes `text` so this shell reads it back as one word. Plain paths are left as they are.
@@ -176,7 +192,7 @@ impl Session {
         let listener = Listener { id, tx, waker };
         let config = Config { scrolling_history: SCROLLBACK_LINES, ..Config::default() };
         let term = Term::new(config, &GridSize { columns: 80, lines: 24 }, listener.clone());
-        let shell = Shell::default_shell();
+        let shell = Shell::for_directory(&directory);
         Session {
             id,
             project,
@@ -222,6 +238,11 @@ impl Session {
     }
 
     /// Launches the shell, sized for the pane it is in, so the first prompt is laid out for it.
+    /// A path as this terminal's shell reaches it: a Windows path is put as the distro sees it in a WSL terminal.
+    pub fn shell_path(&self, path: &str) -> String {
+        crate::core::wsl::location(&self.directory).and_then(|at| at.linux_path(path)).unwrap_or_else(|| path.to_string())
+    }
+
     pub fn start(&mut self, columns: usize, lines: usize, cell: (f32, f32)) {
         if self.is_started {
             return;
@@ -235,6 +256,11 @@ impl Session {
         env.insert("COLORTERM".to_string(), "truecolor".to_string());
         env.insert("TERM_PROGRAM".to_string(), "DiffCode".to_string());
         env.insert("TERM_PROGRAM_VERSION".to_string(), env!("CARGO_PKG_VERSION").to_string());
+        if crate::core::wsl::location(&self.directory).is_some() {
+            // A distro's shell sees only the variables WSLENV names.
+            let names = ["TERM", "COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"];
+            env.insert("WSLENV".to_string(), crate::core::wsl::environment_list(std::env::var("WSLENV").ok().as_deref(), &names));
+        }
         let options = tty::Options {
             shell: Some(tty::Shell::new(self.shell.program.clone(), self.shell.args.clone())),
             working_directory: Some(directory),
@@ -395,10 +421,18 @@ pub fn same_dir(a: &Path, b: &Path) -> bool {
 /// The program in the foreground under a shell, from a list of running processes (id, parent id, executable):
 /// the deepest of the shell's descendants, the newest of equals, leaving out console hosts. None when the shell has
 /// nothing running.
+///
+/// A distro's shell (`wsl.exe`) never counts as busy: under it are only WSL's own processes (a second `wsl.exe`, then
+/// `wslhost.exe`), and what runs inside the distro is no Windows process at all.
 pub fn foreground_among(processes: &[(u32, u32, String)], shell: u32) -> Option<String> {
+    let is_wsl = processes.iter().any(|(pid, _, name)| *pid == shell && name.eq_ignore_ascii_case("wsl.exe"));
+    if is_wsl {
+        return None;
+    }
+    // `wslhost.exe`: WSL's helper under a `wsl` the user ran from another shell, which then goes by "wsl".
     let host = |name: &str| {
         let n = name.to_ascii_lowercase();
-        n == "conhost.exe" || n == "openconsole.exe"
+        n == "conhost.exe" || n == "openconsole.exe" || n == "wslhost.exe"
     };
     let mut best: Option<(usize, usize)> = None;
     let mut level: Vec<u32> = vec![shell];
@@ -667,6 +701,20 @@ mod tests {
         assert_eq!(foreground_among(&list[..2], 10), None);
         let list = vec![p(10, 1, "cmd.exe"), p(20, 10, "a.exe"), p(21, 10, "b.EXE")];
         assert_eq!(foreground_among(&list, 10).as_deref(), Some("b"));
+        // As WSL 3 starts a distro's shell, seen on a real PC.
+        let list = vec![p(10, 1, "wsl.exe"), p(11, 10, "conhost.exe"), p(20, 10, "wsl.exe"), p(30, 20, "wslhost.exe"), p(40, 30, "conhost.exe")];
+        assert_eq!(foreground_among(&list, 10), None, "a WSL terminal");
+        let mut from_pwsh = vec![p(5, 1, "pwsh.exe")];
+        from_pwsh.extend(list.iter().map(|(pid, parent, name)| (*pid, if *parent == 1 { 5 } else { *parent }, name.clone())));
+        assert_eq!(foreground_among(&from_pwsh, 5).as_deref(), Some("wsl"), "wsl run from PowerShell");
+    }
+
+    #[test]
+    fn a_distro_shell_is_named_after_the_distro() {
+        let wsl = Shell { program: "wsl.exe".into(), args: vec!["-d".into(), "Ubuntu-24.04".into(), "--cd".into(), "/home/me".into()], kind: ShellKind::Posix };
+        assert_eq!(wsl.name(), "Ubuntu-24.04");
+        let pwsh = Shell { program: r"C:\Program Files\PowerShell\7\pwsh.exe".into(), args: vec!["-NoLogo".into()], kind: ShellKind::PowerShell };
+        assert_eq!(pwsh.name(), "pwsh");
     }
 
     #[test]

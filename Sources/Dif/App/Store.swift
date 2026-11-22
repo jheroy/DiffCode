@@ -290,6 +290,7 @@ final class AppStore {
         Task { @MainActor in
             var landed: Project?
             var rejected = 0
+            var refusal: Git.Refusal?
             for url in urls {
                 var isDirectory: ObjCBool = false
                 guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else { continue }
@@ -298,6 +299,7 @@ final class AppStore {
                 let roots = await Git.repositories(for: directory)
                 if roots.isEmpty {
                     rejected += 1
+                    if refusal == nil { refusal = await Git.refusal(at: directory) }
                     // A folder with no repository in it needs no access kept. (A file keeps its own: ~/.gitconfig.)
                     if isDirectory.boolValue { access.release(url.path, keepingFor: self.projects.map(\.url.path)) }
                 }
@@ -325,7 +327,9 @@ final class AppStore {
             if let landed {
                 self.select(landed)
             } else if rejected > 0 {
-                if access.isNeeded {
+                if let refusal {
+                    self.showRefusal(refusal)
+                } else if access.isNeeded {
                     // The sandbox hides the folders above the one chosen, so a folder inside a repository looks like none.
                     self.showToast(L("No Git repository found there · choose the repository's own folder",
                                      "这里没有找到 Git 仓库 · 请选择仓库本身所在的文件夹"))
@@ -334,6 +338,22 @@ final class AppStore {
                 }
             }
             self.persistProjects()
+        }
+    }
+
+    /// Git's reason for not opening a folder, in place of "No Git repository found there".
+    private func showRefusal(_ refusal: Git.Refusal) {
+        let copy = { [weak self] (text: String) in
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            self?.showToast(L("Copied", "已复制"))
+        }
+        if let command = refusal.trustCommand {
+            showToast(L("Git won't open this repository: it belongs to another user", "Git 拒绝打开这个仓库：它属于另一个用户"),
+                      action: ToastAction(title: L("Copy the command that trusts it", "复制信任它的命令")) { copy(command) })
+        } else {
+            showToast(L("Git can't open this folder: \(refusal.message)", "Git 无法打开这个文件夹：\(refusal.message)"),
+                      action: ToastAction(title: L("Copy", "复制")) { copy(refusal.message) })
         }
     }
 

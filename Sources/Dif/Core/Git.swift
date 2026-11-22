@@ -233,6 +233,37 @@ enum Git {
         return path.isEmpty ? nil : URL(fileURLWithPath: path)
     }
 
+    /// Why git would not take a folder as a repository, when the reason is not just that there is none.
+    struct Refusal: Equatable {
+        /// Git's own words, without "fatal: ".
+        var message: String
+        /// For a repository that belongs to another user: the command git suggests to trust it.
+        var trustCommand: String?
+    }
+
+    /// Asks git why the folder is no repository. Nil when it simply is none (or is one after all): "No Git repository
+    /// found there" is then the truth. Otherwise git's reason, such as a repository owned by another user, which git
+    /// refuses unless trusted with `safe.directory` (issue #7: a repository inside WSL, opened from Windows).
+    static func refusal(at directory: URL, environment: [String: String] = [:]) async -> Refusal? {
+        do {
+            _ = try await runString(["rev-parse", "--show-toplevel"], in: directory, environment: environment)
+            return nil
+        } catch let failure as Failure {
+            return parseRefusal(failure.message)
+        } catch {
+            return nil
+        }
+    }
+
+    static func parseRefusal(_ text: String) -> Refusal? {
+        let lines = text.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
+        guard let first = lines.first(where: { !$0.isEmpty }), !first.contains("not a git repository") else { return nil }
+        var message = first
+        for prefix in ["fatal: ", "error: "] where message.hasPrefix(prefix) { message.removeFirst(prefix.count) }
+        let trust = lines.first { $0.hasPrefix("git config") && $0.contains("safe.directory") }
+        return Refusal(message: message, trustCommand: trust)
+    }
+
     /// One of a repository's work trees, as `git worktree list` has it.
     struct Worktree: Equatable {
         var path: String

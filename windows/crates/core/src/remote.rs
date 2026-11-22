@@ -50,7 +50,7 @@ pub enum PullMode {
 pub fn git_directory(dir: &Path) -> Option<PathBuf> {
     let out = run_string(dir, ["rev-parse", "--absolute-git-dir"]).ok()?;
     let p = out.trim();
-    if p.is_empty() { None } else { Some(PathBuf::from(git::normalize_git_path(p))) }
+    if p.is_empty() { None } else { Some(git::path_from_git(dir, p)) }
 }
 
 /// What git is in the middle of, from the marker files it keeps in its directory.

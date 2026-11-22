@@ -252,7 +252,7 @@ impl App {
     /// A path, quoted for the shell, typed into the terminal.
     pub fn insert_path_in_terminal(&mut self, path: &str, project: ProjectId) {
         let quoted = match self.active_terminal(project).and_then(|id| self.terminals.session(id)) {
-            Some(s) => s.shell.quote(path),
+            Some(s) => s.shell.quote(&s.shell_path(path)),
             None => crate::terminal::Shell::default_shell().quote(path),
         };
         self.type_in_terminal(&format!("{quoted} "), project);

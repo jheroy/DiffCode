@@ -427,8 +427,12 @@ impl App {
         self.tick_updates();
         let mut next = self.viewer.tick();
         let visible = self.window_visible;
+        let selected = self.selected;
         for p in &mut self.projects {
-            if let Some(t) = p.tick(visible) {
+            // How often a repository that cannot be watched (inside WSL) is looked at: the one on screen often enough
+            // to follow an agent at work, the others for their counts in the list.
+            let poll_every = Duration::from_secs(if Some(p.id) == selected { 2 } else { 10 });
+            if let Some(t) = p.tick(visible, poll_every) {
                 next = Some(next.map_or(t, |n| n.min(t)));
             }
         }
@@ -536,6 +540,7 @@ impl App {
             move || {
                 let mut roots = Vec::new();
                 let mut rejected = 0;
+                let mut refusal = None;
                 for path in paths {
                     let directory = if path.is_dir() {
                         path.clone()
@@ -548,12 +553,15 @@ impl App {
                     let found = git::repositories_for(&directory, 3);
                     if found.is_empty() {
                         rejected += 1;
+                        if refusal.is_none() {
+                            refusal = git::refusal(&directory, &[]);
+                        }
                     }
                     roots.extend(found);
                 }
-                (roots, rejected)
+                (roots, rejected, refusal)
             },
-            |app: &mut App, (roots, rejected): (Vec<PathBuf>, usize)| {
+            |app: &mut App, (roots, rejected, refusal): (Vec<PathBuf>, usize, Option<git::Refusal>)| {
                 let mut landed = None;
                 for root in roots {
                     if let Some(existing) = app.projects.iter_mut().find(|p| same_path(&p.url, &root)) {
@@ -575,12 +583,32 @@ impl App {
                 }
                 if let Some(id) = landed {
                     app.select(id);
+                } else if let Some(refusal) = refusal {
+                    app.show_refusal(refusal);
                 } else if rejected > 0 {
                     app.show_toast(l("No Git repository found there", "这里没有找到 Git 仓库"));
                 }
                 app.persist_projects();
             },
         );
+    }
+
+    /// Git's reason for not opening a folder, in place of "No Git repository found there".
+    fn show_refusal(&mut self, refusal: git::Refusal) {
+        if let Some(command) = refusal.trust_command {
+            self.show_toast_action(
+                l("Git won't open this repository: it belongs to another user", "Git 拒绝打开这个仓库：它属于另一个用户"),
+                l("Copy the command that trusts it", "复制信任它的命令"),
+                move |app| app.copy_text(command),
+            );
+        } else {
+            let message = refusal.message;
+            self.show_toast_action(
+                format!("{}{message}", l("Git can't open this folder: ", "Git 无法打开这个文件夹：")),
+                l("Copy", "复制"),
+                move |app| app.copy_text(message),
+            );
+        }
     }
 
     /// The sidebar's Refresh: the project's changes, and the repositories that appeared inside it since it was
@@ -1559,6 +1587,9 @@ impl Program for App {
             // Back from installing Git: no need to look for the button.
             if self.git_missing {
                 self.check_git_again();
+            }
+            for p in &mut self.projects {
+                p.poll_soon();
             }
         }
         if let Some(Event::FocusChanged(false)) = &ui.event {
