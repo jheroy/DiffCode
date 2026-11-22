@@ -198,10 +198,18 @@ struct AIGroupPanel: View {
                             ForEach(result.groups) { group in
                                 AIGroupRow(
                                     group: group,
-                                    isSelected: group.id == activeGroupID
-                                ) {
-                                    store.selectAIGroup(group, in: project, openFirstFile: true)
-                                }
+                                    isSelected: group.id == activeGroupID,
+                                    canDelete: !project.isCommittingGroup,
+                                    onSelect: {
+                                        store.selectAIGroup(group, in: project, openFirstFile: true)
+                                    },
+                                    onDelete: {
+                                        store.deleteAIGroup(group, in: project)
+                                    },
+                                    onClearAll: {
+                                        store.clearAIGroups(for: project)
+                                    }
+                                )
                             }
                         }
                         .padding(.horizontal, 6)
@@ -317,7 +325,7 @@ struct AIGroupPanel: View {
                 }
 
                 IconButton(symbol: "xmark.circle",
-                           help: L("Clear groups", "清空分组"),
+                           help: L("Clear all groups", "清空全部分组"),
                            size: 11.5) {
                     store.clearAIGroups(for: project)
                 }
@@ -394,62 +402,95 @@ struct AIGroupPanel: View {
 private struct AIGroupRow: View {
     let group: AIHunkGroup
     let isSelected: Bool
+    let canDelete: Bool
     let onSelect: () -> Void
+    let onDelete: () -> Void
+    let onClearAll: () -> Void
 
     @State private var hovering = false
+    @State private var hoveringDelete = false
 
     var body: some View {
         let trimmedSummary = group.summary.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        Button(action: onSelect) {
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(alignment: .center, spacing: 6) {
-                    Text(group.name)
-                        .font(.ui(size: 12, weight: .semibold))
-                        .foregroundStyle(Color.difText)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .center, spacing: 6) {
+                Text(group.name)
+                    .font(.ui(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.difText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
 
-                    Spacer(minLength: 4)
+                Spacer(minLength: 4)
 
-                    Text(L("\(group.fileCount)F · \(group.hunkCount)H",
-                           "\(group.fileCount) 文件 · \(group.hunkCount) 处"))
-                        .font(.ui(size: 10, weight: .semibold, design: .rounded))
-                        .foregroundStyle(isSelected ? Color.difAccent : Color.difText3)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 1.5)
-                        .background(
-                            RoundedRectangle(cornerRadius: 4.5, style: .continuous)
-                                .fill(isSelected ? Color.difAccent.opacity(0.15) : Color.difChip)
-                        )
-                        .fixedSize()
+                if hovering && canDelete {
+                    Button(action: onDelete) {
+                        Image(systemName: "trash")
+                            .font(.ui(size: 10, weight: .medium))
+                            .foregroundStyle(hoveringDelete ? Color.difRemoved : Color.difText3)
+                            .frame(width: UI.s(20), height: UI.s(18))
+                            .background(
+                                RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                                    .fill(hoveringDelete ? Color.difRemoved.opacity(0.14) : Color.difChip.opacity(0.8))
+                            )
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { hoveringDelete = $0 }
+                    .help(L("Delete this group", "删除该分组"))
                 }
 
-                if !trimmedSummary.isEmpty {
-                    Text(trimmedSummary)
-                        .font(.ui(size: 11))
-                        .foregroundStyle(isSelected ? Color.difText2 : Color.difText3)
-                        .lineLimit(2)
-                        .truncationMode(.tail)
-                        .multilineTextAlignment(.leading)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                Text(L("\(group.fileCount)F · \(group.hunkCount)H",
+                       "\(group.fileCount) 文件 · \(group.hunkCount) 处"))
+                    .font(.ui(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(isSelected ? Color.difAccent : Color.difText3)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1.5)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                            .fill(isSelected ? Color.difAccent.opacity(0.15) : Color.difChip)
+                    )
+                    .fixedSize()
             }
-            .padding(.horizontal, 9)
-            .padding(.vertical, 7)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(isSelected ? Color.difSelection : (hovering ? Color.difHover : Color.clear))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .strokeBorder(isSelected ? Color.difAccent.opacity(0.45) : Color.clear, lineWidth: 1)
-            )
-            .contentShape(Rectangle())
+
+            if !trimmedSummary.isEmpty {
+                Text(trimmedSummary)
+                    .font(.ui(size: 11))
+                    .foregroundStyle(isSelected ? Color.difText2 : Color.difText3)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
-        .buttonStyle(.plain)
-        .onHover { hovering = $0 }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(isSelected ? Color.difSelection : (hovering ? Color.difHover : Color.clear))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(isSelected ? Color.difAccent.opacity(0.45) : Color.clear, lineWidth: 1)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onSelect)
+        .onHover {
+            hovering = $0
+            if !$0 { hoveringDelete = false }
+        }
+        .contextMenu {
+            Button(role: .destructive, action: onDelete) {
+                Label(L("Delete Group", "删除此分组"), systemImage: "trash")
+            }
+            .disabled(!canDelete)
+            Divider()
+            Button(role: .destructive, action: onClearAll) {
+                Label(L("Clear All Groups", "清空全部分组"), systemImage: "xmark.circle")
+            }
+            .disabled(!canDelete)
+        }
         .help(trimmedSummary.isEmpty ? group.name : "\(group.name)\n\(trimmedSummary)")
     }
 }
@@ -736,7 +777,10 @@ private struct AIGroupCommitBox: View {
             CommitMessageEditor(
                 text: Binding(
                     get: { project.commitMessage(for: group) },
-                    set: { project.setCommitMessage($0, for: group) }
+                    set: {
+                        project.setCommitMessage($0, for: group)
+                        store.schedulePersistAIGroups(for: project)
+                    }
                 ),
                 placeholder: L("Group commit message", "分组提交说明"),
                 focusToken: focusToken,
@@ -911,7 +955,7 @@ private struct AgentModelSelectorCard: View {
         let selectedModel = store.settings.aiModel(for: provider, task: task)
         let defaultModel = models.first(where: \.isDefault)
         let missingModel: String? = selectedModel.flatMap { chosen in
-            models.isEmpty || models.contains(where: { $0.id == chosen }) ? nil : chosen
+            models.contains(where: { $0.id == chosen }) ? nil : chosen
         }
 
         VStack(alignment: .leading, spacing: compact ? 4 : 7) {
@@ -1010,10 +1054,11 @@ private struct AgentModelSelectorCard: View {
                     .tag(String?.some(model.id))
             }
             if let missingModel {
-                Text("\(missingModel) (\(L("saved", "已保存")))")
+                Text(models.isEmpty ? missingModel : "\(missingModel) (\(L("saved", "已保存")))")
                     .tag(String?.some(missingModel))
             }
         }
+        .id(provider)
         .pickerStyle(.menu)
         .labelsHidden()
         .controlSize(.small)

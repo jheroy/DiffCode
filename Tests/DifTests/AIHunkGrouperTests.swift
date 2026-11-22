@@ -552,4 +552,204 @@ final class AIHunkGrouperTests: XCTestCase {
         XCTAssertTrue(statusAfterB.changes.isEmpty)
         XCTAssertNil(AIHunkGrouper.resultAfterCommitting(groupID: shiftedGroupB.id, in: remainingResult))
     }
+
+    // MARK: - Deletion, File-Removal Helpers & Persistence Storage
+
+    func testResultAfterDeletingRemovesGroupWithoutShiftingIndices() {
+        let groupA = AIHunkGroup(
+            name: "分组 A",
+            summary: "保留 0 和 2 号 hunk",
+            files: [AIHunkGroupFile(path: "shared.swift", hunkIndices: [0, 2])]
+        )
+        let groupB = AIHunkGroup(
+            name: "分组 B",
+            summary: "保留 1 和 3 号 hunk",
+            files: [AIHunkGroupFile(path: "shared.swift", hunkIndices: [1, 3])]
+        )
+        let result = AIHunkGroupingResult(
+            groups: [groupA, groupB],
+            totalHunks: 4,
+            totalFiles: 1,
+            provider: .agy,
+            model: "gemini-4",
+            generatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+
+        let afterDeleteA = AIHunkGrouper.resultAfterDeleting(groupID: groupA.id, in: result)
+        XCTAssertNotNil(afterDeleteA)
+        XCTAssertEqual(afterDeleteA?.groups.count, 1)
+        XCTAssertEqual(afterDeleteA?.groups[0].id, groupB.id)
+        XCTAssertEqual(
+            afterDeleteA?.groups[0].files,
+            [AIHunkGroupFile(path: "shared.swift", hunkIndices: [1, 3])],
+            "Deleting a group must not shift hunk indices of remaining groups"
+        )
+        XCTAssertEqual(afterDeleteA?.totalHunks, 2)
+        XCTAssertEqual(afterDeleteA?.totalFiles, 1)
+
+        XCTAssertNil(afterDeleteA.flatMap { AIHunkGrouper.resultAfterDeleting(groupID: groupB.id, in: $0) })
+    }
+
+    func testResultAfterRemovingFilesDropsEmptiedGroupsAndUpdatesTotals() {
+        let groupA = AIHunkGroup(
+            name: "分组 A",
+            summary: "仅含已提交文件",
+            files: [AIHunkGroupFile(path: "committed.swift", hunkIndices: [0, 1])]
+        )
+        let groupB = AIHunkGroup(
+            name: "分组 B",
+            summary: "跨文件改动",
+            files: [
+                AIHunkGroupFile(path: "committed.swift", hunkIndices: [2]),
+                AIHunkGroupFile(path: "kept.swift", hunkIndices: [0, 2]),
+            ]
+        )
+        let result = AIHunkGroupingResult(
+            groups: [groupA, groupB],
+            totalHunks: 5,
+            totalFiles: 2,
+            provider: .claude,
+            model: "sonnet",
+            generatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+
+        let afterEmpty = AIHunkGrouper.resultAfterRemovingFiles([], in: result)
+        XCTAssertEqual(afterEmpty, result)
+
+        let afterRemovingCommitted = AIHunkGrouper.resultAfterRemovingFiles(["committed.swift"], in: result)
+        XCTAssertEqual(afterRemovingCommitted?.groups.count, 1)
+        XCTAssertEqual(afterRemovingCommitted?.groups[0].id, groupB.id)
+        XCTAssertEqual(afterRemovingCommitted?.groups[0].files, [AIHunkGroupFile(path: "kept.swift", hunkIndices: [0, 2])])
+        XCTAssertEqual(afterRemovingCommitted?.totalHunks, 2)
+        XCTAssertEqual(afterRemovingCommitted?.totalFiles, 1)
+
+        XCTAssertNil(AIHunkGrouper.resultAfterRemovingFiles(["committed.swift", "kept.swift"], in: result))
+    }
+
+    func testAIGroupStorageSaveLoadDeleteSymlinkAndCorruptionResilience() throws {
+        let dir = try makeTempDir("storage")
+        let storageFile = dir.appendingPathComponent("nested/ai-groups.json")
+
+        let realRepo = dir.appendingPathComponent("real-repo")
+        try fm.createDirectory(at: realRepo, withIntermediateDirectories: true)
+        let linkRepo = dir.appendingPathComponent("link-repo")
+        try fm.createSymbolicLink(at: linkRepo, withDestinationURL: realRepo)
+
+        let group = AIHunkGroup(
+            name: "持久化测试分组",
+            summary: "验证读写与删除",
+            files: [AIHunkGroupFile(path: "Sources/App.swift", hunkIndices: [0, 2])]
+        )
+        let state = PersistedAIGroupState(
+            result: AIHunkGroupingResult(
+                groups: [group],
+                totalHunks: 2,
+                totalFiles: 1,
+                provider: .codex,
+                model: "gpt-6-luna",
+                generatedAt: Date(timeIntervalSince1970: 1_700_000_123)
+            ),
+            selectedGroupID: group.id,
+            selectedGroupFilePath: "Sources/App.swift",
+            selectedGroupHunkIndex: 2,
+            groupCommitMessages: [group.id.uuidString: "feat: custom message"],
+            headOID: "deadbeef"
+        )
+
+        let writer = AIGroupStorage(fileURL: storageFile)
+        writer.save(state, for: realRepo)
+        XCTAssertTrue(fm.fileExists(atPath: storageFile.path))
+
+        // Fresh storage instance reads via symlinked repo URL.
+        let reader = AIGroupStorage(fileURL: storageFile)
+        XCTAssertEqual(reader.load(for: linkRepo), state)
+        XCTAssertEqual(reader.allKeys().count, 1)
+
+        // Empty-groups guard deletes record and backing file.
+        let emptyState = PersistedAIGroupState(
+            result: AIHunkGroupingResult(
+                groups: [],
+                totalHunks: 0,
+                totalFiles: 0,
+                provider: .codex,
+                model: nil,
+                generatedAt: Date(timeIntervalSince1970: 1_700_000_123)
+            )
+        )
+        reader.save(emptyState, for: realRepo)
+        XCTAssertNil(reader.load(for: realRepo))
+        XCTAssertFalse(fm.fileExists(atPath: storageFile.path))
+
+        // Corrupted JSON falls back cleanly without crashing.
+        try fm.createDirectory(at: storageFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("{corrupted-json".utf8).write(to: storageFile)
+        let corruptedReader = AIGroupStorage(fileURL: storageFile)
+        XCTAssertNil(corruptedReader.load(for: realRepo))
+        XCTAssertTrue(corruptedReader.allKeys().isEmpty)
+    }
+
+    @MainActor
+    func testProjectPersistedAIGroupStateRoundTripAndValidation() throws {
+        let dir = try makeTempDir("project-state")
+        let groupA = AIHunkGroup(
+            name: "分组 A",
+            summary: "摘要 A",
+            files: [AIHunkGroupFile(path: "a.swift", hunkIndices: [0, 3])]
+        )
+        let groupB = AIHunkGroup(
+            name: "分组 B",
+            summary: "摘要 B",
+            files: [AIHunkGroupFile(path: "b.swift", hunkIndices: [1, 2])]
+        )
+        let result = AIHunkGroupingResult(
+            groups: [groupA, groupB],
+            totalHunks: 4,
+            totalFiles: 2,
+            provider: .agy,
+            model: "gemini-4",
+            generatedAt: Date(timeIntervalSince1970: 1_700_000_500)
+        )
+
+        let sourceProject = Project(url: dir)
+        sourceProject.aiGroupResult = result
+        sourceProject.selectedGroupID = groupB.id
+        sourceProject.selectedGroupFilePath = "b.swift"
+        sourceProject.selectedGroupRowID = ChangeRow.fileID("b.swift")
+        sourceProject.selectedGroupHunkIndex = 2
+        sourceProject.setCommitMessage(AIHunkGrouper.defaultCommitMessage(for: groupA), for: groupA)
+        sourceProject.setCommitMessage("custom commit draft B", for: groupB)
+        let staleID = UUID()
+        sourceProject.groupCommitMessages[staleID] = "stale draft"
+
+        let snapshot = try XCTUnwrap(sourceProject.persistedAIGroupState(headOIDOverride: "abc1234"))
+        XCTAssertEqual(snapshot.headOID, "abc1234")
+        XCTAssertEqual(snapshot.groupCommitMessages, [groupB.id.uuidString: "custom commit draft B"])
+
+        let restoredProject = Project(url: dir)
+        restoredProject.restoreAIGroupState(snapshot)
+        XCTAssertEqual(restoredProject.aiGroupResult, result)
+        XCTAssertEqual(restoredProject.selectedGroupID, groupB.id)
+        XCTAssertEqual(restoredProject.selectedGroupFilePath, "b.swift")
+        XCTAssertEqual(restoredProject.selectedGroupRowID, ChangeRow.fileID("b.swift"))
+        XCTAssertEqual(restoredProject.selectedGroupHunkIndex, 2)
+        XCTAssertEqual(restoredProject.commitMessage(for: groupB), "custom commit draft B")
+        XCTAssertEqual(restoredProject.commitMessage(for: groupA), AIHunkGrouper.defaultCommitMessage(for: groupA))
+        XCTAssertNil(restoredProject.groupCommitMessages[staleID])
+
+        // Invalid selection fields fall back cleanly to valid group/file/hunk.
+        let invalidSelectionState = PersistedAIGroupState(
+            result: result,
+            selectedGroupID: UUID(),
+            selectedGroupFilePath: "missing.swift",
+            selectedGroupHunkIndex: 99,
+            groupCommitMessages: [groupA.id.uuidString: AIHunkGrouper.defaultCommitMessage(for: groupA)]
+        )
+        let fallbackProject = Project(url: dir)
+        fallbackProject.restoreAIGroupState(invalidSelectionState)
+        XCTAssertEqual(fallbackProject.selectedGroupID, groupA.id)
+        XCTAssertEqual(fallbackProject.selectedGroupFilePath, "a.swift")
+        XCTAssertEqual(fallbackProject.selectedGroupRowID, ChangeRow.fileID("a.swift"))
+        XCTAssertEqual(fallbackProject.selectedGroupHunkIndex, 0)
+        XCTAssertTrue(fallbackProject.groupCommitMessages.isEmpty)
+    }
 }

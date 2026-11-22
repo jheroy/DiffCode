@@ -12,6 +12,17 @@ extension AppStore {
         agentModelsByProvider[provider]?.first(where: \.isDefault)
     }
 
+    /// Populates `agentModelsByProvider` from persisted settings so model pickers show cached options on launch.
+    func restoreCachedAgentModels() {
+        guard !AppEnvironment.isAppStore else { return }
+        for provider in AgentProvider.allCases {
+            let cached = settings.cachedAIModels(for: provider)
+            if (agentModelsByProvider[provider]?.isEmpty ?? true), !cached.isEmpty {
+                agentModelsByProvider[provider] = cached
+            }
+        }
+    }
+
     /// Ensures agent availability and models for `task`'s provider have been loaded at least once.
     /// Fast-paths immediately with zero allocations when already cached or attempted, so switching
     /// back to a grouped project never blocks or re-probes the environment.
@@ -96,13 +107,30 @@ extension AppStore {
                 )
                 try Task.checkCancellation()
                 guard self.agentModelLoadTokens[provider] == token else { return }
-                self.agentModelsByProvider[provider] = models
+                if !models.isEmpty {
+                    self.agentModelsByProvider[provider] = models
+                    self.settings.setCachedAIModels(models, for: provider)
+                } else if self.agentModelsByProvider[provider]?.isEmpty ?? true {
+                    self.agentModelAttemptedProviders.remove(provider)
+                }
                 self.agentModelErrors[provider] = nil
             } catch is CancellationError {
-                // Superseded by a newer refresh or provider switch.
+                if self.agentModelLoadTokens[provider] == token {
+                    self.agentModelAttemptedProviders.remove(provider)
+                }
             } catch {
                 guard self.agentModelLoadTokens[provider] == token else { return }
                 self.agentModelErrors[provider] = error.localizedDescription
+                let hasCached = !(self.agentModelsByProvider[provider]?.isEmpty ?? true)
+                let isNotInstalled: Bool
+                if case LocalAgentError.providerNotInstalled = error {
+                    isNotInstalled = true
+                } else {
+                    isNotInstalled = false
+                }
+                if !isNotInstalled && !hasCached {
+                    self.agentModelAttemptedProviders.remove(provider)
+                }
             }
         }
     }
@@ -187,6 +215,7 @@ extension AppStore {
                         project.selectedGroupHunkIndex = firstFile.hunkIndices.first ?? 0
                     }
                 }
+                self.persistAIGroups(for: project)
 
                 let summary = result.groups.count == 1
                     ? L("Grouped \(result.totalHunks) changes into 1 group", "已将 \(result.totalHunks) 处变更归为 1 组")
@@ -212,8 +241,153 @@ extension AppStore {
             pendingGroupHunkFocus = nil
         }
         project.clearAIGroups()
+        deletePersistedAIGroups(for: project)
         if project.id == selectedProjectID {
             viewer.setHighlightedGroupHunks(nil)
+        }
+    }
+
+    /// Deletes a single logical group from `project` without touching git working-tree changes,
+    /// updating the selection and persisted record immediately.
+    func deleteAIGroup(_ group: AIHunkGroup, in project: Project) {
+        guard !project.isCommittingGroup, let currentResult = project.aiGroupResult else { return }
+        let groupID = group.id
+        let previousIndex = currentResult.groups.firstIndex(where: { $0.id == groupID })
+        guard let updatedResult = AIHunkGrouper.resultAfterDeleting(groupID: groupID, in: currentResult) else {
+            clearAIGroups(for: project)
+            if project.id == selectedProjectID {
+                syncViewer()
+            }
+            return
+        }
+
+        if project.generatingGroupCommitID == groupID {
+            project.cancelGroupCommitMessageGeneration()
+        }
+        project.groupCommitMessages.removeValue(forKey: groupID)
+        project.aiGroupResult = updatedResult
+        reconcileAIGroupState(for: updatedResult, removedGroupID: groupID, previousIndex: previousIndex, in: project)
+        persistAIGroups(for: project)
+
+        if project.id == selectedProjectID {
+            syncViewer()
+        }
+    }
+
+    /// Prunes or clears AI group records when files are committed outside the Groups tab.
+    func updateAIGroupsAfterExternalCommit(
+        committedPaths: Set<String>,
+        in project: Project,
+        newHeadOID: String?
+    ) {
+        guard !committedPaths.isEmpty, let currentResult = project.aiGroupResult else { return }
+        let previousIndex = project.selectedGroupID.flatMap { id in
+            currentResult.groups.firstIndex(where: { $0.id == id })
+        }
+        guard let updatedResult = AIHunkGrouper.resultAfterRemovingFiles(committedPaths, in: currentResult) else {
+            clearAIGroups(for: project)
+            return
+        }
+        project.aiGroupResult = updatedResult
+        reconcileAIGroupState(for: updatedResult, removedGroupID: nil, previousIndex: previousIndex, in: project)
+        persistAIGroups(for: project, headOIDOverride: newHeadOID)
+    }
+
+    // MARK: AI Group Persistence
+
+    func restoreAIGroups(for project: Project) {
+        guard !AppEnvironment.isAppStore else { return }
+        guard let state = aiGroupStorage.load(for: project.url) else { return }
+        project.restoreAIGroupState(state)
+    }
+
+    func persistAIGroups(for project: Project, headOIDOverride: String? = nil) {
+        aiGroupPersistTasks.removeValue(forKey: project.id)?.cancel()
+        guard !AppEnvironment.isAppStore else { return }
+        if let state = project.persistedAIGroupState(headOIDOverride: headOIDOverride) {
+            aiGroupStorage.save(state, for: project.url)
+        } else {
+            aiGroupStorage.delete(for: project.url)
+        }
+    }
+
+    func schedulePersistAIGroups(for project: Project) {
+        aiGroupPersistTasks.removeValue(forKey: project.id)?.cancel()
+        guard !AppEnvironment.isAppStore else { return }
+        aiGroupPersistTasks[project.id] = Task { @MainActor [weak self, weak project] in
+            do {
+                try await Task.sleep(for: .milliseconds(400))
+            } catch {
+                return
+            }
+            guard let self, let project else { return }
+            self.aiGroupPersistTasks.removeValue(forKey: project.id)
+            self.persistAIGroups(for: project)
+        }
+    }
+
+    func deletePersistedAIGroups(for project: Project) {
+        aiGroupPersistTasks.removeValue(forKey: project.id)?.cancel()
+        aiGroupStorage.delete(for: project.url)
+    }
+
+    func flushAllPersistedAIGroups() {
+        for (_, task) in aiGroupPersistTasks {
+            task.cancel()
+        }
+        aiGroupPersistTasks.removeAll()
+        guard !AppEnvironment.isAppStore else { return }
+        for project in projects where project.aiGroupResult != nil {
+            persistAIGroups(for: project)
+        }
+    }
+
+    private func reconcileAIGroupState(
+        for updatedResult: AIHunkGroupingResult,
+        removedGroupID: UUID? = nil,
+        previousIndex: Int? = nil,
+        in project: Project
+    ) {
+        let validIDs = Set(updatedResult.groups.map(\.id))
+        if project.groupCommitMessages.keys.contains(where: { !validIDs.contains($0) }) {
+            project.groupCommitMessages = project.groupCommitMessages.filter { validIDs.contains($0.key) }
+        }
+        if let generatingID = project.generatingGroupCommitID, !validIDs.contains(generatingID) {
+            project.cancelGroupCommitMessageGeneration()
+        }
+
+        let needsReselect = project.selectedGroupID == nil
+            || (removedGroupID != nil && project.selectedGroupID == removedGroupID)
+            || !validIDs.contains(project.selectedGroupID!)
+        if needsReselect {
+            let nextIdx = min(max(0, previousIndex ?? 0), updatedResult.groups.count - 1)
+            let nextGroup = updatedResult.groups[nextIdx]
+            project.selectedGroupID = nextGroup.id
+            project.groupCollapsed.removeAll()
+            project.selectedGroupFilePath = nil
+            project.selectedGroupRowID = nil
+            project.selectedGroupHunkIndex = nil
+            if let firstFile = project.orderedGroupFiles(for: nextGroup, flat: settings.flatList).first ?? nextGroup.files.first {
+                project.selectedGroupFilePath = firstFile.path
+                project.selectedGroupRowID = ChangeRow.fileID(firstFile.path)
+                project.selectedGroupHunkIndex = firstFile.hunkIndices.first ?? 0
+            }
+        } else if let activeID = project.selectedGroupID,
+                  let activeGroup = updatedResult.groups.first(where: { $0.id == activeID }) {
+            if let currentPath = project.selectedGroupFilePath,
+               let activeFile = activeGroup.files.first(where: { $0.path == currentPath }) {
+                if let hunk = project.selectedGroupHunkIndex, !activeFile.hunkIndices.contains(hunk) {
+                    project.selectedGroupHunkIndex = activeFile.hunkIndices.first ?? 0
+                }
+            } else if let firstFile = project.orderedGroupFiles(for: activeGroup, flat: settings.flatList).first ?? activeGroup.files.first {
+                project.selectedGroupFilePath = firstFile.path
+                project.selectedGroupRowID = ChangeRow.fileID(firstFile.path)
+                project.selectedGroupHunkIndex = firstFile.hunkIndices.first ?? 0
+            } else {
+                project.selectedGroupFilePath = nil
+                project.selectedGroupRowID = nil
+                project.selectedGroupHunkIndex = nil
+            }
         }
     }
 
@@ -224,6 +398,7 @@ extension AppStore {
         if changedGroup {
             project.selectedGroupID = group.id
             project.groupCollapsed.removeAll()
+            schedulePersistAIGroups(for: project)
         }
         guard project.id == selectedProjectID else { return }
 
@@ -252,12 +427,18 @@ extension AppStore {
         guard project.id == selectedProjectID else { return }
         exitExternalFileMode()
         project.browsedPath = nil
+        let selectionChanged = project.selectedGroupID != group.id
+            || project.selectedGroupFilePath != filePath
+            || project.selectedGroupHunkIndex != hunkIndex
         if project.selectedGroupID != group.id {
             project.selectedGroupID = group.id
         }
         project.selectedGroupFilePath = filePath
         project.selectedGroupRowID = ChangeRow.fileID(filePath)
         project.selectedGroupHunkIndex = hunkIndex
+        if selectionChanged, project.aiGroupResult != nil {
+            schedulePersistAIGroups(for: project)
+        }
 
         let rawRequest: DiffRequest
         if let change = project.change(forPath: filePath) {
@@ -394,59 +575,15 @@ extension AppStore {
                     project.aiGroupResult = updatedResult
 
                     if let updatedResult {
-                        let validIDs = Set(updatedResult.groups.map(\.id))
-                        if project.groupCommitMessages.keys.contains(where: { !validIDs.contains($0) }) {
-                            project.groupCommitMessages = project.groupCommitMessages.filter { validIDs.contains($0.key) }
-                        }
-                        if let generatingID = project.generatingGroupCommitID, !validIDs.contains(generatingID) {
-                            project.cancelGroupCommitMessageGeneration()
-                        }
-
-                        let needsReselect = project.selectedGroupID == nil
-                            || project.selectedGroupID == groupID
-                            || !validIDs.contains(project.selectedGroupID!)
-                        if needsReselect {
-                            let nextIdx = min(previousIndex ?? 0, updatedResult.groups.count - 1)
-                            let nextGroup = updatedResult.groups[nextIdx]
-                            project.selectedGroupID = nextGroup.id
-                            project.groupCollapsed.removeAll()
-                            project.selectedGroupFilePath = nil
-                            project.selectedGroupRowID = nil
-                            project.selectedGroupHunkIndex = nil
-                            if let firstFile = project.orderedGroupFiles(for: nextGroup, flat: self.settings.flatList).first ?? nextGroup.files.first {
-                                project.selectedGroupFilePath = firstFile.path
-                                project.selectedGroupRowID = ChangeRow.fileID(firstFile.path)
-                                project.selectedGroupHunkIndex = firstFile.hunkIndices.first ?? 0
-                            }
-                        } else if let activeID = project.selectedGroupID,
-                                  let activeGroup = updatedResult.groups.first(where: { $0.id == activeID }) {
-                            if let currentPath = project.selectedGroupFilePath,
-                               let activeFile = activeGroup.files.first(where: { $0.path == currentPath }) {
-                                if let hunk = project.selectedGroupHunkIndex, !activeFile.hunkIndices.contains(hunk) {
-                                    project.selectedGroupHunkIndex = activeFile.hunkIndices.first ?? 0
-                                }
-                            } else if let firstFile = project.orderedGroupFiles(for: activeGroup, flat: self.settings.flatList).first ?? activeGroup.files.first {
-                                project.selectedGroupFilePath = firstFile.path
-                                project.selectedGroupRowID = ChangeRow.fileID(firstFile.path)
-                                project.selectedGroupHunkIndex = firstFile.hunkIndices.first ?? 0
-                            } else {
-                                project.selectedGroupFilePath = nil
-                                project.selectedGroupRowID = nil
-                                project.selectedGroupHunkIndex = nil
-                            }
-                        }
+                        self.reconcileAIGroupState(
+                            for: updatedResult,
+                            removedGroupID: groupID,
+                            previousIndex: previousIndex,
+                            in: project
+                        )
+                        self.persistAIGroups(for: project, headOIDOverride: result.hash)
                     } else {
-                        project.cancelGroupCommitMessageGeneration()
-                        project.groupCommitMessages.removeAll()
-                        project.selectedGroupID = nil
-                        project.selectedGroupRowID = nil
-                        project.selectedGroupFilePath = nil
-                        project.selectedGroupHunkIndex = nil
-                        project.groupCollapsed.removeAll()
-                        if project.id == self.selectedProjectID {
-                            self.pendingGroupHunkFocus = nil
-                            self.viewer.setHighlightedGroupHunks(nil)
-                        }
+                        self.clearAIGroups(for: project)
                     }
                 }
 
@@ -516,6 +653,7 @@ extension AppStore {
                 try Task.checkCancellation()
                 guard project.groupCommitMessageToken == token else { return }
                 project.setCommitMessage(generated, for: group)
+                self.persistAIGroups(for: project)
                 self.showToast(L("Commit message generated", "已生成提交信息"))
             } catch is CancellationError {
                 // Cancelled by user or project switch; keep existing draft intact.
@@ -537,5 +675,6 @@ extension AppStore {
             project.cancelGroupCommitMessageGeneration()
         }
         project.resetCommitMessage(for: group)
+        persistAIGroups(for: project)
     }
 }

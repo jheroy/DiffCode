@@ -91,6 +91,32 @@ final class AICommitTests: XCTestCase {
         XCTAssertEqual(afterReset.commitMessageFormat, Settings.defaultCommitMessageFormat)
     }
 
+    @MainActor
+    func testCachedAIModelsPersistenceAndEmptyGuard() {
+        let suiteName = "dif.aicommit.models.tests.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Could not create isolated UserDefaults suite")
+            return
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = Settings(defaults: defaults)
+        XCTAssertTrue(settings.cachedAIModels(for: .agy).isEmpty)
+
+        let models = [
+            AgentModel(id: "gemini-4-neon", name: "Gemini 4 Neon", provider: .agy, isDefault: true),
+            AgentModel(id: "gemini-4-argon", name: "Gemini 4 Argon", provider: .agy, isDefault: false),
+        ]
+        settings.setCachedAIModels(models, for: .agy)
+        // Empty lists must never overwrite a valid cached model list.
+        settings.setCachedAIModels([], for: .agy)
+        XCTAssertEqual(settings.cachedAIModels(for: .agy), models)
+
+        let reloaded = Settings(defaults: defaults)
+        XCTAssertEqual(reloaded.cachedAIModels(for: .agy), models)
+        XCTAssertTrue(reloaded.cachedAIModels(for: .codex).isEmpty)
+    }
+
     // MARK: - Prompt & Response Cleaning
 
     func testBuildPromptEmbedsCustomFormatSummaryAndDiff() {

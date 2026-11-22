@@ -94,6 +94,8 @@ final class AppStore {
     @ObservationIgnored var agentModelLoadTasks: [AgentProvider: Task<Void, Never>] = [:]
     /// Pending hunk focus requested from the Groups tab while the target file finishes loading.
     @ObservationIgnored var pendingGroupHunkFocus: (root: URL, path: String, hunkIndex: Int)?
+    @ObservationIgnored let aiGroupStorage = AIGroupStorage.shared
+    @ObservationIgnored var aiGroupPersistTasks: [UUID: Task<Void, Never>] = [:]
 
     @ObservationIgnored var recent: [RecentFile] = []
     /// Rollbacks and deletes that can still be undone, oldest first.
@@ -150,6 +152,7 @@ final class AppStore {
         gitGraph.store = self
         references.store = self
         fileSymbols.store = self
+        restoreCachedAgentModels()
     }
 
     var currentProject: Project? {
@@ -162,6 +165,7 @@ final class AppStore {
     // MARK: Lifecycle
 
     func bootstrap() {
+        restoreCachedAgentModels()
         let defaults = UserDefaults.standard
         let access = FolderAccess.shared
         access.restore()
@@ -226,6 +230,7 @@ final class AppStore {
         project.isVisibleProvider = { [weak self] in self?.isWindowVisible ?? true }
         project.startWatching()
         projects.append(project)
+        restoreAIGroups(for: project)
     }
 
     private func persistProjects() {
@@ -373,6 +378,7 @@ final class AppStore {
         terminals.removeAll(for: project)
         project.cancelCommitMessageGeneration()
         project.cancelAIGroupGeneration()
+        deletePersistedAIGroups(for: project)
         project.stopWatching()
         projects.removeAll { $0.id == project.id }
         FolderAccess.shared.release(project.url.path, keepingFor: projects.map(\.url.path))
@@ -553,6 +559,19 @@ final class AppStore {
         syncWorktrees(of: project)
         if mergeSession?.project.id == project.id {
             mergeSession?.refreshFromProjectStatus()
+        }
+        if project.hasLoaded,
+           project.errorMessage == nil,
+           project.aiGroupResult != nil,
+           project.changes.isEmpty,
+           !project.isCommitting,
+           !project.isCommittingGroup,
+           !project.isGeneratingGroups {
+            let editingInProject = viewer.request?.root == project.url
+                && viewer.isEditing(root: project.url, path: viewer.request?.path ?? "")
+            if !editingInProject {
+                clearAIGroups(for: project)
+            }
         }
         let currentSig = project.status.conflictSignature
         if project.id == selectedProjectID,

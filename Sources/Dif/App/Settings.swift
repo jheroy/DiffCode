@@ -232,6 +232,23 @@ final class Settings {
         save()
     }
 
+    private static let aiCachedModelsKey = "aiCachedAgentModels"
+    @ObservationIgnored private var aiCachedModels: [String: [AgentModel]] = [:]
+
+    /// Returns the persisted model list last fetched for `provider`, or `[]` when never cached.
+    func cachedAIModels(for provider: AgentProvider) -> [AgentModel] {
+        aiCachedModels[provider.rawValue] ?? []
+    }
+
+    /// Persists a non-empty model list for `provider` so pickers populate immediately across launches.
+    func setCachedAIModels(_ models: [AgentModel], for provider: AgentProvider) {
+        guard !models.isEmpty, aiCachedModels[provider.rawValue] != models else { return }
+        aiCachedModels[provider.rawValue] = models
+        if let data = try? JSONEncoder().encode(aiCachedModels) {
+            defaults.set(data, forKey: Self.aiCachedModelsKey)
+        }
+    }
+
     @ObservationIgnored private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
@@ -273,6 +290,10 @@ final class Settings {
         aiCommitModels = defaults.dictionary(forKey: "aiCommitModels") as? [String: String] ?? legacyModels
         aiGroupingProvider = AgentProvider(rawValue: defaults.string(forKey: "aiGroupingProvider") ?? "") ?? legacyProvider
         aiGroupingModels = defaults.dictionary(forKey: "aiGroupingModels") as? [String: String] ?? legacyModels
+        if let cachedData = defaults.data(forKey: Self.aiCachedModelsKey),
+           let decoded = try? JSONDecoder().decode([String: [AgentModel]].self, from: cachedData) {
+            aiCachedModels = decoded.filter { AgentProvider(rawValue: $0.key) != nil && !$0.value.isEmpty }
+        }
         if let savedFormat = defaults.string(forKey: "commitMessageFormat"),
            !savedFormat.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             commitMessageFormat = savedFormat

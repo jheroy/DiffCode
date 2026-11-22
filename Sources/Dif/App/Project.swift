@@ -187,7 +187,7 @@ final class Project: Identifiable {
     @ObservationIgnored var historyPaths: [String: String] = [:]
 
     // AI Hunk Grouping
-    /// Latest AI logical grouping of uncommitted hunks; always starts empty (`nil`) until requested.
+    /// Latest AI logical grouping of uncommitted hunks (restored from disk on project load when present).
     var aiGroupResult: AIHunkGroupingResult? = nil {
         didSet {
             aiGroupVersion &+= 1
@@ -437,6 +437,70 @@ final class Project: Identifiable {
         selectedGroupFilePath = nil
         selectedGroupHunkIndex = nil
         groupCommitMessages.removeAll()
+    }
+
+    /// Captures a serializable snapshot of the active AI grouping result, selection, and customized drafts.
+    func persistedAIGroupState(headOIDOverride: String? = nil) -> PersistedAIGroupState? {
+        guard let result = aiGroupResult, !result.groups.isEmpty else { return nil }
+        let groupsByID = Dictionary(uniqueKeysWithValues: result.groups.map { ($0.id, $0) })
+        var serializedDrafts: [String: String] = [:]
+        for (groupID, draft) in groupCommitMessages {
+            guard let group = groupsByID[groupID],
+                  draft != AIHunkGrouper.defaultCommitMessage(for: group) else { continue }
+            serializedDrafts[groupID.uuidString] = draft
+        }
+        return PersistedAIGroupState(
+            result: result,
+            selectedGroupID: selectedGroupID,
+            selectedGroupFilePath: selectedGroupFilePath,
+            selectedGroupHunkIndex: selectedGroupHunkIndex,
+            groupCommitMessages: serializedDrafts,
+            headOID: headOIDOverride ?? status.headOID
+        )
+    }
+
+    /// Restores a previously persisted AI grouping result, validating active group, file, hunk, and drafts.
+    func restoreAIGroupState(_ state: PersistedAIGroupState) {
+        guard !state.result.groups.isEmpty else { return }
+        aiGroupResult = state.result
+        aiGroupError = nil
+        groupCollapsed.removeAll()
+
+        let groupsByID = Dictionary(uniqueKeysWithValues: state.result.groups.map { ($0.id, $0) })
+        var restoredDrafts: [UUID: String] = [:]
+        for (rawID, draft) in state.groupCommitMessages {
+            guard let uuid = UUID(uuidString: rawID),
+                  let group = groupsByID[uuid],
+                  draft != AIHunkGrouper.defaultCommitMessage(for: group) else { continue }
+            restoredDrafts[uuid] = draft
+        }
+        groupCommitMessages = restoredDrafts
+
+        let activeGroup = state.selectedGroupID.flatMap { groupsByID[$0] } ?? state.result.groups.first
+        selectedGroupID = activeGroup?.id
+
+        if let activeGroup {
+            let matchedFile = state.selectedGroupFilePath.flatMap { path in
+                activeGroup.files.first { $0.path == path }
+            } ?? activeGroup.files.first
+            if let file = matchedFile {
+                selectedGroupFilePath = file.path
+                selectedGroupRowID = ChangeRow.fileID(file.path)
+                if let savedHunk = state.selectedGroupHunkIndex, file.hunkIndices.contains(savedHunk) {
+                    selectedGroupHunkIndex = savedHunk
+                } else {
+                    selectedGroupHunkIndex = file.hunkIndices.first ?? 0
+                }
+            } else {
+                selectedGroupFilePath = nil
+                selectedGroupRowID = nil
+                selectedGroupHunkIndex = nil
+            }
+        } else {
+            selectedGroupFilePath = nil
+            selectedGroupRowID = nil
+            selectedGroupHunkIndex = nil
+        }
     }
 
     /// O(1) lookup of a working-tree `FileChange` by repository-relative path, cached per `changesVersion`.

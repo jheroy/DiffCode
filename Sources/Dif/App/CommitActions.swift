@@ -125,6 +125,13 @@ extension AppStore {
                 // Only if nobody started a new message while git was at work. After an amend, what was being
                 // written before comes back.
                 if project.commitMessage == message { project.commitMessage = amend ? (draft?.before ?? "") : "" }
+                if !targets.isEmpty {
+                    self.updateAIGroupsAfterExternalCommit(
+                        committedPaths: committed,
+                        in: project,
+                        newHeadOID: result.hash
+                    )
+                }
                 self.afterHistoryChanged(project)
                 let files = result.fileCount == 1 ? L("1 file", "1 个文件") : L("\(result.fileCount) files", "\(result.fileCount) 个文件")
                 let part = partial.isEmpty ? "" : L(", \(partial.count) in part", "（\(partial.count) 个部分提交）")
@@ -166,6 +173,9 @@ extension AppStore {
                 // Lines picked before the merge were picked against the old HEAD.
                 if !project.excludedLines.isEmpty { project.excludedLines = [:] }
                 if project.commitMessage == message { project.commitMessage = "" }
+                if project.aiGroupResult != nil {
+                    self.clearAIGroups(for: project)
+                }
                 self.afterHistoryChanged(project)
                 self.showToast(L("Merge committed · \(result.shortHash)", "合并已提交 · \(result.shortHash)"))
                 if thenPush { self.push(in: project) }

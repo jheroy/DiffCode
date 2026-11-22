@@ -1853,7 +1853,7 @@ struct SettingsView: View {
         let selectedModel = settings.aiModel(for: provider, task: task)
         let defaultModel = models.first(where: \.isDefault)
         let missingModel: String? = selectedModel.flatMap { chosen in
-            models.isEmpty || models.contains(where: { $0.id == chosen }) ? nil : chosen
+            models.contains(where: { $0.id == chosen }) ? nil : chosen
         }
 
         return VStack(alignment: .leading, spacing: 4) {
@@ -1890,10 +1890,11 @@ struct SettingsView: View {
                                 .tag(String?.some(model.id))
                         }
                         if let missingModel {
-                            Text("\(missingModel) (\(L("saved", "已保存")))")
+                            Text(models.isEmpty ? missingModel : "\(missingModel) (\(L("saved", "已保存")))")
                                 .tag(String?.some(missingModel))
                         }
                     }
+                    .id(provider)
                     .pickerStyle(.menu)
                     .labelsHidden()
                     .frame(width: UI.s(164))

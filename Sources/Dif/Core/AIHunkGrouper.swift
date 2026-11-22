@@ -949,17 +949,61 @@ enum AIHunkGrouper {
             }
         }
 
-        guard !remainingGroups.isEmpty else { return nil }
+        return rebuildResult(from: remainingGroups, basedOn: result)
+    }
 
-        let totalHunks = remainingGroups.reduce(0) { $0 + $1.hunkCount }
-        let totalFiles = Set(remainingGroups.flatMap { $0.files.map(\.path) }).count
+    /// Removes `groupID` after manual deletion without shifting hunk indices of remaining groups.
+    /// Returns `nil` when no groups remain.
+    static func resultAfterDeleting(
+        groupID: UUID,
+        in result: AIHunkGroupingResult
+    ) -> AIHunkGroupingResult? {
+        let remainingGroups = result.groups.filter { $0.id != groupID }
+        return rebuildResult(from: remainingGroups, basedOn: result)
+    }
+
+    /// Removes all entries matching `paths` (for example after committing whole files from the Changes tab),
+    /// dropping groups that become empty. Returns `nil` when no groups remain.
+    static func resultAfterRemovingFiles(
+        _ paths: Set<String>,
+        in result: AIHunkGroupingResult
+    ) -> AIHunkGroupingResult? {
+        guard !paths.isEmpty else {
+            return result.groups.isEmpty ? nil : result
+        }
+
+        var remainingGroups: [AIHunkGroup] = []
+        remainingGroups.reserveCapacity(result.groups.count)
+
+        for group in result.groups {
+            let keptFiles = group.files.filter { !paths.contains($0.path) && !$0.hunkIndices.isEmpty }
+            if !keptFiles.isEmpty {
+                remainingGroups.append(AIHunkGroup(
+                    id: group.id,
+                    name: group.name,
+                    summary: group.summary,
+                    files: keptFiles
+                ))
+            }
+        }
+
+        return rebuildResult(from: remainingGroups, basedOn: result)
+    }
+
+    private static func rebuildResult(
+        from groups: [AIHunkGroup],
+        basedOn base: AIHunkGroupingResult
+    ) -> AIHunkGroupingResult? {
+        guard !groups.isEmpty else { return nil }
+        let totalHunks = groups.reduce(0) { $0 + $1.hunkCount }
+        let totalFiles = Set(groups.flatMap { $0.files.map(\.path) }).count
         return AIHunkGroupingResult(
-            groups: remainingGroups,
+            groups: groups,
             totalHunks: totalHunks,
             totalFiles: totalFiles,
-            provider: result.provider,
-            model: result.model,
-            generatedAt: result.generatedAt
+            provider: base.provider,
+            model: base.model,
+            generatedAt: base.generatedAt
         )
     }
 }
