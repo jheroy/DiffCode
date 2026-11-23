@@ -55,29 +55,105 @@ enum LSPNavigationHelper {
         return false
     }
 
+    struct WorkingTreeSymbolMatch: Equatable, Sendable {
+        var line: Int
+        var character: Int
+        var symbolRange: Range<Int>
+    }
+
+    private static func isIdentifierChar(_ c: unichar) -> Bool {
+        (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c >= 0x80
+    }
+
     /// Extracts the identifier token name and UTF-16 range covering `utf16Column` in `line`.
     static func extractSymbol(in line: String, at utf16Column: Int) -> (name: String, range: Range<Int>)? {
         let ns = line as NSString
         let length = ns.length
         guard length > 0 else { return nil }
 
-        func isIdent(_ c: unichar) -> Bool {
-            (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95 || c >= 0x80
-        }
-
         var pivot = max(0, min(utf16Column, length - 1))
-        if !isIdent(ns.character(at: pivot)), pivot > 0, isIdent(ns.character(at: pivot - 1)) {
+        if !isIdentifierChar(ns.character(at: pivot)), pivot > 0, isIdentifierChar(ns.character(at: pivot - 1)) {
             pivot -= 1
         }
-        guard isIdent(ns.character(at: pivot)) else { return nil }
+        guard isIdentifierChar(ns.character(at: pivot)) else { return nil }
 
         var start = pivot
         var end = pivot + 1
-        while start > 0, isIdent(ns.character(at: start - 1)) { start -= 1 }
-        while end < length, isIdent(ns.character(at: end)) { end += 1 }
+        while start > 0, isIdentifierChar(ns.character(at: start - 1)) { start -= 1 }
+        while end < length, isIdentifierChar(ns.character(at: end)) { end += 1 }
         let name = ns.substring(with: NSRange(location: start, length: end - start))
         guard !name.isEmpty else { return nil }
         return (name, start..<end)
+    }
+
+    /// Returns all UTF-16 identifier ranges matching `symbolName` as a whole identifier in `line`.
+    static func identifierRanges(of symbolName: String, in line: String) -> [Range<Int>] {
+        guard !symbolName.isEmpty, line.contains(symbolName) else { return [] }
+        let ns = line as NSString
+        let length = ns.length
+        var matches: [Range<Int>] = []
+        var i = 0
+        while i < length {
+            if !isIdentifierChar(ns.character(at: i)) {
+                i += 1
+                continue
+            }
+            let start = i
+            i += 1
+            while i < length, isIdentifierChar(ns.character(at: i)) { i += 1 }
+            if ns.substring(with: NSRange(location: start, length: i - start)) == symbolName {
+                matches.append(start..<i)
+            }
+        }
+        return matches
+    }
+
+    /// Maps a symbol clicked in a historical commit snapshot onto the closest matching identifier
+    /// occurrence in the current working-tree `diskLines` (prefers exact trimmed-line matches nearby).
+    static func mapSymbolToWorkingTree(
+        symbolName: String,
+        clickedLineText: String,
+        clickedLine: Int,
+        clickedStartColumn: Int,
+        offsetInSymbol: Int,
+        diskLines: [String]
+    ) -> WorkingTreeSymbolMatch? {
+        guard !symbolName.isEmpty, !diskLines.isEmpty else { return nil }
+        let trimmedClicked = clickedLineText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clampedOrigin = max(0, min(clickedLine, diskLines.count - 1))
+        let maxDistance = max(clampedOrigin, diskLines.count - 1 - clampedOrigin)
+        let exactWindow = 50
+        var nearestFallback: WorkingTreeSymbolMatch?
+
+        func matchOnLine(_ lineIndex: Int) -> WorkingTreeSymbolMatch? {
+            let ranges = identifierRanges(of: symbolName, in: diskLines[lineIndex])
+            guard let best = ranges.min(by: {
+                abs($0.lowerBound - clickedStartColumn) < abs($1.lowerBound - clickedStartColumn)
+            }) else { return nil }
+            let clampedOffset = max(0, min(offsetInSymbol, max(0, best.count - 1)))
+            return WorkingTreeSymbolMatch(
+                line: lineIndex,
+                character: best.lowerBound + clampedOffset,
+                symbolRange: best
+            )
+        }
+
+        for d in 0...maxDistance {
+            let candidates = d == 0 ? [clampedOrigin] : [clampedOrigin - d, clampedOrigin + d]
+            for idx in candidates where idx >= 0 && idx < diskLines.count {
+                guard let match = matchOnLine(idx) else { continue }
+                if diskLines[idx].trimmingCharacters(in: .whitespacesAndNewlines) == trimmedClicked {
+                    return match
+                }
+                if nearestFallback == nil {
+                    nearestFallback = match
+                }
+            }
+            if d >= exactWindow, nearestFallback != nil {
+                return nearestFallback
+            }
+        }
+        return nearestFallback
     }
 }
 
@@ -718,75 +794,175 @@ extension AppStore {
         if externalRequest != nil { externalRequest = nil }
     }
 
+    private struct ResolvedLSPQueryTarget {
+        let request: DiffRequest
+        let fileURL: URL
+        let repoRoot: URL?
+        let language: LanguageSpec
+        let line: Int
+        let character: Int
+        let text: String?
+        let symbolName: String
+        let symbolRange: Range<Int>?
+        let isLiveDocument: Bool
+    }
+
+    private func isLSPQueryStillValid(for resolved: ResolvedLSPQueryTarget) -> Bool {
+        guard viewer.request == resolved.request else { return false }
+        if resolved.isLiveDocument {
+            return viewer.lspDocument?.fileURL == resolved.fileURL
+        }
+        return true
+    }
+
+    private func resolveLSPQueryTarget(line: Int, character: Int) async -> ResolvedLSPQueryTarget? {
+        guard AppEnvironment.hasLSP,
+              viewer.isCurrentDocumentLSPEnabled,
+              let request = viewer.request,
+              let doc = viewer.document,
+              case .text = doc.content else {
+            return nil
+        }
+
+        let symbol = symbolAt(line: line, utf16Column: character)
+
+        if request.isLiveFile {
+            guard let active = await viewer.ensureLSPDocumentSynced() else { return nil }
+            guard !Task.isCancelled, viewer.request == request, viewer.lspDocument?.fileURL == active.fileURL else {
+                return nil
+            }
+            let liveText = viewer.document?.right.lines.joined(separator: "\n")
+            return ResolvedLSPQueryTarget(
+                request: request,
+                fileURL: active.fileURL,
+                repoRoot: active.repoRoot,
+                language: active.language,
+                line: line,
+                character: character,
+                text: liveText,
+                symbolName: symbol?.name ?? "",
+                symbolRange: symbol?.range,
+                isLiveDocument: true
+            )
+        }
+
+        // Historical commit view: resolve against the current working-tree file on disk without
+        // sending historical snapshot text via didOpen (which would overwrite live LSP buffers).
+        guard let symbol else {
+            showToast(L("No definition found", "未找到定义"))
+            return nil
+        }
+
+        let fileURL = LSPURI.canonicalFileURL(request.fileURL)
+        let repoRoot = (request.lspRepoRoot ?? request.root)
+        let canonicalRepoRoot = LSPURI.canonicalFileURL(repoRoot)
+        let clickedLineText = doc.right.lines.indices.contains(line) ? doc.right.lines[line] : ""
+        let offsetInSymbol = max(0, min(character - symbol.range.lowerBound, max(0, symbol.range.count - 1)))
+
+        let diskLines: [String]? = await Task.detached(priority: .userInitiated) {
+            guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe),
+                  !TextCodec.looksBinary(data) else {
+                return nil
+            }
+            return TextCodec.splitLines(TextCodec.decode(data))
+        }.value
+
+        guard !Task.isCancelled, viewer.request == request, viewer.document === doc else { return nil }
+        guard let diskLines,
+              let mapped = LSPNavigationHelper.mapSymbolToWorkingTree(
+                  symbolName: symbol.name,
+                  clickedLineText: clickedLineText,
+                  clickedLine: line,
+                  clickedStartColumn: symbol.range.lowerBound,
+                  offsetInSymbol: offsetInSymbol,
+                  diskLines: diskLines
+              ) else {
+            showToast(L("Symbol not found in current working tree", "当前工作区文件中未找到该符号"))
+            return nil
+        }
+
+        return ResolvedLSPQueryTarget(
+            request: request,
+            fileURL: fileURL,
+            repoRoot: canonicalRepoRoot,
+            language: doc.language,
+            line: mapped.line,
+            character: mapped.character,
+            text: nil,
+            symbolName: symbol.name,
+            symbolRange: mapped.symbolRange,
+            isLiveDocument: false
+        )
+    }
+
     /// Smart `⌘+Click` handler:
     /// - If the clicked position IS the symbol's definition/declaration, queries `textDocument/references`
     ///   and opens the References Picker Popup with preview.
     /// - If the clicked position is a reference, jumps directly to a single definition or opens the picker
     ///   when multiple definitions are returned.
     func smartLSPNavigate(line: Int, character: Int) {
-        guard AppEnvironment.hasLSP, viewer.isCurrentDocumentLSPEnabled, let request = viewer.request else { return }
-
-        let symbol = symbolAt(line: line, utf16Column: character)
-        let origin = makeJumpLocation(from: request, line1Based: line + 1, column: character)
+        guard AppEnvironment.hasLSP, viewer.isCurrentDocumentLSPEnabled else { return }
         let lsp = viewer.lspManager
 
         definitionTask?.cancel()
         definitionTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            guard let active = await self.viewer.ensureLSPDocumentSynced() else { return }
-            guard !Task.isCancelled, self.viewer.lspDocument?.fileURL == active.fileURL else { return }
-            let liveText = self.viewer.document?.right.lines.joined(separator: "\n")
-            let rawDefs = await lsp.definition(
-                fileURL: active.fileURL,
-                line: line,
-                character: character,
-                text: liveText,
-                language: active.language,
-                repoRoot: active.repoRoot
+            guard let self, let resolved = await self.resolveLSPQueryTarget(line: line, character: character) else { return }
+            let origin = self.makeJumpLocation(
+                from: resolved.request,
+                line1Based: line + 1,
+                column: character
             )
-            guard !Task.isCancelled, self.viewer.lspDocument?.fileURL == active.fileURL else { return }
+            let rawDefs = await lsp.definition(
+                fileURL: resolved.fileURL,
+                line: resolved.line,
+                character: resolved.character,
+                text: resolved.text,
+                language: resolved.language,
+                repoRoot: resolved.repoRoot
+            )
+            guard !Task.isCancelled, self.isLSPQueryStillValid(for: resolved) else { return }
 
             let defs = LSPManager.deduplicateLocations(rawDefs).filter { $0.fileURL != nil }
             let isOnDef = LSPNavigationHelper.isPositionOnDefinition(
-                fileURL: active.fileURL,
-                line: line,
-                character: character,
-                symbolRange: symbol?.range,
+                fileURL: resolved.fileURL,
+                line: resolved.line,
+                character: resolved.character,
+                symbolRange: resolved.symbolRange,
                 definitions: defs
             )
 
             if isOnDef {
                 var refs = await lsp.references(
-                    fileURL: active.fileURL,
-                    line: line,
-                    character: character,
+                    fileURL: resolved.fileURL,
+                    line: resolved.line,
+                    character: resolved.character,
                     includeDeclaration: false,
-                    text: liveText,
-                    language: active.language,
-                    repoRoot: active.repoRoot
+                    text: resolved.text,
+                    language: resolved.language,
+                    repoRoot: resolved.repoRoot
                 )
-                guard !Task.isCancelled, self.viewer.lspDocument?.fileURL == active.fileURL else { return }
+                guard !Task.isCancelled, self.isLSPQueryStillValid(for: resolved) else { return }
 
                 refs = refs.filter { $0.fileURL != nil }
                 if refs.isEmpty {
                     // Fallback: some servers require includeDeclaration: true; filter out the clicked definition itself.
                     let allRefs = await lsp.references(
-                        fileURL: active.fileURL,
-                        line: line,
-                        character: character,
+                        fileURL: resolved.fileURL,
+                        line: resolved.line,
+                        character: resolved.character,
                         includeDeclaration: true,
-                        text: liveText,
-                        language: active.language,
-                        repoRoot: active.repoRoot
+                        text: resolved.text,
+                        language: resolved.language,
+                        repoRoot: resolved.repoRoot
                     ).filter { $0.fileURL != nil }
-                    guard !Task.isCancelled, self.viewer.lspDocument?.fileURL == active.fileURL else { return }
+                    guard !Task.isCancelled, self.isLSPQueryStillValid(for: resolved) else { return }
 
                     let nonSelf = allRefs.filter { loc in
                         !LSPNavigationHelper.isPositionOnDefinition(
-                            fileURL: active.fileURL,
-                            line: line,
-                            character: character,
-                            symbolRange: symbol?.range,
+                            fileURL: resolved.fileURL,
+                            line: resolved.line,
+                            character: resolved.character,
+                            symbolRange: resolved.symbolRange,
                             definitions: [loc]
                         )
                     }
@@ -798,7 +974,7 @@ extension AppStore {
                     return
                 }
 
-                let name = symbol?.name ?? ""
+                let name = resolved.symbolName
                 let title = name.isEmpty
                     ? L("References", "所有引用")
                     : L("References to \(name)", "引用：\(name)")
@@ -808,8 +984,8 @@ extension AppStore {
                     locations: refs,
                     declarations: defs,
                     origin: origin,
-                    originFileURL: active.fileURL,
-                    originRepoRoot: active.repoRoot
+                    originFileURL: resolved.fileURL,
+                    originRepoRoot: resolved.repoRoot
                 )
                 return
             }
@@ -823,11 +999,11 @@ extension AppStore {
                 self.navigateToLSPLocation(
                     defs[0],
                     origin: origin,
-                    originFileURL: active.fileURL,
-                    originRepoRoot: active.repoRoot
+                    originFileURL: resolved.fileURL,
+                    originRepoRoot: resolved.repoRoot
                 )
             } else {
-                let name = symbol?.name ?? ""
+                let name = resolved.symbolName
                 let title = name.isEmpty
                     ? L("Definitions", "声明列表")
                     : L("Definitions of \(name)", "声明：\(name)")
@@ -837,8 +1013,8 @@ extension AppStore {
                     locations: defs,
                     declarations: defs,
                     origin: origin,
-                    originFileURL: active.fileURL,
-                    originRepoRoot: active.repoRoot
+                    originFileURL: resolved.fileURL,
+                    originRepoRoot: resolved.repoRoot
                 )
             }
         }
@@ -846,27 +1022,26 @@ extension AppStore {
 
     /// Explicit "Go to Definition" (e.g. from context menu): always resolves `textDocument/definition`.
     func goToDefinition(atLine line: Int, utf16Column character: Int) {
-        guard AppEnvironment.hasLSP, viewer.isCurrentDocumentLSPEnabled, let request = viewer.request else { return }
-
-        let symbol = symbolAt(line: line, utf16Column: character)
-        let origin = makeJumpLocation(from: request, line1Based: line + 1, column: character)
+        guard AppEnvironment.hasLSP, viewer.isCurrentDocumentLSPEnabled else { return }
         let lsp = viewer.lspManager
 
         definitionTask?.cancel()
         definitionTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            guard let active = await self.viewer.ensureLSPDocumentSynced() else { return }
-            guard !Task.isCancelled, self.viewer.lspDocument?.fileURL == active.fileURL else { return }
-            let liveText = self.viewer.document?.right.lines.joined(separator: "\n")
-            let rawDefs = await lsp.definition(
-                fileURL: active.fileURL,
-                line: line,
-                character: character,
-                text: liveText,
-                language: active.language,
-                repoRoot: active.repoRoot
+            guard let self, let resolved = await self.resolveLSPQueryTarget(line: line, character: character) else { return }
+            let origin = self.makeJumpLocation(
+                from: resolved.request,
+                line1Based: line + 1,
+                column: character
             )
-            guard !Task.isCancelled, self.viewer.lspDocument?.fileURL == active.fileURL else { return }
+            let rawDefs = await lsp.definition(
+                fileURL: resolved.fileURL,
+                line: resolved.line,
+                character: resolved.character,
+                text: resolved.text,
+                language: resolved.language,
+                repoRoot: resolved.repoRoot
+            )
+            guard !Task.isCancelled, self.isLSPQueryStillValid(for: resolved) else { return }
 
             let defs = LSPManager.deduplicateLocations(rawDefs).filter { $0.fileURL != nil }
             guard !defs.isEmpty else {
@@ -878,11 +1053,11 @@ extension AppStore {
                 self.navigateToLSPLocation(
                     defs[0],
                     origin: origin,
-                    originFileURL: active.fileURL,
-                    originRepoRoot: active.repoRoot
+                    originFileURL: resolved.fileURL,
+                    originRepoRoot: resolved.repoRoot
                 )
             } else {
-                let name = symbol?.name ?? ""
+                let name = resolved.symbolName
                 let title = name.isEmpty
                     ? L("Definitions", "声明列表")
                     : L("Definitions of \(name)", "声明：\(name)")
@@ -892,8 +1067,8 @@ extension AppStore {
                     locations: defs,
                     declarations: defs,
                     origin: origin,
-                    originFileURL: active.fileURL,
-                    originRepoRoot: active.repoRoot
+                    originFileURL: resolved.fileURL,
+                    originRepoRoot: resolved.repoRoot
                 )
             }
         }
@@ -907,37 +1082,36 @@ extension AppStore {
     /// Explicit "Find All References" (e.g. from context menu): resolves `textDocument/references`
     /// with `includeDeclaration: true` and presents the References Picker Popup with preview.
     func findAllReferences(atLine line: Int, utf16Column character: Int) {
-        guard AppEnvironment.hasLSP, viewer.isCurrentDocumentLSPEnabled, let request = viewer.request else { return }
-
-        let symbol = symbolAt(line: line, utf16Column: character)
-        let origin = makeJumpLocation(from: request, line1Based: line + 1, column: character)
+        guard AppEnvironment.hasLSP, viewer.isCurrentDocumentLSPEnabled else { return }
         let lsp = viewer.lspManager
 
         definitionTask?.cancel()
         definitionTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            guard let active = await self.viewer.ensureLSPDocumentSynced() else { return }
-            guard !Task.isCancelled, self.viewer.lspDocument?.fileURL == active.fileURL else { return }
-            let liveText = self.viewer.document?.right.lines.joined(separator: "\n")
+            guard let self, let resolved = await self.resolveLSPQueryTarget(line: line, character: character) else { return }
+            let origin = self.makeJumpLocation(
+                from: resolved.request,
+                line1Based: line + 1,
+                column: character
+            )
             async let refsTask = lsp.references(
-                fileURL: active.fileURL,
-                line: line,
-                character: character,
+                fileURL: resolved.fileURL,
+                line: resolved.line,
+                character: resolved.character,
                 includeDeclaration: true,
-                text: liveText,
-                language: active.language,
-                repoRoot: active.repoRoot
+                text: resolved.text,
+                language: resolved.language,
+                repoRoot: resolved.repoRoot
             )
             async let defsTask = lsp.definition(
-                fileURL: active.fileURL,
-                line: line,
-                character: character,
-                text: liveText,
-                language: active.language,
-                repoRoot: active.repoRoot
+                fileURL: resolved.fileURL,
+                line: resolved.line,
+                character: resolved.character,
+                text: resolved.text,
+                language: resolved.language,
+                repoRoot: resolved.repoRoot
             )
             let (rawRefs, rawDefs) = await (refsTask, defsTask)
-            guard !Task.isCancelled, self.viewer.lspDocument?.fileURL == active.fileURL else { return }
+            guard !Task.isCancelled, self.isLSPQueryStillValid(for: resolved) else { return }
 
             let refs = LSPManager.deduplicateLocations(rawRefs).filter { $0.fileURL != nil }
             guard !refs.isEmpty else {
@@ -945,7 +1119,7 @@ extension AppStore {
                 return
             }
 
-            let name = symbol?.name ?? ""
+            let name = resolved.symbolName
             let title = name.isEmpty
                 ? L("References", "所有引用")
                 : L("References to \(name)", "引用：\(name)")
@@ -955,8 +1129,8 @@ extension AppStore {
                 locations: refs,
                 declarations: rawDefs,
                 origin: origin,
-                originFileURL: active.fileURL,
-                originRepoRoot: active.repoRoot
+                originFileURL: resolved.fileURL,
+                originRepoRoot: resolved.repoRoot
             )
         }
     }
@@ -999,13 +1173,18 @@ extension AppStore {
         let canonicalTarget = LSPURI.canonicalFileURL(targetURL)
         let targetLine0 = location.range.start.line
         let targetCol = max(0, location.range.start.character)
+        let targetLine1 = max(1, targetLine0 + 1)
 
-        if let activeFile = viewer.lspDocument?.fileURL,
-           canonicalTarget == activeFile,
-           let origin,
-           origin.fileURL == canonicalTarget,
-           origin.line == targetLine0 + 1 {
-            viewer.reveal(line: targetLine0 + 1, column: targetCol)
+        if let currentRequest = viewer.request,
+           currentRequest.isLiveFile,
+           LSPURI.canonicalFileURL(currentRequest.fileURL) == canonicalTarget,
+           let doc = viewer.document,
+           case .text = doc.content,
+           !viewer.isLoading {
+            if let origin, origin.fileURL != canonicalTarget || origin.line != targetLine1 {
+                jumpHistory.push(origin)
+            }
+            viewer.reveal(line: targetLine1, column: targetCol)
             viewer.focusCanvas()
             return
         }
@@ -1092,6 +1271,7 @@ extension AppStore {
 
     private func makeJumpLocation(from request: DiffRequest, line1Based: Int, column: Int) -> JumpLocation {
         let canonicalFile = LSPURI.canonicalFileURL(request.fileURL)
+        let groupHunks = viewer.request == request ? viewer.highlightedGroupHunks : nil
         if request.isExternalFile {
             return JumpLocation(
                 fileURL: canonicalFile,
@@ -1099,7 +1279,9 @@ extension AppStore {
                 relativePath: nil,
                 line: max(1, line1Based),
                 column: max(0, column),
-                isExternal: true
+                isExternal: true,
+                request: request,
+                groupHunks: groupHunks
             )
         }
         let canonicalRoot = LSPURI.canonicalFileURL(request.root)
@@ -1110,7 +1292,10 @@ extension AppStore {
             relativePath: request.path,
             line: max(1, line1Based),
             column: max(0, column),
-            isExternal: false
+            isExternal: false,
+            request: request,
+            groupHunks: groupHunks,
+            projectTabRaw: project?.tab.rawValue
         )
     }
 
@@ -1119,14 +1304,14 @@ extension AppStore {
         case .activeProject(let projectID, let relativePath, _, let line, let column):
             guard let project = projects.first(where: { $0.id == projectID }) ?? currentProject else { return }
             exitExternalFileMode()
-            openFile(in: project, path: relativePath, line: line, column: column)
+            openFileForLSP(in: project, path: relativePath, line: line, column: column)
             viewer.focusCanvas()
 
         case .otherProject(let projectID, let relativePath, _, let line, let column):
             guard let project = projects.first(where: { $0.id == projectID }) else { return }
             exitExternalFileMode()
             uncollapseAncestors(of: project)
-            openFile(in: project, path: relativePath, line: line, column: column)
+            openFileForLSP(in: project, path: relativePath, line: line, column: column)
             viewer.focusCanvas()
 
         case .externalReadOnly(let fileURL, let repoRoot, let workspaceRoot, let displayPath, let line, let column):
@@ -1142,8 +1327,55 @@ extension AppStore {
     }
 
     private func jumpToLocation(_ location: JumpLocation) {
+        if let savedRequest = location.request {
+            if viewer.request == savedRequest,
+               viewer.highlightedGroupHunks == location.groupHunks,
+               viewer.document != nil,
+               !viewer.isLoading {
+                viewer.reveal(line: location.line, column: location.column, resetVimToNormal: true)
+                viewer.focusCanvas()
+                return
+            }
+            if savedRequest.isExternalFile {
+                externalRequest = savedRequest
+                viewer.setBaseStamp(nil)
+                syncGroupHunkFilter(nil, for: savedRequest)
+                viewer.open(savedRequest, line: location.line, column: location.column)
+                viewer.focusCanvas()
+                return
+            }
+            let canonicalRoot = LSPURI.canonicalFileURL(savedRequest.root)
+            if let project = location.projectID.flatMap({ id in projects.first { $0.id == id } })
+                ?? projects.first(where: { LSPURI.canonicalFileURL($0.url) == canonicalRoot }) {
+                if selectedProjectID != project.id {
+                    currentProject?.cancelAIGroupGeneration()
+                    selectedProjectID = project.id
+                    persistProjects()
+                }
+                exitExternalFileMode()
+                pendingGroupHunkFocus = nil
+                uncollapseAncestors(of: project)
+                if let tabRaw = location.projectTabRaw, let tab = ProjectTab(rawValue: tabRaw), project.tab != tab {
+                    project.tab = tab
+                }
+                if savedRequest.source == .file {
+                    project.browsedPath = savedRequest.path
+                    markInChanges(savedRequest.path, in: project)
+                } else {
+                    project.browsedPath = nil
+                }
+                viewer.setBaseStamp(savedRequest.isCommitDiff ? nil : project.status.headOID)
+                syncGroupHunkFilter(location.groupHunks, for: savedRequest)
+                viewer.open(savedRequest, line: location.line, column: location.column, preserveScroll: false)
+                follow(savedRequest.path, in: project)
+                viewer.focusCanvas()
+                return
+            }
+        }
+
         let targetURL = LSPURI.canonicalFileURL(location.fileURL)
         if let currentRequest = viewer.request,
+           currentRequest.isLiveFile,
            LSPURI.canonicalFileURL(currentRequest.fileURL) == targetURL,
            viewer.document != nil,
            !viewer.isLoading {
@@ -1159,7 +1391,7 @@ extension AppStore {
            let relativePath = location.relativePath {
             exitExternalFileMode()
             uncollapseAncestors(of: project)
-            openFile(in: project, path: relativePath, line: location.line, column: location.column)
+            openFileForLSP(in: project, path: relativePath, line: location.line, column: location.column)
             viewer.focusCanvas()
             return
         }

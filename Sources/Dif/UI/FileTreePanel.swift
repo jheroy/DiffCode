@@ -177,6 +177,9 @@ struct FileTreePanel: View {
             }
         } else {
             add(L("Open", "打开")) { open(row) }
+            if let change = row.change {
+                add(L("Show Diff", "查看差异")) { store.showChangeDiff(change, in: project) }
+            }
             if row.change?.kind != .untracked, row.change?.kind != .added {
                 add(L("Show History", "查看历史")) { store.showHistory(path: row.path, in: project) }
             }

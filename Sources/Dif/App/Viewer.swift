@@ -1,6 +1,80 @@
 import AppKit
 import Observation
 
+/// Resolves and steps through occurrences of the identifier under the cursor (`⌃⌥↓` / `⌃⌥↑`).
+enum SymbolOccurrenceNavigator {
+    /// Whole-identifier, case-sensitive occurrences of `symbolName` in `lines`.
+    static func wholeWordOccurrences(of symbolName: String, in lines: [String], side: Side = .right) -> [SearchMatch] {
+        guard !symbolName.isEmpty else { return [] }
+        var matches: [SearchMatch] = []
+        for (lineIndex, line) in lines.enumerated() {
+            for range in LSPNavigationHelper.identifierRanges(of: symbolName, in: line) {
+                matches.append(SearchMatch(side: side, line: lineIndex, range: range))
+            }
+        }
+        return matches
+    }
+
+    /// Converts single-line LSP `documentHighlight` ranges into sorted, deduplicated `SearchMatch` entries.
+    static func matches(from highlights: [LSPDocumentHighlight], in lines: [String], side: Side = .right) -> [SearchMatch] {
+        var result: [SearchMatch] = []
+        result.reserveCapacity(highlights.count)
+        for item in highlights {
+            let line = item.range.start.line
+            guard item.range.end.line == line, line >= 0, line < lines.count else { continue }
+            let length = (lines[line] as NSString).length
+            let start = max(0, min(item.range.start.character, length))
+            let end = max(0, min(item.range.end.character, length))
+            guard end > start else { continue }
+            result.append(SearchMatch(side: side, line: line, range: start..<end))
+        }
+        result.sort { lhs, rhs in
+            if lhs.line != rhs.line { return lhs.line < rhs.line }
+            if lhs.range.lowerBound != rhs.range.lowerBound { return lhs.range.lowerBound < rhs.range.lowerBound }
+            return lhs.range.upperBound < rhs.range.upperBound
+        }
+        var deduped: [SearchMatch] = []
+        deduped.reserveCapacity(result.count)
+        for match in result where deduped.last != match {
+            deduped.append(match)
+        }
+        return deduped
+    }
+
+    /// Returns `true` when `(line, column)` or `symbolRange` lies inside/at the edge of any occurrence in `matches`.
+    static func contains(line: Int, column: Int, symbolRange: Range<Int>?, in matches: [SearchMatch]) -> Bool {
+        for match in matches where match.line == line {
+            if column >= match.range.lowerBound && column <= match.range.upperBound {
+                return true
+            }
+            if let sym = symbolRange, sym.lowerBound < match.range.upperBound && match.range.lowerBound < sym.upperBound {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Returns the wrap-around next (`forward == true`) or previous (`forward == false`) match index from `(line, column)`.
+    static func targetIndex(in matches: [SearchMatch], fromLine line: Int, column: Int, forward: Bool) -> Int? {
+        guard !matches.isEmpty else { return nil }
+        if let currentIndex = matches.firstIndex(where: {
+            $0.line == line && column >= $0.range.lowerBound && column < $0.range.upperBound
+        }) ?? matches.firstIndex(where: {
+            $0.line == line && column == $0.range.upperBound
+        }) {
+            return (currentIndex + (forward ? 1 : -1) + matches.count) % matches.count
+        }
+        if forward {
+            return matches.firstIndex(where: {
+                $0.line > line || ($0.line == line && $0.range.lowerBound > column)
+            }) ?? 0
+        }
+        return matches.lastIndex(where: {
+            $0.line < line || ($0.line == line && $0.range.upperBound <= column)
+        }) ?? (matches.count - 1)
+    }
+}
+
 /// Drives the diff/file viewer: loading documents, change navigation, in-file find.
 ///
 /// Documents are pushed to the canvas imperatively rather than through SwiftUI state, so
@@ -136,6 +210,9 @@ final class ViewerModel: CodeCanvasDelegate {
     @ObservationIgnored var lspDebounceTimer: Timer?
     /// ⌘+Click on a symbol in an LSP-enabled pane (`line` is 0-based, `character` is 0-based UTF-16).
     @ObservationIgnored var onGoToDefinition: ((Int, Int) -> Void)?
+    @ObservationIgnored private var symbolHighlightTask: Task<Void, Never>?
+    @ObservationIgnored private var symbolHighlightGeneration: UInt64 = 0
+    @ObservationIgnored private var symbolOccurrenceCache: (docID: ObjectIdentifier, diffRevision: Int, side: Side, symbolName: String, matches: [SearchMatch])?
 
     // Spreadsheet viewer (see ExcelViewerView.swift).
     /// Target sheet name requested before (or while) an `.xlsx` workbook finishes loading.
@@ -158,8 +235,16 @@ final class ViewerModel: CodeCanvasDelegate {
     }
 
     func excelSessionKey(for fileURL: URL? = nil) -> String {
-        if let request, case .commit(let hash, _) = request.source {
-            return "commit:\(hash):\(request.root.standardizedFileURL.path)/\(request.path)"
+        if let request {
+            switch request.source {
+            case .commit(let hash, _):
+                return "commit:\(hash):\(request.root.standardizedFileURL.path)/\(request.path)"
+            case .commitSteps(let steps):
+                let hash = steps.last?.hash ?? ""
+                return "commit:\(hash):\(request.root.standardizedFileURL.path)/\(request.path)"
+            default:
+                break
+            }
         }
         if let url = fileURL ?? request?.fileURL {
             return url.standardizedFileURL.path
@@ -354,7 +439,7 @@ final class ViewerModel: CodeCanvasDelegate {
                 container?.canvas.showsRevertButtons = canRevertHunks
                 onDocumentChanged?()
             }
-            if current.source == .file || request.source == .file || self.request == request {
+            if self.request == request {
                 if let line {
                     let pos = currentCaretPosition()
                     if line != pos.row + 1 {
@@ -430,6 +515,7 @@ final class ViewerModel: CodeCanvasDelegate {
         loadTask?.cancel()
         blameTask?.cancel()
         closeLSPDocument()
+        clearSymbolOccurrenceState()
         annotationHover = nil
         request = nil
         endEditing()
@@ -510,6 +596,7 @@ final class ViewerModel: CodeCanvasDelegate {
             doc.semanticOptions.collapseUnchanged = settings.collapseUnchanged
         }
         expandedFoldSegments = []
+        clearSymbolOccurrenceState()
         document = doc
         activeLineDiffLocation = preservedLineDiffLocation
         isLoading = false
@@ -994,6 +1081,7 @@ final class ViewerModel: CodeCanvasDelegate {
     }
 
     func hideFind() {
+        clearSymbolOccurrenceState()
         findVisible = false
         findOrigin = nil
         findCount = 0
@@ -1003,6 +1091,7 @@ final class ViewerModel: CodeCanvasDelegate {
     }
 
     func runFind(reveal: Bool) {
+        clearSymbolOccurrenceState()
         guard let container, let doc = document, case .text = doc.content, !findQuery.isEmpty else {
             findCount = 0
             findIndex = 0
@@ -1139,6 +1228,126 @@ final class ViewerModel: CodeCanvasDelegate {
         revealMatch(match, center: true)
     }
 
+    func clearSymbolOccurrenceState() {
+        symbolHighlightTask?.cancel()
+        symbolHighlightTask = nil
+        symbolHighlightGeneration &+= 1
+        symbolOccurrenceCache = nil
+    }
+
+    /// Jumps to the next (`forward == true`) or previous (`forward == false`) occurrence of the symbol under the cursor.
+    /// Uses LSP `textDocument/documentHighlight` when available on live documents, with cached fast path and whole-word fallback.
+    func stepSymbolOccurrence(forward: Bool) {
+        guard let container, let doc = document, case .text = doc.content else { return }
+        let ctx = container.canvas.symbolCursorContext() ?? (.right, currentCaretPosition().row, currentCaretPosition().column)
+        let lines = doc.buffer(ctx.side).lines
+        guard lines.indices.contains(ctx.line),
+              let symbol = LSPNavigationHelper.extractSymbol(in: lines[ctx.line], at: ctx.column) else {
+            return
+        }
+
+        let docID = ObjectIdentifier(doc)
+        if let cache = symbolOccurrenceCache,
+           cache.docID == docID,
+           cache.diffRevision == diffRevision,
+           cache.side == ctx.side,
+           cache.symbolName == symbol.name,
+           SymbolOccurrenceNavigator.contains(line: ctx.line, column: ctx.column, symbolRange: symbol.range, in: cache.matches) {
+            applySymbolOccurrenceJump(matches: cache.matches, originLine: ctx.line, originColumn: ctx.column, forward: forward)
+            return
+        }
+
+        if ctx.side == .right, isCurrentDocumentLSPSyncEnabled, AppEnvironment.hasLSP {
+            symbolHighlightTask?.cancel()
+            symbolHighlightGeneration &+= 1
+            let gen = symbolHighlightGeneration
+            let startRevision = diffRevision
+            let symbolName = symbol.name
+            let symbolRange = symbol.range
+            let originLine = ctx.line
+            let originColumn = ctx.column
+
+            symbolHighlightTask = Task { @MainActor [weak self, weak doc] in
+                guard let self, let doc else { return }
+                var resolvedMatches: [SearchMatch] = []
+                if let active = await self.ensureLSPDocumentSynced() {
+                    guard !Task.isCancelled,
+                          self.symbolHighlightGeneration == gen,
+                          self.document === doc,
+                          self.diffRevision == startRevision else { return }
+                    let text = doc.right.lines.joined(separator: "\n")
+                    let highlights = await self.lspManager.documentHighlight(
+                        fileURL: active.fileURL,
+                        line: originLine,
+                        character: originColumn,
+                        text: text,
+                        language: active.language,
+                        repoRoot: active.repoRoot
+                    )
+                    guard !Task.isCancelled,
+                          self.symbolHighlightGeneration == gen,
+                          self.document === doc,
+                          self.diffRevision == startRevision else { return }
+                    let lspMatches = SymbolOccurrenceNavigator.matches(from: highlights, in: doc.right.lines, side: .right)
+                    if !lspMatches.isEmpty,
+                       SymbolOccurrenceNavigator.contains(line: originLine, column: originColumn, symbolRange: symbolRange, in: lspMatches) {
+                        resolvedMatches = lspMatches
+                    }
+                }
+                guard !Task.isCancelled,
+                      self.symbolHighlightGeneration == gen,
+                      self.document === doc,
+                      self.diffRevision == startRevision else { return }
+                if resolvedMatches.isEmpty {
+                    resolvedMatches = SymbolOccurrenceNavigator.wholeWordOccurrences(of: symbolName, in: doc.right.lines, side: .right)
+                }
+                guard !resolvedMatches.isEmpty else { return }
+                self.symbolOccurrenceCache = (ObjectIdentifier(doc), startRevision, .right, symbolName, resolvedMatches)
+                self.applySymbolOccurrenceJump(matches: resolvedMatches, originLine: originLine, originColumn: originColumn, forward: forward)
+            }
+            return
+        }
+
+        let matches = SymbolOccurrenceNavigator.wholeWordOccurrences(of: symbol.name, in: lines, side: ctx.side)
+        guard !matches.isEmpty else { return }
+        symbolOccurrenceCache = (docID, diffRevision, ctx.side, symbol.name, matches)
+        applySymbolOccurrenceJump(matches: matches, originLine: ctx.line, originColumn: ctx.column, forward: forward)
+    }
+
+    private func applySymbolOccurrenceJump(matches: [SearchMatch], originLine: Int, originColumn: Int, forward: Bool) {
+        guard let container,
+              !matches.isEmpty,
+              let targetIndex = SymbolOccurrenceNavigator.targetIndex(in: matches, fromLine: originLine, column: originColumn, forward: forward) else {
+            return
+        }
+        var bySide: [[Int: [Range<Int>]]] = [[:], [:]]
+        for m in matches {
+            bySide[m.side.rawValue][m.line, default: []].append(m.range)
+        }
+        container.canvas.setHighlightedRanges(bySide, navigation: matches, current: targetIndex)
+        let target = matches[targetIndex]
+        if target.side == .right {
+            if target.line != originLine {
+                onRecordJump?(originLine, originColumn)
+            }
+            if container.canvas.editor != nil || container.canvas.vimModeEnabled {
+                if container.canvas.vimModeEnabled, container.canvas.vimEngine.mode.isVisual {
+                    container.canvas.vimEngine.resetToNormal(switchInputSource: false)
+                }
+                container.canvas.placeCaret(line: target.line, column: target.range.lowerBound)
+                if container.canvas.vimModeEnabled {
+                    container.canvas.reportVimStateIfNeeded(force: true)
+                }
+            } else {
+                container.canvas.selectRange(side: .right, line: target.line, range: target.range)
+            }
+        } else {
+            container.canvas.selectRange(side: .left, line: target.line, range: target.range)
+        }
+        revealMatch(target, center: false)
+        refreshLineDiff(side: target.side, line: target.line)
+    }
+
     func expandSelection() {
         container?.canvas.vimExpandSelection()
     }
@@ -1201,6 +1410,14 @@ final class ViewerModel: CodeCanvasDelegate {
 
     func canvas(_ canvas: CodeCanvasView, expandFoldSegment segmentIndex: Int) {
         expandFoldSegment(segmentIndex)
+    }
+
+    func canvas(_ canvas: CodeCanvasView, didSelectHunk index: Int) {
+        guard let doc = document, doc.hunks.indices.contains(index) else { return }
+        focusedHunk = index
+        detachedFromFocus = false
+        armed = nil
+        canvas.focusedHunk = index
     }
 
     func canvas(_ canvas: CodeCanvasView, performVimAction action: VimAction, line: Int, column: Int) {

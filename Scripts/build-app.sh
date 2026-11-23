@@ -192,6 +192,16 @@ $EXTRA_KEYS    <key>CFBundleDocumentTypes</key>
             <key>LSItemContentTypes</key><array><string>public.folder</string></array>
         </dict>
     </array>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key><string>$BUNDLE_ID</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>diffcode</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>
 PLIST

@@ -358,6 +358,7 @@ extension AppStore {
             project.logRef = name
         }
         project.logQuery = ""
+        project.logAuthors = []
         dismissPopup(restoreFocus: false)
         if !listVisible { withAnimation(.snappy(duration: 0.2)) { listVisible = true } }
         project.browsedPath = nil

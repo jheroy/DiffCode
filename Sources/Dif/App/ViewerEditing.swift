@@ -109,6 +109,7 @@ extension ViewerModel {
     // MARK: Canvas
 
     func canvasDidEdit(_ canvas: CodeCanvasView) {
+        clearSymbolOccurrenceState()
         updateDirty()
         refreshConflicts()
         if let doc = document, hunkCount != doc.hunks.count { hunkCount = doc.hunks.count }

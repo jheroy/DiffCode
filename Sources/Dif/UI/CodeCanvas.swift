@@ -70,6 +70,8 @@ protocol CodeCanvasDelegate: AnyObject {
     func canvas(_ canvas: CodeCanvasView, jumpToMoveCounterpart hunkIndex: Int)
     /// A collapsed unchanged-code fold bar was clicked: expand `segmentIndex`.
     func canvas(_ canvas: CodeCanvasView, expandFoldSegment segmentIndex: Int)
+    /// The user clicked inside change `index`: switch the focused hunk to it without scrolling.
+    func canvas(_ canvas: CodeCanvasView, didSelectHunk index: Int)
 }
 
 // MARK: - Layers
@@ -427,9 +429,9 @@ final class CodeCanvasView: NSView {
             stroke.isHidden = hidden
         }
 
-        func setZOffset(_ offset: CGFloat) {
-            fill.zPosition = 0.2 + offset * 0.4
-            stroke.zPosition = 1.2 + offset
+        func setZPositions(fill fillZ: CGFloat, stroke strokeZ: CGFloat) {
+            fill.zPosition = fillZ
+            stroke.zPosition = strokeZ
         }
     }
 
@@ -2377,6 +2379,9 @@ final class CodeCanvasView: NSView {
         var wordColors = [theme.modifiedWord, theme.addedWord, theme.deletedWord, theme.movedWord]
         let hasRenames = !doc.renameGroups.isEmpty
         let hoveredMovePair = activeHoveredMovePairID
+        let focusedMovePairID: Int? = focusedHunk.flatMap { idx in
+            doc.hunks.indices.contains(idx) ? doc.hunks[idx].moveInfo?.pairID : nil
+        }
 
         switch mode {
         case .sideBySide:
@@ -2390,6 +2395,7 @@ final class CodeCanvasView: NSView {
                 if displayStart > rows.upperBound { break }
                 let k = hunkBucket(hunk)
                 let isFocused = focusedHunk == index
+                    || (focusedMovePairID != nil && hunk.moveInfo?.pairID == focusedMovePairID)
                 if n == 0 {
                     // Moved source/target blocks never draw a fake 0-height gap hairline on the opposite pane.
                     if hunk.moveInfo == nil {
@@ -2745,7 +2751,8 @@ final class CodeCanvasView: NSView {
         let scale = backingScale
         let hoveredPair = activeHoveredMovePairID
         let totalPairs = movePairs.count
-        let maxTurnR: CGFloat = 5.0
+        let maxLead: CGFloat = 16.0
+        let unselectedHalfWidth: CGFloat = 1.0
         let kappa: CGFloat = 0.55228475
 
         func visibleMid(top: CGFloat, bottom: CGFloat) -> CGFloat {
@@ -2767,36 +2774,28 @@ final class CodeCanvasView: NSView {
             }
         }
 
-        func addLeftFunnel(l0: CGFloat, l1: CGFloat, tipX: CGFloat, midY: CGFloat, fill: CGMutablePath, stroke: CGMutablePath) {
-            let bend = tipX * 0.5
-            fill.move(to: CGPoint(x: 0, y: l0))
-            fill.addCurve(to: CGPoint(x: tipX, y: midY), control1: CGPoint(x: bend, y: l0), control2: CGPoint(x: tipX - bend, y: midY))
-            fill.addCurve(to: CGPoint(x: 0, y: l1), control1: CGPoint(x: tipX - bend, y: midY), control2: CGPoint(x: bend, y: l1))
-            fill.closeSubpath()
-
-            let topL = min(l0 + 0.5, midY)
-            let botL = max(l1 - 0.5, midY)
-            stroke.move(to: CGPoint(x: 0, y: topL))
-            stroke.addCurve(to: CGPoint(x: tipX, y: midY), control1: CGPoint(x: bend, y: topL), control2: CGPoint(x: tipX - bend, y: midY))
-            stroke.move(to: CGPoint(x: 0, y: botL))
-            stroke.addCurve(to: CGPoint(x: tipX, y: midY), control1: CGPoint(x: bend, y: botL), control2: CGPoint(x: tipX - bend, y: midY))
+        func addHorizToVert(_ path: CGMutablePath, from p0: CGPoint, to p3: CGPoint) {
+            let c1 = CGPoint(x: p0.x + (p3.x - p0.x) * kappa, y: p0.y)
+            let c2 = CGPoint(x: p3.x, y: p3.y + (p0.y - p3.y) * kappa)
+            path.addCurve(to: p3, control1: c1, control2: c2)
         }
 
-        func addRightFunnel(r0: CGFloat, r1: CGFloat, tipX: CGFloat, midY: CGFloat, fill: CGMutablePath, stroke: CGMutablePath) {
-            let span = x1 - tipX
-            let bend = span * 0.5
-            fill.move(to: CGPoint(x: tipX, y: midY))
-            fill.addCurve(to: CGPoint(x: x1, y: r0), control1: CGPoint(x: tipX + bend, y: midY), control2: CGPoint(x: x1 - bend, y: r0))
-            fill.addLine(to: CGPoint(x: x1, y: r1))
-            fill.addCurve(to: CGPoint(x: tipX, y: midY), control1: CGPoint(x: x1 - bend, y: r1), control2: CGPoint(x: tipX + bend, y: midY))
-            fill.closeSubpath()
+        func addVertToHoriz(_ path: CGMutablePath, from p0: CGPoint, to p3: CGPoint) {
+            let c1 = CGPoint(x: p0.x, y: p0.y + (p3.y - p0.y) * kappa)
+            let c2 = CGPoint(x: p3.x + (p0.x - p3.x) * kappa, y: p3.y)
+            path.addCurve(to: p3, control1: c1, control2: c2)
+        }
 
-            let topR = min(r0 + 0.5, midY)
-            let botR = max(r1 - 0.5, midY)
-            stroke.move(to: CGPoint(x: tipX, y: midY))
-            stroke.addCurve(to: CGPoint(x: x1, y: topR), control1: CGPoint(x: tipX + bend, y: midY), control2: CGPoint(x: x1 - bend, y: topR))
-            stroke.move(to: CGPoint(x: tipX, y: midY))
-            stroke.addCurve(to: CGPoint(x: x1, y: botR), control1: CGPoint(x: tipX + bend, y: midY), control2: CGPoint(x: x1 - bend, y: botR))
+        func sampleHorizToVert(from p0: CGPoint, to p3: CGPoint, steps: Int = 8, to pts: inout [CGPoint]) {
+            let c1 = CGPoint(x: p0.x + (p3.x - p0.x) * kappa, y: p0.y)
+            let c2 = CGPoint(x: p3.x, y: p3.y + (p0.y - p3.y) * kappa)
+            appendCubicSamples(p0: p0, c1: c1, c2: c2, p3: p3, steps: steps, to: &pts)
+        }
+
+        func sampleVertToHoriz(from p0: CGPoint, to p3: CGPoint, steps: Int = 8, to pts: inout [CGPoint]) {
+            let c1 = CGPoint(x: p0.x, y: p0.y + (p3.y - p0.y) * kappa)
+            let c2 = CGPoint(x: p3.x + (p0.x - p3.x) * kappa, y: p3.y)
+            appendCubicSamples(p0: p0, c1: c1, c2: c2, p3: p3, steps: steps, to: &pts)
         }
 
         func addEdgeChevron(x: CGFloat, pointingUp: Bool, to stroke: CGMutablePath) {
@@ -2828,10 +2827,10 @@ final class CodeCanvasView: NSView {
             let r0 = max(rawDstTop, -h), r1 = min(rawDstBottom, 2 * h)
 
             let laneX = moveConnectorLaneX(forPairID: pair.pairID, totalPairs: totalPairs)
-            let tipL = max(6.0, laneX - maxTurnR)
-            let tipR = min(x1 - 6.0, laneX + maxTurnR)
             let isHovered = hoveredPair == pair.pairID
             let isFocused = focusedHunk == pair.sourceHunk || focusedHunk == pair.targetHunk
+            let isActive = isFocused || isHovered
+            let hw = unselectedHalfWidth
 
             let fillPath = CGMutablePath()
             let strokePath = CGMutablePath()
@@ -2841,10 +2840,10 @@ final class CodeCanvasView: NSView {
             if srcVisible && dstVisible {
                 let lMid = visibleMid(top: rawSrcTop, bottom: rawSrcBottom)
                 let rMid = visibleMid(top: rawDstTop, bottom: rawDstBottom)
-                let verticalGap = max(rawSrcTop, rawDstTop) - min(rawSrcBottom, rawDstBottom)
-                let useDirectRibbon = verticalGap <= lh * 0.5 && abs(rMid - lMid) <= max(lh * 3.5, 64)
+                let dir: CGFloat = rMid >= lMid ? 1 : -1
+                let nearGap = dir < 0 ? (l0 - r1) : (r0 - l1)
 
-                if useDirectRibbon {
+                if nearGap < 14 {
                     let bend = x1 * 0.5
                     fillPath.move(to: CGPoint(x: 0, y: l0))
                     fillPath.addCurve(to: CGPoint(x: x1, y: r0), control1: CGPoint(x: bend, y: l0), control2: CGPoint(x: x1 - bend, y: r0))
@@ -2852,12 +2851,14 @@ final class CodeCanvasView: NSView {
                     fillPath.addCurve(to: CGPoint(x: 0, y: l1), control1: CGPoint(x: x1 - bend, y: r1), control2: CGPoint(x: bend, y: l1))
                     fillPath.closeSubpath()
 
-                    let topL = min(l0 + 0.5, lMid), botL = max(l1 - 0.5, lMid)
-                    let topR = min(r0 + 0.5, rMid), botR = max(r1 - 0.5, rMid)
-                    strokePath.move(to: CGPoint(x: 0, y: topL))
-                    strokePath.addCurve(to: CGPoint(x: x1, y: topR), control1: CGPoint(x: bend, y: topL), control2: CGPoint(x: x1 - bend, y: topR))
-                    strokePath.move(to: CGPoint(x: 0, y: botL))
-                    strokePath.addCurve(to: CGPoint(x: x1, y: botR), control1: CGPoint(x: bend, y: botL), control2: CGPoint(x: x1 - bend, y: botR))
+                    if isActive {
+                        let topL = min(l0 + 0.5, lMid), botL = max(l1 - 0.5, lMid)
+                        let topR = min(r0 + 0.5, rMid), botR = max(r1 - 0.5, rMid)
+                        strokePath.move(to: CGPoint(x: 0, y: topL))
+                        strokePath.addCurve(to: CGPoint(x: x1, y: topR), control1: CGPoint(x: bend, y: topL), control2: CGPoint(x: x1 - bend, y: topR))
+                        strokePath.move(to: CGPoint(x: 0, y: botL))
+                        strokePath.addCurve(to: CGPoint(x: x1, y: botR), control1: CGPoint(x: bend, y: botL), control2: CGPoint(x: x1 - bend, y: botR))
+                    }
 
                     appendCubicSamples(
                         p0: CGPoint(x: 0, y: lMid),
@@ -2868,105 +2869,160 @@ final class CodeCanvasView: NSView {
                         to: &spineSamples
                     )
                 } else {
-                    addLeftFunnel(l0: l0, l1: l1, tipX: tipL, midY: lMid, fill: fillPath, stroke: strokePath)
-                    addRightFunnel(r0: r0, r1: r1, tipX: tipR, midY: rMid, fill: fillPath, stroke: strokePath)
+                    let lead = min(maxLead, nearGap * 0.45)
+                    let yJoinL: CGFloat = dir < 0 ? (l0 - lead) : (l1 + lead)
+                    let yJoinR: CGFloat = dir < 0 ? (r1 + lead) : (r0 - lead)
 
-                    let dy = rMid - lMid
-                    let dir: CGFloat = dy >= 0 ? 1 : -1
-                    let turnY = min(maxTurnR, abs(dy) * 0.5)
-                    let dxL = laneX - tipL
-                    let dxR = tipR - laneX
+                    if !isActive {
+                        let xInner = dir < 0 ? (laneX - hw) : (laneX + hw)
+                        let xOuter = dir < 0 ? (laneX + hw) : (laneX - hw)
+                        fillPath.move(to: CGPoint(x: 0, y: l0))
+                        addHorizToVert(fillPath, from: CGPoint(x: 0, y: l0), to: CGPoint(x: xInner, y: yJoinL))
+                        fillPath.addLine(to: CGPoint(x: xInner, y: yJoinR))
+                        addVertToHoriz(fillPath, from: CGPoint(x: xInner, y: yJoinR), to: CGPoint(x: x1, y: r0))
+                        fillPath.addLine(to: CGPoint(x: x1, y: r1))
+                        addHorizToVert(fillPath, from: CGPoint(x: x1, y: r1), to: CGPoint(x: xOuter, y: yJoinR))
+                        fillPath.addLine(to: CGPoint(x: xOuter, y: yJoinL))
+                        addVertToHoriz(fillPath, from: CGPoint(x: xOuter, y: yJoinL), to: CGPoint(x: 0, y: l1))
+                        fillPath.closeSubpath()
+                    } else {
+                        let joinL = CGPoint(x: laneX, y: yJoinL)
+                        let joinR = CGPoint(x: laneX, y: yJoinR)
+                        fillPath.move(to: CGPoint(x: 0, y: l0))
+                        addHorizToVert(fillPath, from: CGPoint(x: 0, y: l0), to: joinL)
+                        addVertToHoriz(fillPath, from: joinL, to: CGPoint(x: 0, y: l1))
+                        fillPath.closeSubpath()
 
-                    let p0 = CGPoint(x: tipL, y: lMid)
-                    let c1L = CGPoint(x: tipL + dxL * kappa, y: lMid)
-                    let c2L = CGPoint(x: laneX, y: lMid + dir * turnY * (1 - kappa))
-                    let pTurnL = CGPoint(x: laneX, y: lMid + dir * turnY)
+                        fillPath.move(to: joinR)
+                        addVertToHoriz(fillPath, from: joinR, to: CGPoint(x: x1, y: r0))
+                        fillPath.addLine(to: CGPoint(x: x1, y: r1))
+                        addHorizToVert(fillPath, from: CGPoint(x: x1, y: r1), to: joinR)
+                        fillPath.closeSubpath()
 
-                    let pTurnR = CGPoint(x: laneX, y: rMid - dir * turnY)
-                    let c1R = CGPoint(x: laneX, y: rMid - dir * turnY * (1 - kappa))
-                    let c2R = CGPoint(x: tipR - dxR * kappa, y: rMid)
-                    let p3 = CGPoint(x: tipR, y: rMid)
+                        let topL = min(l0 + 0.5, lMid), botL = max(l1 - 0.5, lMid)
+                        let topR = min(r0 + 0.5, rMid), botR = max(r1 - 0.5, rMid)
+                        strokePath.move(to: CGPoint(x: 0, y: topL))
+                        addHorizToVert(strokePath, from: CGPoint(x: 0, y: topL), to: joinL)
+                        strokePath.move(to: CGPoint(x: 0, y: botL))
+                        addHorizToVert(strokePath, from: CGPoint(x: 0, y: botL), to: joinL)
 
-                    strokePath.move(to: p0)
-                    strokePath.addCurve(to: pTurnL, control1: c1L, control2: c2L)
-                    if abs(pTurnR.y - pTurnL.y) > 0.25 {
-                        strokePath.addLine(to: pTurnR)
+                        strokePath.move(to: joinL)
+                        strokePath.addLine(to: joinR)
+
+                        strokePath.move(to: joinR)
+                        addVertToHoriz(strokePath, from: joinR, to: CGPoint(x: x1, y: topR))
+                        strokePath.move(to: joinR)
+                        addVertToHoriz(strokePath, from: joinR, to: CGPoint(x: x1, y: botR))
                     }
-                    strokePath.addCurve(to: p3, control1: c1R, control2: c2R)
 
-                    appendCubicSamples(p0: p0, c1: c1L, c2: c2L, p3: pTurnL, to: &spineSamples)
-                    if abs(pTurnR.y - pTurnL.y) > 0.25 {
-                        spineSamples.append(pTurnR)
-                    }
-                    appendCubicSamples(p0: pTurnR, c1: c1R, c2: c2R, p3: p3, to: &spineSamples)
+                    sampleHorizToVert(from: CGPoint(x: 0, y: lMid), to: CGPoint(x: laneX, y: yJoinL), to: &spineSamples)
+                    spineSamples.append(CGPoint(x: laneX, y: yJoinR))
+                    sampleVertToHoriz(from: CGPoint(x: laneX, y: yJoinR), to: CGPoint(x: x1, y: rMid), to: &spineSamples)
                 }
                 clickSourceHunk = (focusedHunk == pair.targetHunk) ? pair.targetHunk : pair.sourceHunk
             } else if srcVisible {
                 let lMid = visibleMid(top: rawSrcTop, bottom: rawSrcBottom)
-                addLeftFunnel(l0: l0, l1: l1, tipX: tipL, midY: lMid, fill: fillPath, stroke: strokePath)
-
                 let goingUp = rawDstBottom < 0
-                let dir: CGFloat = goingUp ? -1 : 1
                 let edgeY: CGFloat = goingUp ? 0 : h
-                let availY = abs(edgeY - lMid)
-                let showChevron = availY > 10
+                let availNear = goingUp ? (l0 - edgeY) : (edgeY - l1)
+                let showChevron = isActive && abs(edgeY - lMid) > 10
                 let endY: CGFloat = showChevron ? (goingUp ? 1.5 : (h - 1.5)) : edgeY
-                let turnY = min(maxTurnR, abs(endY - lMid))
-                let dxL = laneX - tipL
-
-                let p0 = CGPoint(x: tipL, y: lMid)
-                let c1 = CGPoint(x: tipL + dxL * kappa, y: lMid)
-                let c2 = CGPoint(x: laneX, y: lMid + dir * turnY * (1 - kappa))
-                let pTurn = CGPoint(x: laneX, y: lMid + dir * turnY)
-                let pEnd = CGPoint(x: laneX, y: endY)
-
-                strokePath.move(to: p0)
-                strokePath.addCurve(to: pTurn, control1: c1, control2: c2)
-                if abs(pEnd.y - pTurn.y) > 0.25 {
-                    strokePath.addLine(to: pEnd)
-                }
-                if showChevron {
-                    addEdgeChevron(x: laneX, pointingUp: goingUp, to: strokePath)
+                let yJoinL: CGFloat
+                if availNear >= 4 {
+                    let lead = min(maxLead, availNear * 0.65)
+                    yJoinL = goingUp ? max(endY, l0 - lead) : min(endY, l1 + lead)
+                } else {
+                    yJoinL = goingUp ? min(l0, endY) : max(l1, endY)
                 }
 
-                appendCubicSamples(p0: p0, c1: c1, c2: c2, p3: pTurn, to: &spineSamples)
-                if abs(pEnd.y - pTurn.y) > 0.25 {
-                    spineSamples.append(pEnd)
+                if !isActive {
+                    let xInner = goingUp ? (laneX - hw) : (laneX + hw)
+                    let xOuter = goingUp ? (laneX + hw) : (laneX - hw)
+                    fillPath.move(to: CGPoint(x: 0, y: l0))
+                    addHorizToVert(fillPath, from: CGPoint(x: 0, y: l0), to: CGPoint(x: xInner, y: yJoinL))
+                    fillPath.addLine(to: CGPoint(x: xInner, y: endY))
+                    fillPath.addLine(to: CGPoint(x: xOuter, y: endY))
+                    fillPath.addLine(to: CGPoint(x: xOuter, y: yJoinL))
+                    addVertToHoriz(fillPath, from: CGPoint(x: xOuter, y: yJoinL), to: CGPoint(x: 0, y: l1))
+                    fillPath.closeSubpath()
+                } else {
+                    let joinL = CGPoint(x: laneX, y: yJoinL)
+                    fillPath.move(to: CGPoint(x: 0, y: l0))
+                    addHorizToVert(fillPath, from: CGPoint(x: 0, y: l0), to: joinL)
+                    addVertToHoriz(fillPath, from: joinL, to: CGPoint(x: 0, y: l1))
+                    fillPath.closeSubpath()
+
+                    let topL = min(l0 + 0.5, lMid), botL = max(l1 - 0.5, lMid)
+                    strokePath.move(to: CGPoint(x: 0, y: topL))
+                    addHorizToVert(strokePath, from: CGPoint(x: 0, y: topL), to: joinL)
+                    strokePath.move(to: CGPoint(x: 0, y: botL))
+                    addHorizToVert(strokePath, from: CGPoint(x: 0, y: botL), to: joinL)
+                    if abs(endY - yJoinL) > 0.25 {
+                        strokePath.move(to: joinL)
+                        strokePath.addLine(to: CGPoint(x: laneX, y: endY))
+                    }
+                    if showChevron {
+                        addEdgeChevron(x: laneX, pointingUp: goingUp, to: strokePath)
+                    }
+                }
+
+                sampleHorizToVert(from: CGPoint(x: 0, y: lMid), to: CGPoint(x: laneX, y: yJoinL), to: &spineSamples)
+                if abs(endY - yJoinL) > 0.25 {
+                    spineSamples.append(CGPoint(x: laneX, y: endY))
                 }
                 clickSourceHunk = pair.sourceHunk
             } else {
                 let rMid = visibleMid(top: rawDstTop, bottom: rawDstBottom)
-                addRightFunnel(r0: r0, r1: r1, tipX: tipR, midY: rMid, fill: fillPath, stroke: strokePath)
-
                 let fromAbove = rawSrcBottom < 0
-                let dir: CGFloat = fromAbove ? 1 : -1
                 let edgeY: CGFloat = fromAbove ? 0 : h
-                let availY = abs(rMid - edgeY)
-                let showChevron = availY > 10
+                let availNear = fromAbove ? (r0 - edgeY) : (edgeY - r1)
+                let showChevron = isActive && abs(rMid - edgeY) > 10
                 let startY: CGFloat = showChevron ? (fromAbove ? 1.5 : (h - 1.5)) : edgeY
-                let turnY = min(maxTurnR, abs(rMid - startY))
-                let dxR = tipR - laneX
-
-                let pStart = CGPoint(x: laneX, y: startY)
-                let pTurn = CGPoint(x: laneX, y: rMid - dir * turnY)
-                let c1 = CGPoint(x: laneX, y: rMid - dir * turnY * (1 - kappa))
-                let c2 = CGPoint(x: tipR - dxR * kappa, y: rMid)
-                let p3 = CGPoint(x: tipR, y: rMid)
-
-                if showChevron {
-                    addEdgeChevron(x: laneX, pointingUp: fromAbove, to: strokePath)
+                let yJoinR: CGFloat
+                if availNear >= 4 {
+                    let lead = min(maxLead, availNear * 0.65)
+                    yJoinR = fromAbove ? max(startY, r0 - lead) : min(startY, r1 + lead)
+                } else {
+                    yJoinR = fromAbove ? min(r0, startY) : max(r1, startY)
                 }
-                strokePath.move(to: pStart)
-                if abs(pTurn.y - pStart.y) > 0.25 {
-                    strokePath.addLine(to: pTurn)
-                }
-                strokePath.addCurve(to: p3, control1: c1, control2: c2)
 
-                spineSamples.append(pStart)
-                if abs(pTurn.y - pStart.y) > 0.25 {
-                    spineSamples.append(pTurn)
+                if !isActive {
+                    let xTop = fromAbove ? (laneX + hw) : (laneX - hw)
+                    let xBot = fromAbove ? (laneX - hw) : (laneX + hw)
+                    fillPath.move(to: CGPoint(x: xBot, y: startY))
+                    fillPath.addLine(to: CGPoint(x: xTop, y: startY))
+                    fillPath.addLine(to: CGPoint(x: xTop, y: yJoinR))
+                    addVertToHoriz(fillPath, from: CGPoint(x: xTop, y: yJoinR), to: CGPoint(x: x1, y: r0))
+                    fillPath.addLine(to: CGPoint(x: x1, y: r1))
+                    addHorizToVert(fillPath, from: CGPoint(x: x1, y: r1), to: CGPoint(x: xBot, y: yJoinR))
+                    fillPath.closeSubpath()
+                } else {
+                    let joinR = CGPoint(x: laneX, y: yJoinR)
+                    fillPath.move(to: joinR)
+                    addVertToHoriz(fillPath, from: joinR, to: CGPoint(x: x1, y: r0))
+                    fillPath.addLine(to: CGPoint(x: x1, y: r1))
+                    addHorizToVert(fillPath, from: CGPoint(x: x1, y: r1), to: joinR)
+                    fillPath.closeSubpath()
+
+                    if showChevron {
+                        addEdgeChevron(x: laneX, pointingUp: fromAbove, to: strokePath)
+                    }
+                    if abs(yJoinR - startY) > 0.25 {
+                        strokePath.move(to: CGPoint(x: laneX, y: startY))
+                        strokePath.addLine(to: joinR)
+                    }
+                    let topR = min(r0 + 0.5, rMid), botR = max(r1 - 0.5, rMid)
+                    strokePath.move(to: joinR)
+                    addVertToHoriz(strokePath, from: joinR, to: CGPoint(x: x1, y: topR))
+                    strokePath.move(to: joinR)
+                    addVertToHoriz(strokePath, from: joinR, to: CGPoint(x: x1, y: botR))
                 }
-                appendCubicSamples(p0: pTurn, c1: c1, c2: c2, p3: p3, to: &spineSamples)
+
+                spineSamples.append(CGPoint(x: laneX, y: startY))
+                if abs(yJoinR - startY) > 0.25 {
+                    spineSamples.append(CGPoint(x: laneX, y: yJoinR))
+                }
+                sampleVertToHoriz(from: CGPoint(x: laneX, y: yJoinR), to: CGPoint(x: x1, y: rMid), to: &spineSamples)
                 clickSourceHunk = pair.targetHunk
             }
 
@@ -2975,15 +3031,30 @@ final class CodeCanvasView: NSView {
             }
             let layerSet = moveConnectorLayers[used]
             used += 1
-            layerSet.setZOffset(isHovered ? 1.0 : (isFocused ? 0.5 : 0.0))
 
-            let fillColor = isHovered
-                ? (theme.moved.copy(alpha: theme.isDark ? 0.28 : 0.20) ?? theme.moved)
-                : theme.moved
-            let strokeColor = isHovered
-                ? (theme.movedBorder.copy(alpha: theme.isDark ? 0.92 : 0.85) ?? theme.movedBorder)
-                : theme.movedBorder
-            let lineWidth: CGFloat = isHovered ? 1.5 : 1.0
+            let fillColor: CGColor
+            let strokeColor: CGColor
+            let lineWidth: CGFloat
+            let lineCap: CAShapeLayerLineCap
+            if isHovered {
+                fillColor = theme.moved.copy(alpha: theme.isDark ? 0.28 : 0.20) ?? theme.moved
+                strokeColor = theme.movedBorder.copy(alpha: theme.isDark ? 0.92 : 0.85) ?? theme.movedBorder
+                lineWidth = 1.5
+                lineCap = .round
+                layerSet.setZPositions(fill: 0.6, stroke: 2.2)
+            } else if isFocused {
+                fillColor = theme.moved
+                strokeColor = theme.movedBorder
+                lineWidth = 1.0
+                lineCap = .round
+                layerSet.setZPositions(fill: 0.4, stroke: 1.6)
+            } else {
+                fillColor = theme.moved
+                strokeColor = theme.moved
+                lineWidth = 1.0
+                lineCap = .round
+                layerSet.setZPositions(fill: 0.1, stroke: 0.15)
+            }
 
             layerSet.fill.contentsScale = scale
             layerSet.fill.fillColor = fillColor
@@ -2992,6 +3063,7 @@ final class CodeCanvasView: NSView {
             layerSet.stroke.contentsScale = scale
             layerSet.stroke.strokeColor = strokeColor
             layerSet.stroke.lineWidth = lineWidth
+            layerSet.stroke.lineCap = lineCap
             layerSet.stroke.path = strokePath.isEmpty ? nil : strokePath
             layerSet.setHidden(false)
 
@@ -3614,12 +3686,16 @@ final class CodeCanvasView: NSView {
             let hunk = Int(doc.unifiedRows[row].hunk)
             return hunk >= 0 ? hunk : nil
         case .sideBySide:
-            let index = firstHunk(doc, side: side, endingAtOrAfter: row)
-            guard index < doc.hunks.count else { return nil }
-            let hunk = doc.hunks[index]
-            let start = hunkDisplayStart(index, side: side)
-            let count = side == .left ? hunk.leftCount : hunk.rightCount
-            return row >= start && row < start + count ? index : nil
+            var index = firstHunk(doc, side: side, endingAtOrAfter: row)
+            while index < doc.hunks.count {
+                let hunk = doc.hunks[index]
+                let start = hunkDisplayStart(index, side: side)
+                if start > row { break }
+                let count = side == .left ? hunk.leftCount : hunk.rightCount
+                if count > 0, row >= start, row < start + count { return index }
+                index += 1
+            }
+            return nil
         case .single:
             return nil
         }
@@ -3973,6 +4049,9 @@ final class CodeCanvasView: NSView {
             delegate?.canvas(self, goToDefinitionAt: target.line, character: target.column)
             return
         }
+        if let clickedHunk = hunkIndex(at: point) {
+            delegate?.canvas(self, didSelectHunk: clickedHunk)
+        }
         let side = pane(at: point)
         let previousCaret = activeCaretPosition()
         guard let pos = position(at: point, pane: side) else { selection = nil; return }
@@ -4131,6 +4210,55 @@ final class CodeCanvasView: NSView {
         }
         if vimModeEnabled {
             return TextEditing.clamp(vimCursor, in: doc.right.lines)
+        }
+        return nil
+    }
+
+    /// Selects a single-line UTF-16 range on `side`, mapping `line` (0-based) into the active pane's display rows.
+    func selectRange(side: Side, line: Int, range: Range<Int>) {
+        guard let doc = document, case .text = doc.content else { return }
+        let lines = doc.buffer(side).lines
+        guard lines.indices.contains(line) else { return }
+        let len = (lines[line] as NSString).length
+        let startCol = max(0, min(range.lowerBound, len))
+        let endCol = max(startCol, min(range.upperBound, len))
+        let displayR: Int
+        switch mode {
+        case .sideBySide:
+            displayR = displayRow(forLine: line, side: side)
+        case .unified:
+            displayR = unifiedDisplayRow(forLine: line, side: side)
+        case .single:
+            guard side == .right else { return }
+            displayR = line
+        }
+        let targetPane: Side = mode == .sideBySide ? side : .right
+        selection = TextSelection(
+            pane: targetPane,
+            anchor: TextPosition(row: displayR, column: startCol),
+            head: TextPosition(row: displayR, column: endCol)
+        )
+        if targetPane == .right, vimModeEnabled {
+            vimCursor = TextPosition(row: line, column: startCol)
+        }
+        goalX = nil
+    }
+
+    /// Returns the active pane, 0-based buffer line, and 0-based UTF-16 column for symbol occurrence stepping.
+    func symbolCursorContext() -> (side: Side, line: Int, column: Int)? {
+        guard let doc = document, case .text = doc.content else { return nil }
+        if mode == .sideBySide, let sel = selection, sel.pane == .left,
+           let src = source(pane: .left, row: sel.lower.row) {
+            let col = sel.lower.row == sel.upper.row ? sel.lower.column : sel.head.column
+            return (.left, src.line, col)
+        }
+        if let sel = selection, !sel.isEmpty, sel.lower.row == sel.upper.row,
+           mode != .sideBySide || sel.pane == .right,
+           let src = source(pane: sel.pane, row: sel.lower.row), src.side == .right {
+            return (.right, src.line, sel.lower.column)
+        }
+        if let pos = activeCaretPosition() {
+            return (.right, pos.row, pos.column)
         }
         return nil
     }

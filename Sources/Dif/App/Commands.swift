@@ -219,7 +219,18 @@ extension AppStore {
             AppCommand(id: "nav.locate", title: L("Select Opened File in Tree", "在文件树中定位当前文件"), symbol: "scope", group: .navigate,
                        key: KeyLabel.function(1), modifiers: .option) { [weak self] in self?.locateInTree() },
             AppCommand(id: "nav.showDiff", title: L("Show Diff", "查看差异"), symbol: "arrow.left.arrow.right", group: .navigate,
-                       key: "d", modifiers: .command, separatorBefore: true) { [weak self] in self?.focusViewer() },
+                       key: "d", modifiers: .command, separatorBefore: true) { [weak self] in
+                guard let self else { return }
+                if self.canShowDiffForCurrentFile {
+                    self.showDiffForCurrentFile()
+                } else {
+                    self.focusViewer()
+                }
+            },
+            AppCommand(id: "nav.openFile", title: L("Open File Content", "直接打开当前文件内容"), symbol: "doc.plaintext",
+                       group: .navigate) { [weak self] in
+                self?.openCurrentFile()
+            },
             AppCommand(id: "nav.nextProject", title: L("Next Project", "下一个项目"), symbol: "chevron.down.square", group: .navigate,
                        key: "]", modifiers: [.command, .option]) { [weak self] in self?.selectProject(offset: 1) },
             AppCommand(id: "nav.prevProject", title: L("Previous Project", "上一个项目"), symbol: "chevron.up.square", group: .navigate,

@@ -318,6 +318,28 @@ private struct ViewerHeader: View {
                                 if viewer.findVisible { viewer.hideFind() } else { viewer.showFind() }
                             }
                         }
+                        if let request = viewer.request, request.source != .file, !request.isExternalFile, !viewer.isSpreadsheet {
+                            let canOpen = store.canOpenCurrentFile
+                            IconButton(
+                                symbol: "doc.plaintext",
+                                help: canOpen
+                                    ? L("Open File Content", "直接打开当前文件内容")
+                                    : L("This file is not in the working tree", "这个文件不在当前工作区里"),
+                                size: 12.5
+                            ) {
+                                store.openCurrentFile()
+                            }
+                            .disabled(!canOpen)
+                            .opacity(canOpen ? 1 : 0.35)
+                        } else if store.canShowDiffForCurrentFile {
+                            IconButton(
+                                symbol: "arrow.left.arrow.right",
+                                help: L("Show Diff (⌘D)", "查看差异 (⌘D)"),
+                                size: 12
+                            ) {
+                                store.showDiffForCurrentFile()
+                            }
+                        }
                         if AppEnvironment.hasTerminal {
                             Divider().frame(height: 14)
                         }

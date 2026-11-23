@@ -46,6 +46,9 @@ extension ViewerModel {
         case .commit(let hash, _):
             if request.kind == .deleted { return nil }
             return (request.path, hash)
+        case .commitSteps(let steps):
+            if request.kind == .deleted || doc.isSyntheticReplay { return nil }
+            return steps.last.map { ($0.path, $0.hash) }
         }
     }
 

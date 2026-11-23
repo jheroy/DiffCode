@@ -1493,4 +1493,350 @@ final class LSPIntegrationTests: XCTestCase {
 
         await manager.shutdownAll()
     }
+
+    // MARK: - 6. History Commit Diff LSP Navigation & Diff JumpHistory Round-Trip Tests
+
+    func testMapSymbolToWorkingTreeHandlesShiftedAndRemovedSymbols() {
+        let diskLines = [
+            "package repo",
+            "// added comment 1",
+            "// added comment 2",
+            "func main() { checkLeagueEvolveTimeWithLock(tableMgr, league, now) }",
+            "func other() { checkLeagueEvolveTimeWithLock(nil, nil, now) }",
+        ]
+
+        // 1. Shifted lines: commit had call at line 1, working tree has exact trimmed line at line 3.
+        let shifted = LSPNavigationHelper.mapSymbolToWorkingTree(
+            symbolName: "checkLeagueEvolveTimeWithLock",
+            clickedLineText: "func main() { checkLeagueEvolveTimeWithLock(tableMgr, league, now) }",
+            clickedLine: 1,
+            clickedStartColumn: 14,
+            offsetInSymbol: 5,
+            diskLines: diskLines
+        )
+        XCTAssertEqual(shifted?.line, 3)
+        XCTAssertEqual(shifted?.symbolRange, 14..<43)
+        XCTAssertEqual(shifted?.character, 19)
+
+        // 2. Modified line near clicked line: falls back to nearest identifier match.
+        let modified = LSPNavigationHelper.mapSymbolToWorkingTree(
+            symbolName: "checkLeagueEvolveTimeWithLock",
+            clickedLineText: "func main() { checkLeagueEvolveTimeWithLock(oldArg) }",
+            clickedLine: 3,
+            clickedStartColumn: 14,
+            offsetInSymbol: 0,
+            diskLines: diskLines
+        )
+        XCTAssertEqual(modified?.line, 3)
+        XCTAssertEqual(modified?.symbolRange, 14..<43)
+
+        // 3. Removed symbol: returns nil.
+        let missing = LSPNavigationHelper.mapSymbolToWorkingTree(
+            symbolName: "deletedHelper",
+            clickedLineText: "deletedHelper()",
+            clickedLine: 1,
+            clickedStartColumn: 0,
+            offsetInSymbol: 0,
+            diskLines: diskLines
+        )
+        XCTAssertNil(missing)
+    }
+
+    @MainActor
+    func testCommitDiffEnablesWorkingTreeLSPNavigationAndBackRestoresExactCommitDiff() async throws {
+        let originalEdition = AppEnvironment.edition
+        AppEnvironment.edition = .direct
+        defer { AppEnvironment.edition = originalEdition }
+
+        let dir = try makeTempDir(prefix: "dif-lsp-history-nav")
+        let repo = dir.appendingPathComponent("repo", isDirectory: true)
+        let fileMain = repo.appendingPathComponent("main.go")
+        let fileHelper = repo.appendingPathComponent("helper.go")
+        try writeFile(repo.appendingPathComponent("go.mod"), contents: "module example.com/repo\ngo 1.22\n")
+        try writeFile(fileHelper, contents: "package repo\nfunc Helper() {}\n")
+        try writeFile(fileMain, contents: "package repo\nfunc main() { Helper() }\n")
+
+        func git(_ args: String...) throws -> String {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            p.arguments = args
+            p.currentDirectoryURL = repo
+            let out = Pipe()
+            p.standardOutput = out
+            p.standardError = Pipe()
+            try p.run()
+            p.waitUntilExit()
+            XCTAssertEqual(p.terminationStatus, 0, "git \(args.joined(separator: " ")) failed")
+            return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
+
+        _ = try git("init")
+        _ = try git("config", "user.name", "Tester")
+        _ = try git("config", "user.email", "tester@example.com")
+        _ = try git("add", ".")
+        _ = try git("commit", "-m", "init")
+        let parentHash = try git("rev-parse", "HEAD")
+
+        try writeFile(fileMain, contents: "package repo\n// commit line\nfunc main() { Helper() }\n")
+        _ = try git("add", "main.go")
+        _ = try git("commit", "-m", "second")
+        let commitHash = try git("rev-parse", "HEAD")
+
+        // Working tree shifts the call down by 2 more lines compared to the commit snapshot.
+        let diskMainText = "package repo\n// wt 1\n// wt 2\n// commit line\nfunc main() { Helper() }\n"
+        try writeFile(fileMain, contents: diskMainText)
+
+        let helperURI = LSPURI.uri(from: fileHelper)
+        let logFile = dir.appendingPathComponent("history-lsp.log")
+        let script = dir.appendingPathComponent("history-lsp.py")
+        let source = """
+        #!/usr/bin/env python3
+        import json, sys
+
+        LOG_PATH = \(String(reflecting: logFile.path))
+
+        def log(line):
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\\n")
+
+        def read_msg():
+            headers = {}
+            while True:
+                line = sys.stdin.buffer.readline()
+                if not line:
+                    return None
+                if line in (b"\\r\\n", b"\\n"):
+                    break
+                k, _, v = line.decode("utf-8", "replace").partition(":")
+                headers[k.strip().lower()] = v.strip()
+            n = int(headers.get("content-length", "0"))
+            return json.loads(sys.stdin.buffer.read(n).decode("utf-8")) if n > 0 else None
+
+        def send_msg(obj):
+            raw = json.dumps(obj).encode("utf-8")
+            sys.stdout.buffer.write(f"Content-Length: {len(raw)}\\r\\n\\r\\n".encode("ascii") + raw)
+            sys.stdout.buffer.flush()
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            method = msg.get("method")
+            msg_id = msg.get("id")
+            params = msg.get("params") or {}
+            if method == "initialize":
+                send_msg({"jsonrpc": "2.0", "id": msg_id, "result": {"capabilities": {"textDocumentSync": 1, "definitionProvider": True}}})
+            elif method == "textDocument/didOpen":
+                td = params.get("textDocument", {})
+                log("didOpen:" + json.dumps({"uri": td.get("uri"), "text": td.get("text")}))
+            elif method == "textDocument/definition":
+                pos = params.get("position", {})
+                log(f"definition:{pos.get('line')}:{pos.get('character')}")
+                send_msg({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": [{
+                        "uri": "\(helperURI)",
+                        "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 11}},
+                    }],
+                })
+            elif method == "shutdown":
+                send_msg({"jsonrpc": "2.0", "id": msg_id, "result": None})
+            elif method == "exit":
+                break
+        """
+        try writeFile(script, contents: source)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let server = LSPResolvedServer(
+            descriptor: LSPServerRegistry.go,
+            executablePath: "/usr/bin/python3",
+            arguments: [script.path],
+            environment: AppEnvironment.childEnvironment
+        )
+        let manager = LSPManager(isEnabled: true, serverOverrides: [LSPServerRegistry.go.id: server])
+        defer { Task { await manager.shutdownAll() } }
+
+        let store = AppStore.shared
+        let prevProjects = store.projects
+        let prevSelectedID = store.selectedProjectID
+        let prevManager = store.viewer.lspManager
+        let prevReq = store.viewer.request
+        let prevDoc = store.viewer.document
+        let prevLSPDoc = store.viewer.lspDocument
+        let prevHistory = store.jumpHistory
+        let prevExternal = store.externalRequest
+        defer {
+            store.definitionTask?.cancel()
+            store.viewer.lspManager = prevManager
+            store.projects = prevProjects
+            store.selectedProjectID = prevSelectedID
+            store.viewer.request = prevReq
+            store.viewer.document = prevDoc
+            store.viewer.lspDocument = prevLSPDoc
+            store.jumpHistory = prevHistory
+            store.externalRequest = prevExternal
+        }
+
+        let project = Project(url: repo)
+        project.tab = .log
+        store.projects = [project]
+        store.selectedProjectID = project.id
+        store.viewer.lspManager = manager
+        store.jumpHistory.clear()
+
+        let commitReq = store.resolvedRequest(DiffRequest(
+            root: project.url,
+            path: "main.go",
+            oldPath: nil,
+            kind: .modified,
+            source: .commit(hash: commitHash, parent: parentHash)
+        ))
+        let commitDoc = await DiffLoader.load(commitReq)
+        store.viewer.request = commitReq
+        store.viewer.document = commitDoc
+        store.viewer.syncLSPForCurrentDocument()
+
+        let container = CodeScrollContainer(frame: NSRect(x: 0, y: 0, width: 900, height: 300))
+        container.layoutSubtreeIfNeeded()
+        store.viewer.attach(container)
+        container.canvas.flush()
+
+        XCTAssertTrue(store.viewer.isCurrentDocumentLSPEnabled)
+        XCTAssertFalse(store.viewer.isCurrentDocumentLSPSyncEnabled)
+        XCTAssertTrue(container.canvas.isLSPEnabled)
+        XCTAssertNil(store.viewer.lspDocument, "Historical commit diff must never open a live LSP buffer")
+
+        // Verify right-click context menu shows Go to Definition & Find All References on commit diff.
+        container.canvas.noteContextLSPSymbol(CodeCanvasView.LSPHoverTarget(row: 2, line: 2, column: 15, range: 14..<20))
+        let menuTitles = store.viewerContextMenu()?.items.map(\.title) ?? []
+        XCTAssertTrue(menuTitles.contains("跳转到声明") || menuTitles.contains("Go to Definition"))
+        XCTAssertTrue(menuTitles.contains("查找所有引用") || menuTitles.contains("Find All References"))
+
+        // Click `Helper` at line 2, col 15 in the commit diff -> maps to line 4 in working tree on disk!
+        store.smartLSPNavigate(line: 2, character: 15)
+        await store.definitionTask?.value
+
+        XCTAssertEqual(store.viewer.request?.path, "helper.go")
+        XCTAssertTrue(store.jumpHistory.canGoBack)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.request, commitReq)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.line, 3)
+
+        // Ctrl-O / navigateBack restores the exact historical commit diff!
+        store.navigateBack()
+        XCTAssertEqual(store.viewer.request, commitReq)
+        XCTAssertEqual(project.tab, .log)
+        XCTAssertNil(project.browsedPath)
+
+        // Ctrl-I / navigateForward jumps forward back to helper.go!
+        store.navigateForward()
+        XCTAssertEqual(store.viewer.request?.path, "helper.go")
+
+        await manager.shutdownAll()
+
+        let logs = try String(contentsOf: logFile, encoding: .utf8)
+            .split(separator: "\n")
+            .map(String.init)
+        XCTAssertTrue(logs.contains("definition:4:15"), "Should query working-tree line 4, got \(logs)")
+        let openLog = try XCTUnwrap(logs.first(where: { $0.hasPrefix("didOpen:") }))
+        XCTAssertTrue(openLog.contains("// wt 1"), "didOpen must use disk working-tree text, never historical snapshot")
+
+        // Deleted commit file must disable LSP navigation.
+        let deletedCommitReq = store.resolvedRequest(DiffRequest(
+            root: repo,
+            path: "main.go",
+            oldPath: nil,
+            kind: .deleted,
+            source: .commit(hash: commitHash, parent: parentHash)
+        ))
+        store.viewer.request = deletedCommitReq
+        XCTAssertFalse(store.viewer.isCurrentDocumentLSPEnabled)
+    }
+
+    @MainActor
+    func testOpenCurrentFileFromDiffSupportsBackAndForwardToExactDiff() async throws {
+        let dir = try makeTempDir(prefix: "dif-open-current-back")
+        let repo = dir.appendingPathComponent("repo", isDirectory: true)
+        let fileMain = repo.appendingPathComponent("main.go")
+        try writeFile(fileMain, contents: "package repo\nfunc a() {}\nfunc b() {}\n")
+
+        func git(_ args: String...) throws -> String {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            p.arguments = args
+            p.currentDirectoryURL = repo
+            let out = Pipe()
+            p.standardOutput = out
+            p.standardError = Pipe()
+            try p.run()
+            p.waitUntilExit()
+            XCTAssertEqual(p.terminationStatus, 0)
+            return String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
+
+        _ = try git("init")
+        _ = try git("config", "user.name", "Tester")
+        _ = try git("config", "user.email", "tester@example.com")
+        _ = try git("add", ".")
+        _ = try git("commit", "-m", "init")
+        let parentHash = try git("rev-parse", "HEAD")
+
+        try writeFile(fileMain, contents: "package repo\nfunc a() {}\nfunc b() { a() }\n")
+        _ = try git("add", "main.go")
+        _ = try git("commit", "-m", "second")
+        let commitHash = try git("rev-parse", "HEAD")
+
+        let store = AppStore.shared
+        let prevProjects = store.projects
+        let prevSelectedID = store.selectedProjectID
+        let prevReq = store.viewer.request
+        let prevDoc = store.viewer.document
+        let prevHistory = store.jumpHistory
+        let prevExternal = store.externalRequest
+        defer {
+            store.projects = prevProjects
+            store.selectedProjectID = prevSelectedID
+            store.viewer.request = prevReq
+            store.viewer.document = prevDoc
+            store.jumpHistory = prevHistory
+            store.externalRequest = prevExternal
+        }
+
+        let project = Project(url: repo)
+        project.tab = .log
+        store.projects = [project]
+        store.selectedProjectID = project.id
+        store.jumpHistory.clear()
+
+        let commitReq = store.resolvedRequest(DiffRequest(
+            root: project.url,
+            path: "main.go",
+            oldPath: nil,
+            kind: .modified,
+            source: .commit(hash: commitHash, parent: parentHash)
+        ))
+        let commitDoc = await DiffLoader.load(commitReq)
+        store.viewer.request = commitReq
+        store.viewer.document = commitDoc
+        let container = CodeScrollContainer(frame: NSRect(x: 0, y: 0, width: 900, height: 300))
+        container.layoutSubtreeIfNeeded()
+        store.viewer.attach(container)
+        container.canvas.placeCaret(line: 2, column: 11)
+
+        store.openCurrentFile()
+        XCTAssertEqual(store.viewer.request?.source, .file)
+        XCTAssertEqual(project.browsedPath, "main.go")
+        XCTAssertTrue(store.jumpHistory.canGoBack)
+
+        store.navigateBack()
+        XCTAssertEqual(store.viewer.request, commitReq)
+        XCTAssertNil(project.browsedPath)
+        XCTAssertEqual(project.tab, .log)
+
+        store.navigateForward()
+        XCTAssertEqual(store.viewer.request?.source, .file)
+        XCTAssertEqual(project.browsedPath, "main.go")
+    }
 }

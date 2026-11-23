@@ -550,6 +550,67 @@ actor LSPManager {
         )
     }
 
+    /// Resolves `textDocument/documentHighlight` at a 0-based `(line, character)` UTF-16 position.
+    func documentHighlight(
+        uri: String,
+        line: Int,
+        character: Int,
+        text: String? = nil,
+        language: LanguageSpec? = nil,
+        workspaceRoot: URL? = nil
+    ) async -> [LSPDocumentHighlight] {
+        guard isEffectivelyEnabled else { return [] }
+        let normalizedURI = LSPURI.normalize(uri)
+        guard let (key, server) = await ensureDocumentOpen(
+            normalizedURI: normalizedURI,
+            text: text,
+            language: language,
+            workspaceRoot: workspaceRoot
+        ), server.capabilities.documentHighlightProvider else {
+            return []
+        }
+
+        servers[key]?.lastActivity = .now
+        let params: JSONValue = .object([
+            "textDocument": .object(["uri": .string(normalizedURI)]),
+            "position": .object([
+                "line": .int(line),
+                "character": .int(character),
+            ]),
+        ])
+
+        do {
+            let response = try await server.transport.request(
+                method: "textDocument/documentHighlight",
+                params: params,
+                timeout: .seconds(1)
+            )
+            servers[key]?.lastActivity = .now
+            return LSPDocumentHighlightDecoder.decode(from: response)
+        } catch {
+            return []
+        }
+    }
+
+    /// Convenience `fileURL` overload for `documentHighlight`.
+    func documentHighlight(
+        fileURL: URL,
+        line: Int,
+        character: Int,
+        text: String? = nil,
+        language: LanguageSpec? = nil,
+        repoRoot: URL? = nil
+    ) async -> [LSPDocumentHighlight] {
+        await documentHighlight(
+            uri: LSPURI.uri(from: fileURL),
+            line: line,
+            character: character,
+            text: text,
+            language: language,
+            workspaceRoot: repoRoot
+        )
+    }
+
     /// Deduplicates identical `(canonicalFileURL, range.start.line, range.start.character)` entries
     /// while preserving stable first-seen order.
     nonisolated static func deduplicateLocations(_ locations: [LSPLocation]) -> [LSPLocation] {
@@ -783,6 +844,9 @@ actor LSPManager {
                         "linkSupport": .bool(true),
                     ]),
                     "references": .object([
+                        "dynamicRegistration": .bool(false),
+                    ]),
+                    "documentHighlight": .object([
                         "dynamicRegistration": .bool(false),
                     ]),
                     "semanticTokens": .object([

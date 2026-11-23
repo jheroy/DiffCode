@@ -1,22 +1,210 @@
 #!/bin/bash
-# Opens repositories in DiffCode:  dif            (the current directory)
-#                                  dif ~/work/app ~/work/lib
+# Opens repositories or files (with optional line/column) in DiffCode:
+#   dif                                  (the current directory)
+#   dif ~/work/app ~/work/lib
+#   dif path/to/file.swift:42[:10]
+#   dif --goto path/to/file.swift:42:10
 set -euo pipefail
 
-paths=()
-for arg in "$@"; do
-    case "$arg" in
-        -h|--help) echo "usage: dif [directory ...]"; exit 0 ;;
-        *) paths+=("$(cd "$arg" 2>/dev/null && pwd || echo "$arg")") ;;
+usage() {
+    cat <<'EOF'
+usage: dif [options] [path[:line[:column]] ...]
+  -g, --goto <path[:line[:column]]>   Open file at optional 1-based line and column
+  --line <n>                          1-based line number for the target file
+  --column <c>                        1-based column number for the target file
+  -n, --new-window, -r, --reuse-window, -w, --wait
+                                      Accepted for editor CLI compatibility
+  -h, --help                          Show this help message
+EOF
+}
+
+urlencode() {
+    local LC_ALL=C s="$1" i c hex out=""
+    for ((i = 0; i < ${#s}; i++)); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9._~/-]) out+="$c" ;;
+            *) printf -v hex '%02X' "'$c"; out+="%${hex: -2}" ;;
+        esac
+    done
+    printf '%s\n' "$out"
+}
+
+resolve_abs() {
+    local p="$1"
+    if [ "$p" = "/" ]; then
+        printf '/\n'
+        return
+    fi
+    if [ -d "$p" ]; then
+        (cd "$p" 2>/dev/null && pwd) || printf '%s\n' "$p"
+        return
+    fi
+    local dir base resolved_dir
+    dir="$(dirname "$p")"
+    base="$(basename "$p")"
+    if [ -d "$dir" ]; then
+        resolved_dir="$(cd "$dir" 2>/dev/null && pwd)"
+        if [ "$resolved_dir" = "/" ]; then
+            printf '/%s\n' "$base"
+        else
+            printf '%s/%s\n' "$resolved_dir" "$base"
+        fi
+        return
+    fi
+    case "$p" in
+        /*) printf '%s\n' "$p" ;;
+        *) printf '%s/%s\n' "$PWD" "$p" ;;
     esac
+}
+
+build_url() {
+    local raw="$1" pending_line="$2" pending_col="$3"
+    if [[ "$raw" == diffcode://* ]]; then
+        printf '%s\n' "$raw"
+        return
+    fi
+
+    local abs_raw path line col
+    abs_raw="$(resolve_abs "$raw")"
+    path="$abs_raw"
+    line="$pending_line"
+    col="$pending_col"
+
+    if [ ! -e "$abs_raw" ]; then
+        if [[ "$raw" =~ ^(.+):([0-9]+):([0-9]+)$ ]]; then
+            local cand="${BASH_REMATCH[1]}" c_line="${BASH_REMATCH[2]}" c_col="${BASH_REMATCH[3]}"
+            local abs_cand_line
+            abs_cand_line="$(resolve_abs "$cand:$c_line")"
+            if [ -e "$abs_cand_line" ]; then
+                path="$abs_cand_line"
+                if [[ "$c_col" =~ ^[1-9][0-9]*$ ]]; then
+                    line="$c_col"
+                fi
+            elif [[ "$c_line" =~ ^[1-9][0-9]*$ && "$c_col" =~ ^[1-9][0-9]*$ ]]; then
+                path="$(resolve_abs "$cand")"
+                line="$c_line"
+                col="$c_col"
+            fi
+        elif [[ "$raw" =~ ^(.+):([0-9]+)$ ]]; then
+            local cand="${BASH_REMATCH[1]}" c_line="${BASH_REMATCH[2]}"
+            if [[ "$c_line" =~ ^[1-9][0-9]*$ ]]; then
+                path="$(resolve_abs "$cand")"
+                line="$c_line"
+            fi
+        fi
+    fi
+
+    local url="diffcode://open?path=$(urlencode "$path")"
+    if [[ "$line" =~ ^[1-9][0-9]*$ ]]; then
+        url+="&line=$line"
+        if [[ "$col" =~ ^[1-9][0-9]*$ ]]; then
+            url+="&column=$col"
+        fi
+    fi
+    printf '%s\n' "$url"
+}
+
+raw_targets=()
+raw_lines=()
+raw_cols=()
+literal_only=0
+pending_line=""
+pending_col=""
+
+while [ $# -gt 0 ]; do
+    arg="$1"
+    if [ "$literal_only" -eq 0 ]; then
+        case "$arg" in
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --)
+                literal_only=1
+                shift
+                continue
+                ;;
+            -n|--new-window|-r|--reuse-window|-w|--wait)
+                shift
+                continue
+                ;;
+            -g|--goto)
+                shift
+                if [ $# -gt 0 ]; then
+                    raw_targets+=("$1")
+                    raw_lines+=("$pending_line")
+                    raw_cols+=("$pending_col")
+                    pending_line=""
+                    pending_col=""
+                    shift
+                fi
+                continue
+                ;;
+            --line)
+                shift
+                if [ $# -gt 0 ]; then
+                    [[ "$1" =~ ^[1-9][0-9]*$ ]] && pending_line="$1"
+                    shift
+                fi
+                continue
+                ;;
+            --line=*)
+                val="${arg#--line=}"
+                [[ "$val" =~ ^[1-9][0-9]*$ ]] && pending_line="$val"
+                shift
+                continue
+                ;;
+            --column)
+                shift
+                if [ $# -gt 0 ]; then
+                    [[ "$1" =~ ^[1-9][0-9]*$ ]] && pending_col="$1"
+                    shift
+                fi
+                continue
+                ;;
+            --column=*)
+                val="${arg#--column=}"
+                [[ "$val" =~ ^[1-9][0-9]*$ ]] && pending_col="$val"
+                shift
+                continue
+                ;;
+        esac
+    fi
+
+    raw_targets+=("$arg")
+    raw_lines+=("$pending_line")
+    raw_cols+=("$pending_col")
+    pending_line=""
+    pending_col=""
+    shift
 done
-[ ${#paths[@]} -eq 0 ] && paths=("$PWD")
+
+if [ ${#raw_targets[@]} -eq 0 ]; then
+    raw_targets=("$PWD")
+    raw_lines=("$pending_line")
+    raw_cols=("$pending_col")
+elif [ -n "$pending_line" ] || [ -n "$pending_col" ]; then
+    last_idx=$((${#raw_targets[@]} - 1))
+    [ -z "${raw_lines[$last_idx]}" ] && raw_lines[$last_idx]="$pending_line"
+    [ -z "${raw_cols[$last_idx]}" ] && raw_cols[$last_idx]="$pending_col"
+fi
+
+urls=()
+for idx in "${!raw_targets[@]}"; do
+    urls+=("$(build_url "${raw_targets[$idx]}" "${raw_lines[$idx]}" "${raw_cols[$idx]}")")
+done
+
+if [ "${DIF_DRY_RUN:-0}" = "1" ]; then
+    printf '%s\n' "${urls[@]}"
+    exit 0
+fi
 
 # Prefer the bundle this script ships in, so a copy outside /Applications still works.
-SELF="$(readlink "$0" 2>/dev/null || echo "$0")"
+SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
 BUNDLE="$(cd "$(dirname "$SELF")/../.." 2>/dev/null && pwd)"
 if [ -d "$BUNDLE/Contents/MacOS" ]; then
-    exec open -a "$BUNDLE" "${paths[@]}"
+    exec /usr/bin/open -a "$BUNDLE" "${urls[@]}"
 fi
 # By identifier, so it finds the app whatever its file is called.
-exec open -b com.nanshanbei.DiffCode "${paths[@]}"
+exec /usr/bin/open -b com.nanshanbei.DiffCode "${urls[@]}"

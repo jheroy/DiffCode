@@ -268,6 +268,8 @@ final class DiffDocument {
     var isJSONNormalized: Bool = false
     /// True when this document is filtered to show only one AI group's hunks (read-only view).
     var isGroupFiltered: Bool = false
+    /// True when this document was synthesized by replaying non-contiguous commits via 3-way patch merge.
+    var isSyntheticReplay: Bool = false
     /// Maps original 0-based raw hunk indices to their 0-based indices in this filtered document's `hunks`.
     var groupHunkIndexMap: [Int: Int] = [:]
     /// Cached unfiltered baseline lines & raw hunks so switching AI groups on the same file is instantaneous.
@@ -611,6 +613,516 @@ enum DiffParser {
     }
 }
 
+// MARK: - Structural & whitespace hunk refinement
+
+enum DiffRefiner {
+    private static let headerModifierKeywords: Set<String> = [
+        "public", "private", "protected", "internal", "fileprivate", "open",
+        "export", "default", "declare", "abstract", "final", "sealed", "static",
+        "async", "extern", "unsafe", "const", "mutating", "nonmutating",
+        "override", "virtual", "inline", "constexpr", "data", "value",
+        "indirect", "actor", "pub", "local",
+    ]
+
+    private static let headerDeclarationKeywords: Set<String> = [
+        "func", "fn", "function", "def", "type", "struct", "class", "interface",
+        "protocol", "enum", "trait", "impl", "mod", "module", "namespace",
+        "extension", "object", "record", "union", "message", "service", "rpc",
+        "sub", "package", "fun", "template", "typealias", "typedef",
+    ]
+
+    private static let controlFlowKeywords: Set<String> = [
+        "if", "for", "while", "switch", "catch", "else", "do", "return",
+        "throw", "case", "try", "finally", "guard", "with", "match",
+        "select", "defer", "go",
+    ]
+
+    private static func stripHorizontalWhitespace(_ line: String) -> String {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(line.utf8.count)
+        for b in line.utf8 where b != 0x20 && b != 0x09 && b != 0x0D {
+            bytes.append(b)
+        }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    private static func isTrivialDelimiter(_ stripped: String) -> Bool {
+        !stripped.isEmpty && stripped.utf8.allSatisfy { b in
+            b == 123 || b == 125 || b == 40 || b == 41 || b == 91 || b == 93 || b == 59 || b == 44
+        }
+    }
+
+    private static func isSubstantive(_ stripped: String) -> Bool {
+        !stripped.isEmpty && !isTrivialDelimiter(stripped)
+    }
+
+    private static func isTrivialBoundaryLine(_ line: String) -> Bool {
+        let stripped = stripHorizontalWhitespace(line)
+        return stripped.isEmpty || isTrivialDelimiter(stripped)
+    }
+
+    private static func leadingIndentWidth(_ line: String) -> Int {
+        var indent = 0
+        for b in line.utf8 {
+            if b == 0x20 { indent += 1 }
+            else if b == 0x09 { indent += 4 }
+            else { break }
+        }
+        return indent
+    }
+
+    @inline(__always)
+    private static func isIdentStart(_ b: UInt8) -> Bool {
+        (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 95
+    }
+
+    @inline(__always)
+    private static func isIdentCont(_ b: UInt8) -> Bool {
+        isIdentStart(b) || (b >= 48 && b <= 57)
+    }
+
+    static func isStructuralHeader(_ line: String) -> Bool {
+        let bytes = Array(line.utf8)
+        let n = bytes.count
+        var i = 0
+        while i < n && (bytes[i] == 0x20 || bytes[i] == 0x09) { i += 1 }
+        guard i < n else { return false }
+
+        if (i + 1 < n && bytes[i] == 0x2F && (bytes[i + 1] == 0x2F || bytes[i + 1] == 0x2A))
+            || bytes[i] == 0x2A
+            || (i + 1 < n && bytes[i] == 0x2D && bytes[i + 1] == 0x2D)
+            || bytes[i] == 0x23 {
+            return false
+        }
+
+        var pos = i
+        var firstToken: String?
+        while pos < n {
+            while pos < n && (bytes[pos] == 0x20 || bytes[pos] == 0x09) { pos += 1 }
+            guard pos < n, isIdentStart(bytes[pos]) else { break }
+            let start = pos
+            pos += 1
+            while pos < n && isIdentCont(bytes[pos]) { pos += 1 }
+            let token = String(decoding: bytes[start..<pos], as: UTF8.self)
+            if firstToken == nil { firstToken = token }
+            if headerDeclarationKeywords.contains(token) {
+                return true
+            }
+            if headerModifierKeywords.contains(token) {
+                if token == "pub" {
+                    var p = pos
+                    while p < n && (bytes[p] == 0x20 || bytes[p] == 0x09) { p += 1 }
+                    if p < n && bytes[p] == 0x28 {
+                        var depth = 1
+                        p += 1
+                        while p < n && depth > 0 {
+                            if bytes[p] == 0x28 { depth += 1 }
+                            else if bytes[p] == 0x29 { depth -= 1 }
+                            p += 1
+                        }
+                        pos = p
+                    }
+                }
+                continue
+            }
+            break
+        }
+
+        if leadingIndentWidth(line) == 0 {
+            var codeEnd = n
+            var k = i
+            while k + 1 < n {
+                if bytes[k] == 0x2F && bytes[k + 1] == 0x2F {
+                    codeEnd = k
+                    break
+                }
+                k += 1
+            }
+            while codeEnd > i && (bytes[codeEnd - 1] == 0x20 || bytes[codeEnd - 1] == 0x09 || bytes[codeEnd - 1] == 0x0D) {
+                codeEnd -= 1
+            }
+            if codeEnd > i && bytes[codeEnd - 1] == 0x7B {
+                let codeSlice = bytes[i..<codeEnd]
+                if codeSlice.contains(0x28) && codeSlice.contains(0x29),
+                   let first = firstToken, !controlFlowKeywords.contains(first) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    private static func structuralWeight(_ line: String) -> Int {
+        let stripped = stripHorizontalWhitespace(line)
+        if stripped.isEmpty { return 1 }
+        if isTrivialDelimiter(stripped) { return 2 }
+        let indent = leadingIndentWidth(line)
+        if isStructuralHeader(line) { return indent == 0 ? 24 : 18 }
+        if indent == 0 && (stripped.hasPrefix("//") || stripped.hasPrefix("/*") || stripped.hasPrefix("*") || stripped.hasPrefix("#") || stripped.hasPrefix("--")) {
+            return 6
+        }
+        return indent == 0 ? 5 : 4
+    }
+
+    private static func isValidHunk(_ h: Hunk, oldCount: Int, newCount: Int) -> Bool {
+        h.leftStart >= 0 && h.leftCount >= 0 && h.leftStart + h.leftCount <= oldCount
+            && h.rightStart >= 0 && h.rightCount >= 0 && h.rightStart + h.rightCount <= newCount
+    }
+
+    /// Realigns local hunk clusters when a structural declaration header is stranded across a short
+    /// unchanged gap of lower-weight body lines, preferring structurally heavier matches.
+    static func realignStructuralHunks(
+        _ hunks: [Hunk],
+        oldLines: [String],
+        newLines: [String],
+        ignoreWhitespace: Bool,
+        exactLineEqual: ((Int, Int) -> Bool)? = nil
+    ) -> [Hunk] {
+        guard hunks.count >= 2 else { return hunks }
+
+        @inline(__always)
+        func linesMatch(_ li: Int, _ rj: Int) -> Bool {
+            if ignoreWhitespace {
+                return stripHorizontalWhitespace(oldLines[li]) == stripHorizontalWhitespace(newLines[rj])
+            }
+            if let exactLineEqual { return exactLineEqual(li, rj) }
+            return oldLines[li] == newLines[rj]
+        }
+
+        var result: [Hunk] = []
+        result.reserveCapacity(hunks.count)
+        var committedLeft = 0
+        var committedRight = 0
+        var clusterStart = 0
+
+        while clusterStart < hunks.count {
+            var clusterEnd = clusterStart
+            while clusterEnd + 1 < hunks.count {
+                let cur = hunks[clusterEnd]
+                let next = hunks[clusterEnd + 1]
+                guard isValidHunk(cur, oldCount: oldLines.count, newCount: newLines.count),
+                      isValidHunk(next, oldCount: oldLines.count, newCount: newLines.count) else { break }
+                let gapL = next.leftStart - (cur.leftStart + cur.leftCount)
+                let gapR = next.rightStart - (cur.rightStart + cur.rightCount)
+                guard gapL == gapR && gapL >= 0 && gapL <= 24 else { break }
+                clusterEnd += 1
+            }
+
+            func emitClusterUnchanged() {
+                result.append(contentsOf: hunks[clusterStart...clusterEnd])
+                let last = hunks[clusterEnd]
+                committedLeft = max(committedLeft, min(oldLines.count, last.leftStart + last.leftCount))
+                committedRight = max(committedRight, min(newLines.count, last.rightStart + last.rightCount))
+            }
+
+            guard clusterEnd > clusterStart,
+                  isValidHunk(hunks[clusterStart], oldCount: oldLines.count, newCount: newLines.count),
+                  isValidHunk(hunks[clusterEnd], oldCount: oldLines.count, newCount: newLines.count) else {
+                emitClusterUnchanged()
+                clusterStart = clusterEnd + 1
+                continue
+            }
+
+            var leftHeaderHunks: [String: Set<Int>] = [:]
+            var rightHeaderHunks: [String: Set<Int>] = [:]
+            for k in clusterStart...clusterEnd {
+                let h = hunks[k]
+                for l in h.leftStart..<(h.leftStart + h.leftCount) {
+                    let line = oldLines[l]
+                    if isStructuralHeader(line) {
+                        let key = ignoreWhitespace ? stripHorizontalWhitespace(line) : line
+                        leftHeaderHunks[key, default: []].insert(k)
+                    }
+                }
+                for r in h.rightStart..<(h.rightStart + h.rightCount) {
+                    let line = newLines[r]
+                    if isStructuralHeader(line) {
+                        let key = ignoreWhitespace ? stripHorizontalWhitespace(line) : line
+                        rightHeaderHunks[key, default: []].insert(k)
+                    }
+                }
+            }
+
+            var hasCrossHunkHeader = false
+            for (key, lSet) in leftHeaderHunks {
+                guard let rSet = rightHeaderHunks[key] else { continue }
+                if lSet.contains(where: { lk in rSet.contains(where: { $0 != lk }) }) {
+                    hasCrossHunkHeader = true
+                    break
+                }
+            }
+            guard hasCrossHunkHeader else {
+                emitClusterUnchanged()
+                clusterStart = clusterEnd + 1
+                continue
+            }
+
+            var l0 = hunks[clusterStart].leftStart
+            var r0 = hunks[clusterStart].rightStart
+            var l1 = hunks[clusterEnd].leftStart + hunks[clusterEnd].leftCount
+            var r1 = hunks[clusterEnd].rightStart + hunks[clusterEnd].rightCount
+
+            var backSteps = 0
+            while backSteps < 4, l0 > committedLeft, r0 > committedRight,
+                  linesMatch(l0 - 1, r0 - 1), isTrivialBoundaryLine(oldLines[l0 - 1]) {
+                l0 -= 1
+                r0 -= 1
+                backSteps += 1
+            }
+
+            let nextL = clusterEnd + 1 < hunks.count ? min(oldLines.count, max(l1, hunks[clusterEnd + 1].leftStart)) : oldLines.count
+            let nextR = clusterEnd + 1 < hunks.count ? min(newLines.count, max(r1, hunks[clusterEnd + 1].rightStart)) : newLines.count
+            var fwdSteps = 0
+            while fwdSteps < 4, l1 < nextL, r1 < nextR,
+                  linesMatch(l1, r1), isTrivialBoundaryLine(oldLines[l1]) {
+                l1 += 1
+                r1 += 1
+                fwdSteps += 1
+            }
+
+            let n = l1 - l0
+            let m = r1 - r0
+            guard n > 0, m > 0, n * m <= 250_000 else {
+                emitClusterUnchanged()
+                clusterStart = clusterEnd + 1
+                continue
+            }
+
+            var oldExactWeight = 0
+            func accumulateOldGap(leftRange: Range<Int>, rightStart: Int) {
+                for offset in 0..<leftRange.count {
+                    let l = leftRange.lowerBound + offset
+                    let r = rightStart + offset
+                    if linesMatch(l, r) {
+                        oldExactWeight += structuralWeight(oldLines[l])
+                    }
+                }
+            }
+            accumulateOldGap(leftRange: l0..<hunks[clusterStart].leftStart, rightStart: r0)
+            for k in clusterStart..<clusterEnd {
+                let gStartL = hunks[k].leftStart + hunks[k].leftCount
+                let gEndL = hunks[k + 1].leftStart
+                let gStartR = hunks[k].rightStart + hunks[k].rightCount
+                accumulateOldGap(leftRange: gStartL..<gEndL, rightStart: gStartR)
+            }
+            accumulateOldGap(
+                leftRange: (hunks[clusterEnd].leftStart + hunks[clusterEnd].leftCount)..<l1,
+                rightStart: hunks[clusterEnd].rightStart + hunks[clusterEnd].rightCount
+            )
+
+            let wL = (l0..<l1).map { structuralWeight(oldLines[$0]) }
+            let normL = (l0..<l1).map { stripHorizontalWhitespace(oldLines[$0]) }
+            let normR = (r0..<r1).map { stripHorizontalWhitespace(newLines[$0]) }
+
+            let scale: Int64 = 1_000_000
+            let contigBonus: Int64 = 40_000
+            let nearBonus: Int64 = 150_000
+
+            let stride = m + 1
+            var dp = [Int64](repeating: 0, count: (n + 1) * stride)
+            var prevExact = [Bool](repeating: false, count: (n + 1) * stride)
+            var choice = [UInt8](repeating: 0, count: (n + 1) * stride)
+
+            for i in 1...n {
+                for j in 1...m {
+                    let idx = i * stride + j
+                    var best = dp[(i - 1) * stride + j]
+                    var bestChoice: UInt8 = 0
+                    var bestExact = false
+
+                    let leftVal = dp[i * stride + (j - 1)]
+                    if leftVal > best {
+                        best = leftVal
+                        bestChoice = 1
+                        bestExact = false
+                    }
+
+                    let prevIdx = (i - 1) * stride + (j - 1)
+                    if linesMatch(l0 + i - 1, r0 + j - 1) {
+                        let cand = dp[prevIdx]
+                            + Int64(wL[i - 1]) * scale
+                            + (prevExact[prevIdx] ? contigBonus : 0)
+                            + Int64((n - i) + (m - j))
+                        if cand > best {
+                            best = cand
+                            bestChoice = 2
+                            bestExact = true
+                        }
+                    } else if !ignoreWhitespace && normL[i - 1] == normR[j - 1] && isSubstantive(normL[i - 1]) {
+                        let cand = dp[prevIdx] + nearBonus + Int64((n - i) + (m - j))
+                        if cand > best {
+                            best = cand
+                            bestChoice = 3
+                            bestExact = false
+                        }
+                    }
+
+                    dp[idx] = best
+                    choice[idx] = bestChoice
+                    prevExact[idx] = bestExact
+                }
+            }
+
+            var newMatches: [(Int, Int)] = []
+            var bi = n
+            var bj = m
+            while bi > 0 && bj > 0 {
+                switch choice[bi * stride + bj] {
+                case 2:
+                    newMatches.append((l0 + bi - 1, r0 + bj - 1))
+                    bi -= 1
+                    bj -= 1
+                case 3:
+                    bi -= 1
+                    bj -= 1
+                case 0:
+                    bi -= 1
+                default:
+                    bj -= 1
+                }
+            }
+            newMatches.reverse()
+
+            let newExactWeight = newMatches.reduce(0) { $0 + structuralWeight(oldLines[$1.0]) }
+            guard newExactWeight > oldExactWeight else {
+                emitClusterUnchanged()
+                clusterStart = clusterEnd + 1
+                continue
+            }
+
+            var pl = l0
+            var pr = r0
+            for (li, rj) in newMatches {
+                if li > pl || rj > pr {
+                    result.append(Hunk(leftStart: pl, leftCount: li - pl, rightStart: pr, rightCount: rj - pr))
+                }
+                pl = li + 1
+                pr = rj + 1
+            }
+            if l1 > pl || r1 > pr {
+                result.append(Hunk(leftStart: pl, leftCount: l1 - pl, rightStart: pr, rightCount: r1 - pr))
+            }
+            committedLeft = l1
+            committedRight = r1
+            clusterStart = clusterEnd + 1
+        }
+
+        return result
+    }
+
+    /// Splits `.modified` hunks that mix whitespace-only realigned lines with pure added/deleted lines
+    /// into separate `.modified` + `.added`/`.deleted` sub-hunks.
+    static func splitWhitespaceAlignedHunks(_ hunks: [Hunk], oldLines: [String], newLines: [String]) -> [Hunk] {
+        var result: [Hunk] = []
+        result.reserveCapacity(hunks.count)
+
+        for h in hunks {
+            guard h.kind == .modified,
+                  h.leftCount <= 400, h.rightCount <= 400,
+                  isValidHunk(h, oldCount: oldLines.count, newCount: newLines.count) else {
+                result.append(h)
+                continue
+            }
+
+            let normL = (h.leftStart..<(h.leftStart + h.leftCount)).map { stripHorizontalWhitespace(oldLines[$0]) }
+            let normR = (h.rightStart..<(h.rightStart + h.rightCount)).map { stripHorizontalWhitespace(newLines[$0]) }
+
+            let substantiveL = Set(normL.filter(isSubstantive))
+            guard !substantiveL.isEmpty, normR.contains(where: { substantiveL.contains($0) }),
+                  let (matchedA, matchedB) = Myers.matches(normL, normR, maxEdits: 400) else {
+                result.append(h)
+                continue
+            }
+
+            var pairs: [(Int, Int)] = []
+            var ia = 0
+            var ib = 0
+            while ia < normL.count && ib < normR.count {
+                while ia < normL.count && !matchedA[ia] { ia += 1 }
+                while ib < normR.count && !matchedB[ib] { ib += 1 }
+                guard ia < normL.count && ib < normR.count else { break }
+                pairs.append((ia, ib))
+                ia += 1
+                ib += 1
+            }
+
+            // Group matched pairs into contiguous diagonal runs and keep only runs containing at least one substantive line.
+            var keptRuns: [(leftStart: Int, rightStart: Int, count: Int)] = []
+            var pIdx = 0
+            while pIdx < pairs.count {
+                let runStartIdx = pIdx
+                var runEndIdx = pIdx + 1
+                while runEndIdx < pairs.count
+                        && pairs[runEndIdx].0 == pairs[runEndIdx - 1].0 + 1
+                        && pairs[runEndIdx].1 == pairs[runEndIdx - 1].1 + 1 {
+                    runEndIdx += 1
+                }
+                if pairs[runStartIdx..<runEndIdx].contains(where: { isSubstantive(normL[$0.0]) }) {
+                    keptRuns.append((
+                        leftStart: pairs[runStartIdx].0,
+                        rightStart: pairs[runStartIdx].1,
+                        count: runEndIdx - runStartIdx
+                    ))
+                }
+                pIdx = runEndIdx
+            }
+
+            guard !keptRuns.isEmpty else {
+                result.append(h)
+                continue
+            }
+
+            var rawSubHunks: [Hunk] = []
+            var curL = 0
+            var curR = 0
+            for run in keptRuns {
+                if run.leftStart > curL || run.rightStart > curR {
+                    rawSubHunks.append(Hunk(
+                        leftStart: h.leftStart + curL,
+                        leftCount: run.leftStart - curL,
+                        rightStart: h.rightStart + curR,
+                        rightCount: run.rightStart - curR
+                    ))
+                }
+                rawSubHunks.append(Hunk(
+                    leftStart: h.leftStart + run.leftStart,
+                    leftCount: run.count,
+                    rightStart: h.rightStart + run.rightStart,
+                    rightCount: run.count
+                ))
+                curL = run.leftStart + run.count
+                curR = run.rightStart + run.count
+            }
+            if h.leftCount > curL || h.rightCount > curR {
+                rawSubHunks.append(Hunk(
+                    leftStart: h.leftStart + curL,
+                    leftCount: h.leftCount - curL,
+                    rightStart: h.rightStart + curR,
+                    rightCount: h.rightCount - curR
+                ))
+            }
+
+            var coalesced: [Hunk] = []
+            for sub in rawSubHunks {
+                if let last = coalesced.last, last.kind == .modified, sub.kind == .modified {
+                    coalesced[coalesced.count - 1].leftCount += sub.leftCount
+                    coalesced[coalesced.count - 1].rightCount += sub.rightCount
+                } else {
+                    coalesced.append(sub)
+                }
+            }
+
+            if coalesced.count > 1 {
+                result.append(contentsOf: coalesced)
+            } else {
+                result.append(h)
+            }
+        }
+
+        return result
+    }
+}
+
 // MARK: - Word-level diff
 
 enum InlineDiff {
@@ -915,9 +1427,72 @@ enum InlineDiff {
         )
     }
 
+    @inline(__always)
+    private static func isHorizontalWhitespaceUnit(_ unit: UInt16) -> Bool {
+        unit == 32 || unit == 9
+    }
+
+    private static func isHorizontalWhitespaceLine(_ line: String) -> Bool {
+        line.utf16.allSatisfy(isHorizontalWhitespaceUnit)
+    }
+
+    /// Computes exact differing horizontal-whitespace UTF-16 ranges between two lines whose
+    /// non-whitespace UTF-16 units match in order.
+    private static func whitespaceDiffRanges(old: String, new: String) -> (old: [Range<Int>], new: [Range<Int>]) {
+        let a = Array(old.utf16)
+        let b = Array(new.utf16)
+        var i = 0
+        var j = 0
+        var oldRanges: [Range<Int>] = []
+        var newRanges: [Range<Int>] = []
+
+        while true {
+            let gapStartA = i
+            while i < a.count && isHorizontalWhitespaceUnit(a[i]) { i += 1 }
+            let gapStartB = j
+            while j < b.count && isHorizontalWhitespaceUnit(b[j]) { j += 1 }
+
+            var a0 = gapStartA
+            var a1 = i
+            var b0 = gapStartB
+            var b1 = j
+            while a0 < a1 && b0 < b1 && a[a0] == b[b0] { a0 += 1; b0 += 1 }
+            while a1 > a0 && b1 > b0 && a[a1 - 1] == b[b1 - 1] { a1 -= 1; b1 -= 1 }
+            if a0 < a1 { oldRanges.append(a0..<a1) }
+            if b0 < b1 { newRanges.append(b0..<b1) }
+
+            if i == a.count && j == b.count { break }
+            guard i < a.count, j < b.count, a[i] == b[j] else { return ([], []) }
+            i += 1
+            j += 1
+        }
+        return (oldRanges, newRanges)
+    }
+
     /// Returns per-line changed ranges for both sides of a modified hunk, or nil when the
     /// two sides share nothing worth aligning (whole-line colouring says enough).
     static func compute(old: ArraySlice<String>, new: ArraySlice<String>) -> (old: [[Range<Int>]], new: [[Range<Int>]])? {
+        if old.count == new.count && !old.isEmpty
+            && old.allSatisfy(isHorizontalWhitespaceLine)
+            && new.allSatisfy(isHorizontalWhitespaceLine)
+            && zip(old, new).contains(where: { $0 != $1 }) {
+            var oldResult: [[Range<Int>]] = []
+            var newResult: [[Range<Int>]] = []
+            oldResult.reserveCapacity(old.count)
+            newResult.reserveCapacity(new.count)
+            for (oldLine, newLine) in zip(old, new) {
+                if oldLine == newLine {
+                    oldResult.append([])
+                    newResult.append([])
+                } else {
+                    let ws = whitespaceDiffRanges(old: oldLine, new: newLine)
+                    oldResult.append(ws.old)
+                    newResult.append(ws.new)
+                }
+            }
+            return (oldResult, newResult)
+        }
+
         guard let a = tokenize(old), let b = tokenize(new), !a.isEmpty, !b.isEmpty else { return nil }
         guard var (matchedA, matchedB) = Myers.matches(a.map(\.hash), b.map(\.hash), maxEdits: 600) else { return nil }
 
@@ -930,8 +1505,6 @@ enum InlineDiff {
 
         func ranges(_ tokens: [Token], _ matched: [Bool], lineCount: Int) -> [[Range<Int>]] {
             var result = [[Range<Int>]](repeating: [], count: lineCount)
-            // Extent of each line's visible text, to spot lines that changed from end to end.
-            var extents = [Range<Int>?](repeating: nil, count: lineCount)
             var open: (line: Int, start: Int, end: Int)?
             func close() {
                 if let o = open { result[o.line].append(o.start..<o.end) }
@@ -943,8 +1516,6 @@ enum InlineDiff {
                 // as solid blocks), but a space between two changed words is bridged so they merge.
                 if t.isSpace { continue }
                 let line = Int(t.line)
-                let tokenEnd = Int(t.start + t.length)
-                extents[line] = (extents[line]?.lowerBound ?? Int(t.start))..<tokenEnd
                 if !matched[i] {
                     let end = Int(t.start + t.length)
                     if let o = open, o.line == line {
@@ -958,14 +1529,62 @@ enum InlineDiff {
                 }
             }
             close()
-            // A line that differs in its entirety gains nothing from a second, darker highlight
-            // on top of its band; keeping those lines plain makes the partial edits stand out.
-            for line in 0..<lineCount where result[line].count == 1 && result[line][0] == extents[line] {
-                result[line] = []
-            }
             return result
         }
-        return (ranges(a, matchedA, lineCount: old.count), ranges(b, matchedB, lineCount: new.count))
+
+        var oldResult = ranges(a, matchedA, lineCount: old.count)
+        var newResult = ranges(b, matchedB, lineCount: new.count)
+
+        var oldLineTarget = [Int?](repeating: nil, count: old.count)
+        var oldLineConflict = [Bool](repeating: false, count: old.count)
+        var newLineSource = [Int?](repeating: nil, count: new.count)
+        var newLineConflict = [Bool](repeating: false, count: new.count)
+
+        var ia = 0
+        var ib = 0
+        while ia < a.count && ib < b.count {
+            while ia < a.count && !matchedA[ia] { ia += 1 }
+            while ib < b.count && !matchedB[ib] { ib += 1 }
+            guard ia < a.count && ib < b.count else { break }
+            let ta = a[ia]
+            let tb = b[ib]
+            if !ta.isSpace && !tb.isSpace {
+                let l = Int(ta.line)
+                let r = Int(tb.line)
+                if let existing = oldLineTarget[l], existing != r { oldLineConflict[l] = true } else { oldLineTarget[l] = r }
+                if let existing = newLineSource[r], existing != l { newLineConflict[r] = true } else { newLineSource[r] = l }
+            }
+            ia += 1
+            ib += 1
+        }
+
+        let oldBase = old.startIndex
+        let newBase = new.startIndex
+        for l in 0..<old.count {
+            guard !oldLineConflict[l], let r = oldLineTarget[l], !newLineConflict[r], newLineSource[r] == l else { continue }
+            guard oldResult[l].isEmpty && newResult[r].isEmpty else { continue }
+            let oldLine = old[oldBase + l]
+            let newLine = new[newBase + r]
+            guard oldLine != newLine else { continue }
+            let ws = whitespaceDiffRanges(old: oldLine, new: newLine)
+            oldResult[l] = ws.old
+            newResult[r] = ws.new
+        }
+
+        if old.count == new.count {
+            for idx in 0..<old.count where oldResult[idx].isEmpty && newResult[idx].isEmpty {
+                let oldLine = old[oldBase + idx]
+                let newLine = new[newBase + idx]
+                guard oldLine != newLine,
+                      isHorizontalWhitespaceLine(oldLine),
+                      isHorizontalWhitespaceLine(newLine) else { continue }
+                let ws = whitespaceDiffRanges(old: oldLine, new: newLine)
+                oldResult[idx] = ws.old
+                newResult[idx] = ws.new
+            }
+        }
+
+        return (oldResult, newResult)
     }
 }
 
@@ -1043,12 +1662,14 @@ enum Myers {
 
 // MARK: - Loading
 
-struct DiffRequest: Equatable {
-    enum Source: Equatable {
+struct DiffRequest: Equatable, Hashable, Sendable {
+    enum Source: Equatable, Hashable, Sendable {
         /// `base` (normally HEAD) against the working tree.
         case worktree(base: String)
         /// A commit against its first parent (nil parent means a root commit).
         case commit(hash: String, parent: String?)
+        /// Ordered non-contiguous commits (`oldest` → `newest`) touching one file.
+        case commitSteps([FileCommitStep])
         /// A plain file from the working tree, no comparison.
         case file
         /// An external read-only file opened via LSP navigation (sibling `go.work` repo, `$GOROOT`, `pkg/mod`…).
@@ -1069,6 +1690,13 @@ struct DiffRequest: Equatable {
         return false
     }
 
+    var isCommitDiff: Bool {
+        switch source {
+        case .commit, .commitSteps: return true
+        case .file, .externalFile, .worktree: return false
+        }
+    }
+
     var isExternalFile: Bool {
         if case .externalFile = source { return true }
         return false
@@ -1083,7 +1711,7 @@ struct DiffRequest: Equatable {
         switch source {
         case .file, .externalFile: return true
         case .worktree: return kind != .deleted
-        case .commit: return false
+        case .commit, .commitSteps: return false
         }
     }
 
@@ -1091,8 +1719,7 @@ struct DiffRequest: Equatable {
     var lspRepoRoot: URL? {
         switch source {
         case .externalFile(_, let workspaceRoot): return workspaceRoot
-        case .file, .worktree: return root
-        case .commit: return nil
+        case .file, .worktree, .commit, .commitSteps: return root
         }
     }
 
@@ -1155,6 +1782,16 @@ enum DiffLoader {
             } else {
                 data = nil
             }
+        case .commitSteps(let steps):
+            if request.kind != .deleted, let last = steps.last,
+               let newBlob = await Git.blob(rev: last.hash, path: last.path, in: root) {
+                data = newBlob
+            } else if let first = steps.first, let parent = first.parent,
+                      let oldBlob = await Git.blob(rev: parent, path: first.oldPath ?? request.oldPath ?? request.path, in: root) {
+                data = oldBlob
+            } else {
+                data = nil
+            }
         }
 
         guard let spreadsheetData = data else {
@@ -1200,6 +1837,8 @@ enum DiffLoader {
         var oldData: Data?
         var newData: Data?
         var leftTitle = "", rightTitle = ""
+        var isSyntheticReplay = false
+        var resolutionNote: String?
 
         switch request.source {
         case .file, .externalFile:
@@ -1252,6 +1891,15 @@ enum DiffLoader {
             newData = await new
             leftTitle = parent.map { String($0.prefix(7)) } ?? L("Empty", "空")
             rightTitle = String(hash.prefix(7))
+
+        case .commitSteps(let steps):
+            let resolution = await resolveCommitSteps(steps, in: root)
+            oldData = resolution.oldData
+            newData = resolution.newData
+            leftTitle = resolution.leftTitle
+            rightTitle = resolution.rightTitle
+            isSyntheticReplay = resolution.isSynthetic
+            resolutionNote = resolution.note
         }
 
         func finish(_ doc: DiffDocument) -> DiffDocument {
@@ -1386,6 +2034,7 @@ enum DiffLoader {
         )
         doc.semanticOptions = semanticOptions
         doc.isJSONNormalized = isJSONNormalized
+        doc.isSyntheticReplay = isSyntheticReplay
         doc.setRenameGroups(processed.renameGroups)
         doc.editing = editing
         if !isJSONNormalized && !request.ignoreWhitespace {
@@ -1398,7 +2047,7 @@ enum DiffLoader {
                 hasWorktreeFile: url != nil
             )
         }
-        doc.note = note(
+        doc.note = resolutionNote ?? note(
             hunks: doc.hunks,
             old: oldData,
             new: newData,
@@ -1778,6 +2427,187 @@ enum DiffLoader {
         guard let output = try? await Git.run(args, in: scratch, okStatuses: [0, 1], environment: environment) else { return nil }
         let parsed = DiffParser.parseHunks(output)
         // Files git did not compare line by line are not files without differences.
-        return parsed.binary ? nil : parsed.hunks
+        if parsed.binary { return nil }
+        if parsed.hunks.isEmpty { return [] }
+
+        let oldLines = TextCodec.splitLines(TextCodec.decode(old))
+        let newLines = TextCodec.splitLines(TextCodec.decode(new))
+        let oldRaw = HunkPatch.lineRanges(old)
+        let newRaw = HunkPatch.lineRanges(new)
+        let exactLineEqual: ((Int, Int) -> Bool)?
+        if !ignoreWhitespace && oldRaw.count == oldLines.count && newRaw.count == newLines.count {
+            let oldBytes = old
+            let newBytes = new
+            exactLineEqual = { li, rj in
+                let lr = oldRaw[li]
+                let rr = newRaw[rj]
+                var lEnd = lr.upperBound
+                var rEnd = rr.upperBound
+                let lHasNL = lEnd > lr.lowerBound && oldBytes[oldBytes.startIndex + lEnd - 1] == 0x0A
+                let rHasNL = rEnd > rr.lowerBound && newBytes[newBytes.startIndex + rEnd - 1] == 0x0A
+                guard lHasNL == rHasNL else { return false }
+                if lHasNL { lEnd -= 1 }
+                if rHasNL { rEnd -= 1 }
+                return oldBytes[(oldBytes.startIndex + lr.lowerBound)..<(oldBytes.startIndex + lEnd)]
+                    == newBytes[(newBytes.startIndex + rr.lowerBound)..<(newBytes.startIndex + rEnd)]
+            }
+        } else {
+            exactLineEqual = nil
+        }
+
+        var hunks = DiffRefiner.realignStructuralHunks(
+            parsed.hunks,
+            oldLines: oldLines,
+            newLines: newLines,
+            ignoreWhitespace: ignoreWhitespace,
+            exactLineEqual: exactLineEqual
+        )
+        if !ignoreWhitespace {
+            hunks = DiffRefiner.splitWhitespaceAlignedHunks(hunks, oldLines: oldLines, newLines: newLines)
+        }
+        return hunks
+    }
+
+    private struct CommitStepsResolution {
+        var oldData: Data?
+        var newData: Data?
+        var leftTitle: String
+        var rightTitle: String
+        var isSynthetic: Bool
+        var note: String?
+    }
+
+    /// Resolves a file across non-contiguous selected commits (`oldest` → `newest`) by chaining steps directly
+    /// when untouched in between, or replaying patches with `git merge-file` when unselected commits intervened.
+    private static func resolveCommitSteps(_ steps: [FileCommitStep], in root: URL) async -> CommitStepsResolution {
+        guard !steps.isEmpty else {
+            return CommitStepsResolution(oldData: nil, newData: nil, leftTitle: "", rightTitle: "", isSynthetic: false, note: nil)
+        }
+        var oldBlobs = [Data?](repeating: nil, count: steps.count)
+        var newBlobs = [Data?](repeating: nil, count: steps.count)
+        await withTaskGroup(of: (Int, Data?, Data?).self) { group in
+            for (index, step) in steps.enumerated() {
+                if index >= 8, let done = await group.next() {
+                    oldBlobs[done.0] = done.1
+                    newBlobs[done.0] = done.2
+                }
+                group.addTask {
+                    let hasOld = step.kind != .added && step.parent != nil
+                    let hasNew = step.kind != .deleted
+                    async let oldBlob: Data? = hasOld
+                        ? Git.blob(rev: step.parent!, path: step.oldPath ?? step.path, in: root)
+                        : nil
+                    async let newBlob: Data? = hasNew
+                        ? Git.blob(rev: step.hash, path: step.path, in: root)
+                        : nil
+                    return (index, await oldBlob, await newBlob)
+                }
+            }
+            for await done in group {
+                oldBlobs[done.0] = done.1
+                newBlobs[done.0] = done.2
+            }
+        }
+
+        let baseData = oldBlobs[0]
+        var currentData = newBlobs[0]
+        var replayed = false
+        var hadConflict = false
+
+        for i in 1..<steps.count {
+            let stepOld = oldBlobs[i]
+            let stepNew = newBlobs[i]
+            if currentData == stepOld {
+                currentData = stepNew
+                continue
+            }
+            if stepOld != nil, stepNew == nil {
+                currentData = nil
+                replayed = true
+                continue
+            }
+            if stepOld == nil, let stepNew {
+                if currentData == nil {
+                    currentData = stepNew
+                    replayed = true
+                    continue
+                }
+                hadConflict = true
+                break
+            }
+            guard let cur = currentData, let sOld = stepOld, let sNew = stepNew,
+                  !TextCodec.looksBinary(cur), !TextCodec.looksBinary(sOld), !TextCodec.looksBinary(sNew),
+                  let merged = await mergeThreeWay(current: cur, base: sOld, other: sNew) else {
+                hadConflict = true
+                break
+            }
+            currentData = merged
+            replayed = true
+        }
+
+        let baseTitle = steps[0].parent.map { String($0.prefix(7)) } ?? L("Empty", "空")
+        let firstShort = String(steps[0].hash.prefix(7))
+        let lastShort = String(steps[steps.count - 1].hash.prefix(7))
+        if hadConflict {
+            return CommitStepsResolution(
+                oldData: oldBlobs[0],
+                newData: newBlobs[steps.count - 1],
+                leftTitle: baseTitle,
+                rightTitle: lastShort,
+                isSynthetic: false,
+                note: L("Selected commits overlap with unselected commits in this file · showing \(firstShort)..\(lastShort)",
+                        "此文件中所选提交与未选提交改动重叠 · 已显示区间 \(firstShort)..\(lastShort)")
+            )
+        }
+        if replayed {
+            return CommitStepsResolution(
+                oldData: baseData,
+                newData: currentData,
+                leftTitle: baseTitle,
+                rightTitle: L("\(lastShort) (\(steps.count) selected)", "\(lastShort)（仅已选 \(steps.count) 个提交）"),
+                isSynthetic: true,
+                note: nil
+            )
+        }
+        return CommitStepsResolution(
+            oldData: baseData,
+            newData: currentData,
+            leftTitle: baseTitle,
+            rightTitle: lastShort,
+            isSynthetic: false,
+            note: nil
+        )
+    }
+
+    /// Cleanly replays `base → other` onto `current` using `git merge-file -p`; nil on any conflict or I/O failure.
+    static func mergeThreeWay(current: Data, base: Data, other: Data) async -> Data? {
+        var curData = current, baseData = base, otherData = other
+        if HunkPatch.isUTF16(curData) || HunkPatch.isUTF16(baseData) || HunkPatch.isUTF16(otherData) {
+            curData = Data(TextCodec.decode(curData).utf8)
+            baseData = Data(TextCodec.decode(baseData).utf8)
+            otherData = Data(TextCodec.decode(otherData).utf8)
+        }
+        let id = UUID().uuidString
+        let curURL = scratch.appendingPathComponent("\(id).cur")
+        let baseURL = scratch.appendingPathComponent("\(id).base")
+        let otherURL = scratch.appendingPathComponent("\(id).other")
+        defer {
+            try? FileManager.default.removeItem(at: curURL)
+            try? FileManager.default.removeItem(at: baseURL)
+            try? FileManager.default.removeItem(at: otherURL)
+        }
+        do {
+            try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+            try curData.write(to: curURL)
+            try baseData.write(to: baseURL)
+            try otherData.write(to: otherURL)
+        } catch {
+            return nil
+        }
+        return try? await Git.run(
+            ["merge-file", "-p", curURL.lastPathComponent, baseURL.lastPathComponent, otherURL.lastPathComponent],
+            in: scratch,
+            okStatuses: [0]
+        )
     }
 }

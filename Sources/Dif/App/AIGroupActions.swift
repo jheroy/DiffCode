@@ -472,7 +472,7 @@ extension AppStore {
         // without running a wasted re-filter on the outgoing file.
         pendingGroupHunkFocus = (root: project.url, path: filePath, hunkIndex: hunkIndex)
         syncGroupHunkFilter(targetHunks, for: request)
-        let sameFile = viewer.request?.path == request.path && viewer.request?.root == request.root
+        let sameFile = viewer.request?.path == request.path && viewer.request?.root == request.root && viewer.request?.source != .file
         viewer.open(request, preserveScroll: sameFile)
     }
 

@@ -1108,4 +1108,149 @@ final class LSPTests: XCTestCase {
 
         await manager.shutdownAll()
     }
+
+    // MARK: - 9. LSPDocumentHighlight Decoding, Capabilities & Gating
+
+    func testDocumentHighlightDecoderAndServerCapabilities() {
+        XCTAssertTrue(LSPDocumentHighlightDecoder.decode(from: .null).isEmpty)
+
+        let payload: JSONValue = .array([
+            .object([
+                "range": .object([
+                    "start": .object(["line": .int(2), "character": .int(4)]),
+                    "end": .object(["line": .int(2), "character": .int(9)]),
+                ]),
+                "kind": .int(3),
+            ]),
+            .object([
+                "range": .object([
+                    "start": .object(["line": .int(5), "character": .int(10)]),
+                    "end": .object(["line": .int(5), "character": .int(15)]),
+                ]),
+            ]),
+            .object(["invalid": .bool(true)]),
+        ])
+        let decoded = LSPDocumentHighlightDecoder.decode(from: payload)
+        XCTAssertEqual(decoded.count, 2)
+        XCTAssertEqual(decoded[0].range, LSPRange(start: LSPPosition(line: 2, character: 4), end: LSPPosition(line: 2, character: 9)))
+        XCTAssertEqual(decoded[0].kind, .write)
+        XCTAssertNil(decoded[1].kind)
+
+        let capTrue = LSPServerCapabilities.parse(from: .object([
+            "capabilities": .object(["documentHighlightProvider": .bool(true)]),
+        ]))
+        XCTAssertTrue(capTrue.documentHighlightProvider)
+
+        let capObj = LSPServerCapabilities.parse(from: .object([
+            "capabilities": .object(["documentHighlightProvider": .object(["workDoneProgress": .bool(true)])]),
+        ]))
+        XCTAssertTrue(capObj.documentHighlightProvider)
+
+        let capFalse = LSPServerCapabilities.parse(from: .object([
+            "capabilities": .object(["documentHighlightProvider": .bool(false)]),
+        ]))
+        XCTAssertFalse(capFalse.documentHighlightProvider)
+        XCTAssertFalse(LSPServerCapabilities.empty.documentHighlightProvider)
+    }
+
+    func testMockStdioServerDocumentHighlightReturnsRangesAndRespectsCapability() async throws {
+        let dir = try makeTempDir(prefix: "dif-mock-highlight")
+        let scriptURL = dir.appendingPathComponent("mock_hl_lsp.py")
+        let fileURL = dir.appendingPathComponent("main.go")
+        let source = "package demo\nfunc run() {\n\tcount := 1\n\t_ = count\n}\n"
+        try writeFile(fileURL, contents: source)
+
+        let mockServerScript = """
+        #!/usr/bin/env python3
+        import json, sys
+
+        def send(msg):
+            body = json.dumps(msg).encode("utf-8")
+            header = f"Content-Length: {len(body)}\\r\\n\\r\\n".encode("ascii")
+            sys.stdout.buffer.write(header + body)
+            sys.stdout.buffer.flush()
+
+        def read_msg():
+            headers = {}
+            while True:
+                line = sys.stdin.buffer.readline()
+                if not line:
+                    return None
+                if line in (b"\\r\\n", b"\\n"):
+                    break
+                if b":" in line:
+                    k, v = line.decode("ascii").split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+            length = int(headers.get("content-length", "0"))
+            body = sys.stdin.buffer.read(length)
+            if not body:
+                return None
+            return json.loads(body.decode("utf-8"))
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            method = msg.get("method")
+            req_id = msg.get("id")
+            params = msg.get("params") or {}
+            if method == "initialize":
+                caps = params.get("capabilities") or {}
+                assert "documentHighlight" in (caps.get("textDocument") or {})
+                send({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "capabilities": {
+                            "textDocumentSync": 1,
+                            "documentHighlightProvider": True,
+                        }
+                    },
+                })
+            elif method == "textDocument/documentHighlight":
+                line = (params.get("position") or {}).get("line", 0)
+                if line == 99:
+                    send({"jsonrpc": "2.0", "id": req_id, "result": None})
+                else:
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": [
+                            {"range": {"start": {"line": 2, "character": 1}, "end": {"line": 2, "character": 6}}, "kind": 3},
+                            {"range": {"start": {"line": 3, "character": 5}, "end": {"line": 3, "character": 10}}, "kind": 2},
+                        ],
+                    })
+            elif method == "shutdown":
+                send({"jsonrpc": "2.0", "id": req_id, "result": None})
+            elif method == "exit":
+                break
+        """
+        try writeFile(scriptURL, contents: mockServerScript, executable: true)
+
+        let mockResolved = LSPResolvedServer(
+            descriptor: LSPServerRegistry.go,
+            executablePath: "/usr/bin/python3",
+            arguments: [scriptURL.path],
+            environment: ProcessInfo.processInfo.environment
+        )
+        let manager = LSPManager(
+            isEnabled: true,
+            serverOverrides: [LSPServerRegistry.go.id: mockResolved]
+        )
+
+        let session = await manager.didOpen(fileURL: fileURL, text: source, repoRoot: dir)
+        XCTAssertNotNil(session)
+
+        let highlights = await manager.documentHighlight(fileURL: fileURL, line: 2, character: 2)
+        XCTAssertEqual(highlights.count, 2)
+        XCTAssertEqual(highlights[0].kind, .write)
+        XCTAssertEqual(highlights[0].range.start, LSPPosition(line: 2, character: 1))
+        XCTAssertEqual(highlights[1].kind, .read)
+        XCTAssertEqual(highlights[1].range.start, LSPPosition(line: 3, character: 5))
+
+        let nullHighlights = await manager.documentHighlight(fileURL: fileURL, line: 99, character: 0)
+        XCTAssertTrue(nullHighlights.isEmpty)
+
+        await manager.shutdownAll()
+    }
 }

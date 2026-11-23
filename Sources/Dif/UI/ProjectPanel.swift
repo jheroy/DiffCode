@@ -177,11 +177,21 @@ struct ChangesList: View {
                     } else if rows.isEmpty {
                         EmptyListState(symbol: "line.3.horizontal.decrease.circle", title: L("No files match", "没有匹配的文件"), detail: "")
                     } else {
-                        KeyboardList(rows: rows, selection: $project.selectedChangeID, multiSelection: $project.selectedChangeIDs,
+                        KeyboardList(rows: rows,
+                                     selection: Binding(get: { project.selectedChangeID }, set: { id in
+                                         project.selectedChangeID = id
+                                         store.changeSelectionChanged(project)
+                                     }),
+                                     multiSelection: $project.selectedChangeIDs,
                                      focusToken: store.listFocusToken,
                                      onKey: { event, row in handleKey(event, row, rows) },
                                      onDoubleClick: { row in
-                                         if row.file != nil { store.focusViewer() } else { toggle(row) }
+                                         if row.file != nil {
+                                             store.changeSelectionChanged(project)
+                                             store.focusViewer()
+                                         } else {
+                                             toggle(row)
+                                         }
                                      },
                                      menu: { row in rowMenu(row) },
                                      dragURLs: { row in project.existingURLs(store.editTargets(for: row, in: project)) }) { row, _, _ in
@@ -202,7 +212,6 @@ struct ChangesList: View {
                 }
             }
         }
-        .onChange(of: project.selectedChangeID) { _, _ in store.changeSelectionChanged(project) }
     }
 
     private func toggle(_ row: ChangeRow) {
@@ -247,7 +256,12 @@ struct ChangesList: View {
             if let row, row.file == nil, !row.isExpanded { project.collapsed.remove(row.id) }
             return true
         case 36, 76: // ↩
-            if let row, row.file == nil { toggle(row) } else { store.focusViewer() }
+            if let row, row.file == nil {
+                toggle(row)
+            } else {
+                store.changeSelectionChanged(project)
+                store.focusViewer()
+            }
             return true
         case 53:
             if !project.filter.isEmpty { project.filter = ""; return true }
@@ -292,6 +306,7 @@ struct ChangesList: View {
             })
             menu.addItem(ClosureMenuItem(L("Show Conflict Diff", "查看冲突差异")) {
                 project.selectedChangeID = row.id
+                store.changeSelectionChanged(project)
                 store.focusViewer()
             })
             menu.addItem(ClosureMenuItem(L("Mark as Resolved", "标记为已解决")) { store.markResolved(file.path, in: project) })
@@ -308,6 +323,7 @@ struct ChangesList: View {
         if let file = row.file {
             menu.addItem(ClosureMenuItem(L("Show Diff", "查看差异")) {
                 project.selectedChangeID = row.id
+                store.changeSelectionChanged(project)
                 store.focusViewer()
             })
             if file.kind != .untracked, file.kind != .added {
@@ -476,10 +492,20 @@ struct ComparisonList: View {
             } else if rows.isEmpty {
                 EmptyListState(symbol: "line.3.horizontal.decrease.circle", title: L("No files match", "没有匹配的文件"), detail: "")
             } else {
-                KeyboardList(rows: rows, selection: $project.compareSelectedID, focusToken: store.listFocusToken,
+                KeyboardList(rows: rows,
+                             selection: Binding(get: { project.compareSelectedID }, set: { id in
+                                 project.compareSelectedID = id
+                                 store.compareSelectionChanged(project)
+                             }),
+                             focusToken: store.listFocusToken,
                              onKey: { event, row in handleKey(event, row, rows) },
                              onDoubleClick: { row in
-                                 if row.file != nil { store.focusViewer() } else { toggle(row) }
+                                 if row.file != nil {
+                                     store.compareSelectionChanged(project)
+                                     store.focusViewer()
+                                 } else {
+                                     toggle(row)
+                                 }
                              },
                              menu: { row in menu(row) },
                              dragURLs: { row in
@@ -493,7 +519,6 @@ struct ComparisonList: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .islandCard(background: .difPanel)
-        .onChange(of: project.compareSelectedID) { _, _ in store.compareSelectionChanged(project) }
     }
 
     private func toggle(_ row: ChangeRow) {
@@ -516,7 +541,12 @@ struct ComparisonList: View {
             if let row, row.file == nil, !row.isExpanded { project.compareCollapsed.remove(row.id) }
             return true
         case 36, 76: // ↩
-            if let row, row.file == nil { toggle(row) } else { store.focusViewer() }
+            if let row, row.file == nil {
+                toggle(row)
+            } else {
+                store.compareSelectionChanged(project)
+                store.focusViewer()
+            }
             return true
         case 53:
             if !project.filter.isEmpty { project.filter = ""; return true }
@@ -535,6 +565,7 @@ struct ComparisonList: View {
         }
         menu.addItem(ClosureMenuItem(L("Show Diff", "查看差异")) {
             project.compareSelectedID = row.id
+            store.compareSelectionChanged(project)
             store.focusViewer()
         })
         if file.kind != .untracked {
@@ -902,6 +933,15 @@ struct LogPanel: View {
     @State private var chromeHeight: Double = CommitDetailLayout.defaultChromeHeight
     @State private var filesFocusToken = 0
     @State private var searchWork: DispatchWorkItem?
+    @State private var showAuthorPopover = false
+
+    private var authorFilterHelp: String {
+        if project.logAuthors.isEmpty {
+            return L("Filter by authors (supports multi-select)", "按作者筛选（支持搜索并多选）")
+        }
+        return L("Filtered by \(project.logAuthors.count) authors: ", "已筛选 \(project.logAuthors.count) 位作者：")
+            + project.logAuthors.map(\.displayName).joined(separator: ", ")
+    }
 
     var body: some View {
         GeometryReader { proxy in
@@ -932,7 +972,19 @@ struct LogPanel: View {
                             FilterField(text: Binding(get: { project.logQuery }, set: { value in
                                 project.logQuery = value
                                 scheduleSearch()
-                            }), placeholder: L("Search message, author or hash", "搜索提交信息、作者或哈希"))
+                            }), placeholder: project.logAuthors.isEmpty
+                                ? L("Search message, author or hash", "搜索提交信息、作者或哈希")
+                                : L("Search message or hash", "搜索提交信息或哈希"),
+                            trailingPadding: 0)
+                            AuthorFilterButton(selectedCount: project.logAuthors.count, help: authorFilterHelp) {
+                                showAuthorPopover.toggle()
+                            }
+                            .padding(.top, 6)
+                            .popover(isPresented: $showAuthorPopover, arrowEdge: .bottom) {
+                                LogAuthorFilterPopover(project: project) {
+                                    showAuthorPopover = false
+                                }
+                            }
                             IconButton(symbol: "arrow.triangle.branch", help: L("Show all branches", "显示所有分支"),
                                        isActive: project.logAllBranches, size: 11.5) {
                                 project.logAllBranches.toggle()
@@ -941,6 +993,12 @@ struct LogPanel: View {
                             }
                             .padding(.top, 6)
                             .padding(.trailing, 6)
+                        }
+                        if !project.logAuthors.isEmpty {
+                            LogAuthorChipsBar(authors: project.logAuthors,
+                                              onOpenPicker: { showAuthorPopover = true },
+                                              onRemove: { project.removeLogAuthor($0) },
+                                              onClearAll: { project.clearLogAuthors() })
                         }
                         if let history = project.history {
                             // The Log lists one file's commits (or its lines'); ✕ goes back to the branch.
@@ -974,11 +1032,14 @@ struct LogPanel: View {
                             ProgressView().controlSize(.small)
                             Spacer()
                         } else if let history = project.history {
+                            let hasFilter = !project.logQuery.trimmingCharacters(in: .whitespaces).isEmpty || !project.logAuthors.isEmpty
                             EmptyListState(symbol: "clock", title: history.lines == nil ? L("No commits changed this file", "没有提交改动过这个文件")
                                                                                          : L("No commits changed these lines", "没有提交改动过这些行"),
-                                           detail: project.logQuery.isEmpty ? "" : L("Nothing matches the search.", "没有符合搜索条件的提交。"))
+                                           detail: hasFilter ? L("Nothing matches the filter.", "没有符合筛选条件的提交。") : "")
                         } else {
-                            EmptyListState(symbol: "clock", title: L("No commits", "没有提交"), detail: "")
+                            let hasFilter = !project.logQuery.trimmingCharacters(in: .whitespaces).isEmpty || !project.logAuthors.isEmpty
+                            EmptyListState(symbol: "clock", title: L("No commits", "没有提交"),
+                                           detail: hasFilter ? L("Nothing matches the filter.", "没有符合筛选条件的提交。") : "")
                         }
                     } else {
                         KeyboardList(rows: project.commits,
@@ -1047,6 +1108,7 @@ struct LogPanel: View {
         }
         .onChange(of: project.id) { _, _ in
             manualFilesHeight = nil
+            showAuthorPopover = false
         }
         .onChange(of: project.commitSelectionIDs) { _, _ in
             withAnimation(.snappy(duration: 0.2)) {
@@ -1191,20 +1253,39 @@ private struct CommitDetail: View {
                         StatBadge(additions: added, deletions: deleted)
                     }
                     HStack(spacing: 6) {
-                        Text("\(oldest.shortHash)..\(newest.shortHash)")
-                            .font(.code(10.5))
+                        if project.commitSelectionIsNonContiguous {
+                            Text(project.commitSkippedMergeCount > 0
+                                 ? L("Selected commits only (\(project.commitSkippedMergeCount) merge skipped)",
+                                     "仅统计所选提交（已忽略 \(project.commitSkippedMergeCount) 个合并提交）")
+                                 : L("Selected commits only", "仅统计所选提交（非连续选区）"))
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        } else {
+                            Text("\(oldest.shortHash)..\(newest.shortHash)")
+                                .font(.code(10.5))
+                        }
                         Spacer()
                         Button {
-                            let range = "\(oldest.parents.first ?? Git.emptyTree)..\(newest.hash)"
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(range, forType: .string)
-                            store.showToast(L("Copied \(oldest.shortHash)..\(newest.shortHash)",
-                                              "已复制 \(oldest.shortHash)..\(newest.shortHash)"))
+                            if project.commitSelectionIsNonContiguous {
+                                let hashes = selectedCommits.reversed().map(\.hash).joined(separator: " ")
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(hashes, forType: .string)
+                                store.showToast(L("Copied \(selectedCommits.count) commit hashes",
+                                                  "已复制 \(selectedCommits.count) 个提交哈希"))
+                            } else {
+                                let range = "\(oldest.parents.first ?? Git.emptyTree)..\(newest.hash)"
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(range, forType: .string)
+                                store.showToast(L("Copied \(oldest.shortHash)..\(newest.shortHash)",
+                                                  "已复制 \(oldest.shortHash)..\(newest.shortHash)"))
+                            }
                         } label: {
                             Image(systemName: "doc.on.doc").font(.ui(size: 9))
                         }
                         .buttonStyle(.plain)
-                        .help(L("Copy commit range", "复制提交范围"))
+                        .help(project.commitSelectionIsNonContiguous
+                              ? L("Copy selected commit hashes", "复制所选提交哈希")
+                              : L("Copy commit range", "复制提交范围"))
                     }
                     .font(.ui(size: 11))
                     .foregroundStyle(Color.difText3)
@@ -1330,7 +1411,12 @@ private struct CommitDetail: View {
             toggle(row)
             return true
         case 36, 76: // ↩
-            if let row, row.file == nil { toggle(row) } else { store.focusViewer() }
+            if let row, row.file == nil {
+                toggle(row)
+            } else {
+                store.pickedInLog(project, commitChanged: false)
+                store.focusViewer()
+            }
             return true
         case 53: // Esc
             store.focusList()
@@ -1356,5 +1442,338 @@ private struct CommitDetail: View {
     private func toggle(_ row: ChangeRow) {
         guard row.file == nil else { return }
         if project.commitCollapsed.contains(row.id) { project.commitCollapsed.remove(row.id) } else { project.commitCollapsed.insert(row.id) }
+    }
+}
+
+private struct AuthorFilterButton: View {
+    var selectedCount: Int
+    var help: String
+    var action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        let active = selectedCount > 0
+        Button(action: action) {
+            HStack(spacing: 3) {
+                Image(systemName: active ? "person.2.fill" : "person.2")
+                    .font(.ui(size: active ? 11 : 11.5, weight: .medium))
+                if active {
+                    Text("\(selectedCount)")
+                        .font(.ui(size: 10.5, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                }
+            }
+            .foregroundStyle(active ? Color.difAccent : Color.difText2)
+            .padding(.horizontal, active ? 6 : 0)
+            .frame(minWidth: UI.s(26))
+            .frame(height: UI.s(24))
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(active ? Color.difSelection : (hovering ? Color.difHover : Color.clear))
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+        .onHover { hovering = $0 }
+        .help(help)
+    }
+}
+
+private struct WrappingFlowLayout: Layout {
+    var horizontalSpacing: CGFloat = 5
+    var verticalSpacing: CGFloat = 4
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .greatestFiniteMagnitude
+        let rows = arrange(subviews: subviews, maxWidth: maxWidth)
+        let width = proposal.width ?? rows.map(\.width).max() ?? 0
+        let height = rows.reduce(CGFloat(0)) { $0 + $1.height } + max(0, CGFloat(rows.count - 1)) * verticalSpacing
+        return CGSize(width: width, height: height)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let rows = arrange(subviews: subviews, maxWidth: bounds.width)
+        var y = bounds.minY
+        for row in rows {
+            var x = bounds.minX
+            for item in row.items {
+                item.subview.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(item.size))
+                x += item.size.width + horizontalSpacing
+            }
+            y += row.height + verticalSpacing
+        }
+    }
+
+    private struct Row {
+        var items: [(subview: LayoutSubview, size: CGSize)] = []
+        var width: CGFloat = 0
+        var height: CGFloat = 0
+    }
+
+    private func arrange(subviews: Subviews, maxWidth: CGFloat) -> [Row] {
+        var rows: [Row] = []
+        var current = Row()
+        let limit = maxWidth > 0 ? maxWidth : .greatestFiniteMagnitude
+
+        for subview in subviews {
+            let natural = subview.sizeThatFits(.unspecified)
+            let size = natural.width > limit
+                ? subview.sizeThatFits(ProposedViewSize(width: limit, height: nil))
+                : natural
+            let needed = current.items.isEmpty ? size.width : current.width + horizontalSpacing + size.width
+            if !current.items.isEmpty, needed > limit {
+                rows.append(current)
+                current = Row()
+            }
+            current.items.append((subview, size))
+            current.width = current.items.count == 1 ? size.width : current.width + horizontalSpacing + size.width
+            current.height = max(current.height, size.height)
+        }
+        if !current.items.isEmpty {
+            rows.append(current)
+        }
+        return rows
+    }
+}
+
+private struct LogAuthorChipsBar: View {
+    var authors: [AuthorFilter]
+    var onOpenPicker: () -> Void
+    var onRemove: (AuthorFilter) -> Void
+    var onClearAll: () -> Void
+
+    private var duplicateNames: Set<String> {
+        var counts: [String: Int] = [:]
+        for author in authors {
+            counts[author.displayName, default: 0] += 1
+        }
+        return Set(counts.filter { $0.value > 1 }.keys)
+    }
+
+    var body: some View {
+        let duplicates = duplicateNames
+        WrappingFlowLayout(horizontalSpacing: 5, verticalSpacing: 4) {
+            ForEach(authors) { author in
+                let label = duplicates.contains(author.displayName) && !author.email.isEmpty
+                    ? "\(author.displayName) (\(author.email))"
+                    : author.displayName
+                HStack(spacing: 4) {
+                    Button(action: onOpenPicker) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "person.fill")
+                                .font(.ui(size: 9, weight: .semibold))
+                            Text(label)
+                                .font(.ui(size: 11.5, weight: .medium))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    Button { onRemove(author) } label: {
+                        Image(systemName: "xmark")
+                            .font(.ui(size: 8, weight: .bold))
+                            .padding(2)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(L("Remove \(label)", "移除 \(label)"))
+                }
+                .foregroundStyle(Color.difAccent)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Capsule().fill(Color.difSelection))
+                .help(author.email.isEmpty ? author.displayName : author.gitIdentity)
+            }
+            if authors.count > 1 {
+                Button(action: onClearAll) {
+                    Text(L("Clear", "清空"))
+                        .font(.ui(size: 11, weight: .medium))
+                        .foregroundStyle(Color.difText2)
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Capsule().fill(Color.difChip))
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .help(L("Clear all selected authors", "清空全部已选作者"))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 10)
+        .padding(.top, 5)
+    }
+}
+
+private struct LogAuthorFilterPopover: View {
+    @Bindable var project: Project
+    var onDismiss: () -> Void
+
+    @State private var query = ""
+    @State private var highlightedIndex = 0
+    @State private var focusToken = 1
+    @State private var hoveredID: String?
+
+    var body: some View {
+        let items = AuthorSearch.filter(project.availableLogAuthors, query: query, selected: project.logAuthors)
+        let selectedSet = Set(project.logAuthors)
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.ui(size: 11.5))
+                    .foregroundStyle(Color.difText3)
+                SearchField(
+                    text: $query,
+                    placeholder: L("Search authors (space or comma for multiple)…", "搜索作者（空格或逗号可搜多人）…"),
+                    font: .systemFont(ofSize: 12 * UI.scale),
+                    focusToken: focusToken,
+                    onMove: { delta in
+                        guard !items.isEmpty else { return }
+                        highlightedIndex = max(0, min(items.count - 1, highlightedIndex + delta))
+                    },
+                    onSubmit: {
+                        if items.indices.contains(highlightedIndex) {
+                            project.toggleLogAuthor(items[highlightedIndex].author)
+                        }
+                    },
+                    onCancel: {
+                        onDismiss()
+                    }
+                )
+                .frame(height: UI.s(20))
+                if !query.isEmpty {
+                    Button { query = "" } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.ui(size: 11))
+                            .foregroundStyle(Color.difText3)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+
+            Rectangle().fill(Color.difHairline).frame(height: 1)
+
+            if project.isLoadingLogAuthors && items.isEmpty {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if items.isEmpty {
+                Text(project.availableLogAuthors.isEmpty
+                     ? L("No authors found", "没有找到作者")
+                     : L("No matching authors", "没有匹配的作者"))
+                    .font(.ui(size: 12))
+                    .foregroundStyle(Color.difText3)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(spacing: 1) {
+                            ForEach(Array(items.enumerated()), id: \.element.id) { offset, item in
+                                let isSelected = selectedSet.contains(item.author)
+                                let isHighlighted = offset == highlightedIndex
+                                HStack(spacing: 8) {
+                                    Image(systemName: isSelected ? "checkmark.square.fill" : "square")
+                                        .font(.ui(size: 12))
+                                        .foregroundStyle(isSelected ? Color.difAccent : Color.difText3)
+                                    VStack(alignment: .leading, spacing: 1) {
+                                        Text(item.author.displayName)
+                                            .font(.ui(size: 12, weight: isSelected ? .medium : .regular))
+                                            .foregroundStyle(Color.difText)
+                                            .lineLimit(1)
+                                        if !item.email.isEmpty {
+                                            Text(item.email)
+                                                .font(.ui(size: 10.5))
+                                                .foregroundStyle(Color.difText3)
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+                                        }
+                                    }
+                                    Spacer(minLength: 6)
+                                    Text("\(item.commitCount)")
+                                        .font(.ui(size: 10.5, design: .rounded))
+                                        .monospacedDigit()
+                                        .foregroundStyle(Color.difText3)
+                                }
+                                .padding(.horizontal, 8)
+                                .frame(height: UI.s(36))
+                                .background(
+                                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                        .fill(isHighlighted ? Color.difSelection
+                                              : (hoveredID == item.id ? Color.difHover : Color.clear))
+                                )
+                                .contentShape(Rectangle())
+                                .id(item.id)
+                                .onHover { hovering in
+                                    hoveredID = hovering ? item.id : (hoveredID == item.id ? nil : hoveredID)
+                                }
+                                .onTapGesture {
+                                    highlightedIndex = offset
+                                    project.toggleLogAuthor(item.author)
+                                }
+                            }
+                        }
+                        .padding(5)
+                    }
+                    .onChange(of: highlightedIndex) { _, newValue in
+                        if items.indices.contains(newValue) {
+                            proxy.scrollTo(items[newValue].id)
+                        }
+                    }
+                    .onChange(of: items.count) { _, count in
+                        highlightedIndex = count == 0 ? 0 : min(highlightedIndex, count - 1)
+                    }
+                }
+            }
+
+            Rectangle().fill(Color.difHairline).frame(height: 1)
+
+            HStack(spacing: 8) {
+                if !trimmedQuery.isEmpty, !items.isEmpty {
+                    let unselectedMatches = items.filter { !selectedSet.contains($0.author) }
+                    Button(L("Select Shown", "全选匹配")) {
+                        project.addLogAuthors(items.map(\.author))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(unselectedMatches.isEmpty)
+                }
+
+                Button(L("Clear", "清空")) {
+                    project.clearLogAuthors()
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(project.logAuthors.isEmpty)
+
+                Spacer()
+
+                if !project.logAuthors.isEmpty {
+                    Text(L("\(project.logAuthors.count) selected", "已选 \(project.logAuthors.count) 人"))
+                        .font(.ui(size: 11, weight: .medium, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(Color.difAccent)
+                } else {
+                    Text(L("\(project.availableLogAuthors.count) authors", "共 \(project.availableLogAuthors.count) 位作者"))
+                        .font(.ui(size: 11, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(Color.difText3)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+        }
+        .frame(width: UI.s(300), height: UI.s(340))
+        .background(Color.difElevated)
+        .onAppear {
+            focusToken += 1
+            project.loadLogAuthors()
+        }
+        .onChange(of: query) { _, _ in
+            highlightedIndex = 0
+        }
     }
 }

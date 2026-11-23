@@ -124,18 +124,26 @@ extension Git {
     /// Commits that changed `path`, newest first, following it through renames, with the path the file had in each.
     /// - Parameter scope: where the history starts: nothing for HEAD, `--all`, or a revision.
     static func fileHistory(_ path: String, in dir: URL, skip: Int, limit: Int, query: String = "",
-                            scope: [String] = []) async throws -> (commits: [Commit], paths: [String: String]) {
+                            authors: [AuthorFilter] = [], scope: [String] = []) async throws -> (commits: [Commit], paths: [String: String]) {
         let search = grepArguments(query)
+        let hasFilter = !search.isEmpty || !authors.isEmpty
         var args = ["log", "--format=%x1e" + logFields, "--decorate=full", "--follow", "--name-only", "-z"]
-        if search.isEmpty { args += ["--skip=\(skip)", "--max-count=\(limit)"] }
+        if !hasFilter { args += ["--skip=\(skip)", "--max-count=\(limit)"] }
         let history = parseFileHistory(try await run(args + scope + ["--", path], in: dir, okStatuses: [0, 128]))
-        guard !search.isEmpty else { return history }
-        // `--follow` loses the file at a rename when `--grep` hides the commit that renamed it. So the whole history
-        // is read, and git says which of its commits match, looking under every name the file had.
-        let names = Set(history.paths.values).union([path]).sorted()
-        let out = try await runString(["log", "--format=%H"] + search + scope + ["--"] + names, in: dir, okStatuses: [0, 128])
-        let matching = Set(out.split(separator: "\n").map(String.init))
-        let commits = history.commits.filter { matching.contains($0.hash) }
+        guard hasFilter else { return history }
+        var commits = history.commits
+        if !authors.isEmpty {
+            let allowed = Set(authors)
+            commits = commits.filter { allowed.contains(AuthorFilter.from($0)) }
+        }
+        if !search.isEmpty {
+            // `--follow` loses the file at a rename when `--grep` hides the commit that renamed it. So the whole history
+            // is read, and git says which of its commits match, looking under every name the file had.
+            let names = Set(history.paths.values).union([path]).sorted()
+            let out = try await runString(["log", "--format=%H"] + search + scope + ["--"] + names, in: dir, okStatuses: [0, 128])
+            let matching = Set(out.split(separator: "\n").map(String.init))
+            commits = commits.filter { matching.contains($0.hash) }
+        }
         return (Array(commits.dropFirst(skip).prefix(limit)), history.paths)
     }
 
@@ -160,10 +168,10 @@ extension Git {
     /// - Parameters:
     ///   - lines: 1-based, in the file as `rev` has it; `path` is its path there.
     static func lineHistory(_ path: String, lines: ClosedRange<Int>, rev: String, in dir: URL, skip: Int, limit: Int,
-                            query: String = "") async throws -> [Commit] {
+                            query: String = "", authors: [AuthorFilter] = []) async throws -> [Commit] {
         var args = ["log", "--format=\(logFormat)", "--decorate=full", "--skip=\(skip)", "--max-count=\(limit)", "-s",
                     "-L\(lines.lowerBound),\(lines.upperBound):\(path)"]
-        args += grepArguments(query)
+        args += authorFilterArguments(authors, query: query)
         // A hash or HEAD, never something that reads as an option.
         args.append(rev)
         return parseLog(try await run(args, in: dir, okStatuses: [0, 128]))
@@ -187,17 +195,231 @@ extension Git {
               let data = try? await run(["log", "-1", "--format=\(logFormat)", "--decorate=full", rev, "--"], in: dir) else { return nil }
         return parseLog(data).first
     }
+}
+
+/// A single commit's touch on a file when aggregating non-contiguous Log commit selections.
+struct FileCommitStep: Equatable, Hashable, Sendable {
+    var hash: String
+    /// First parent hash, or nil for a root commit.
+    var parent: String?
+    /// File path at `hash`.
+    var path: String
+    /// Previous path at `parent` when renamed in this commit.
+    var oldPath: String?
+    var kind: FileChange.Kind
+}
+
+/// Aggregated file list and per-file commit steps for a Log commit selection.
+struct CommitSelectionSummary: Equatable, Sendable {
+    var isNonContiguous: Bool
+    var files: [FileChange]
+    /// Chronological steps (oldest → newest) per final `path`; empty for contiguous selections.
+    var fileSteps: [String: [FileCommitStep]]
+    var skippedMergeCount: Int
+}
+
+extension Git {
+    /// True when `commits` (ordered newest first) forms an unbroken linear single-parent chain.
+    static func isContiguousLinearChain(_ commits: [Commit]) -> Bool {
+        guard commits.count >= 2 else { return true }
+        for i in 0..<(commits.count - 1) {
+            let commit = commits[i]
+            guard commit.parents.count == 1, commit.parents[0] == commits[i + 1].hash else {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Parses batched `git log --no-walk=unsorted -m --first-parent --format=%x1e%H --name-status -z -M`.
+    static func parseBatchedNameStatus(_ data: Data) -> [String: [FileChange]] {
+        var result: [String: [FileChange]] = [:]
+        for (hash, body) in splitBatchedCommitRecords(data) {
+            result[hash] = body.isEmpty ? [] : parseNameStatus(body)
+        }
+        return result
+    }
+
+    /// Parses batched `git log --no-walk=unsorted -m --first-parent --format=%x1e%H --numstat -z -M`.
+    static func parseBatchedNumstat(_ data: Data) -> [String: [String: (Int, Int)]] {
+        var result: [String: [String: (Int, Int)]] = [:]
+        for (hash, body) in splitBatchedCommitRecords(data) {
+            result[hash] = body.isEmpty ? [:] : parseNumstat(body)
+        }
+        return result
+    }
+
+    private static func splitBatchedCommitRecords(_ data: Data) -> [(hash: String, body: Data)] {
+        var records: [(String, Data)] = []
+        for record in data.split(separator: 0x1E, omittingEmptySubsequences: true) {
+            let hashEnd = record.firstIndex(where: { $0 == 0x00 || $0 == 0x0A }) ?? record.endIndex
+            let hash = String(decoding: record[record.startIndex..<hashEnd], as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard hash.count >= 7 else { continue }
+            var bodyStart = hashEnd
+            while bodyStart < record.endIndex, record[bodyStart] == 0x00 || record[bodyStart] == 0x0A {
+                bodyStart = record.index(after: bodyStart)
+            }
+            let body = bodyStart < record.endIndex ? Data(record[bodyStart...]) : Data()
+            records.append((hash, body))
+        }
+        return records
+    }
+
+    /// Aggregated summary of `commits` (ordered newest first): uses the fast range diff for single commits
+    /// or contiguous linear chains, and exact per-commit aggregation for non-contiguous selections.
+    static func commitSelectionSummary(_ commits: [Commit], in dir: URL) async throws -> CommitSelectionSummary {
+        guard let newest = commits.first else {
+            return CommitSelectionSummary(isNonContiguous: false, files: [], fileSteps: [:], skippedMergeCount: 0)
+        }
+        if commits.count == 1 {
+            return CommitSelectionSummary(
+                isNonContiguous: false,
+                files: try await commitFiles(newest, in: dir),
+                fileSteps: [:],
+                skippedMergeCount: 0
+            )
+        }
+        if isContiguousLinearChain(commits) {
+            let oldest = commits[commits.count - 1]
+            let base = oldest.parents.first ?? emptyTree
+            let files = try await compareFiles(base: base, head: newest.hash, in: dir)
+            return CommitSelectionSummary(isNonContiguous: false, files: files, fileSteps: [:], skippedMergeCount: 0)
+        }
+
+        // Skip merge commits when non-merge commits exist so merge parents do not pull in other authors' branch work.
+        let nonMerges = commits.filter { !$0.isMerge }
+        let skippedMergeCount = nonMerges.isEmpty ? 0 : commits.count - nonMerges.count
+        let targetCommits = nonMerges.isEmpty ? commits : nonMerges
+
+        var nameStatusByHash: [String: [FileChange]] = [:]
+        var numstatByHash: [String: [String: (Int, Int)]] = [:]
+        let batchSize = 400
+        let hashes = targetCommits.map(\.hash)
+        var offset = 0
+        while offset < hashes.count {
+            let end = min(hashes.count, offset + batchSize)
+            let chunk = Array(hashes[offset..<end])
+            offset = end
+            async let namesData = run(
+                ["log", "--no-walk=unsorted", "-m", "--first-parent", "--format=%x1e%H", "--name-status", "-z", "-M"]
+                    + chunk + ["--"],
+                in: dir
+            )
+            async let statsData = run(
+                ["log", "--no-walk=unsorted", "-m", "--first-parent", "--format=%x1e%H", "--numstat", "-z", "-M"]
+                    + chunk + ["--"],
+                in: dir
+            )
+            let chunkNames = parseBatchedNameStatus(try await namesData)
+            let chunkStats = parseBatchedNumstat((try? await statsData) ?? Data())
+            nameStatusByHash.merge(chunkNames) { _, new in new }
+            numstatByHash.merge(chunkStats) { _, new in new }
+        }
+
+        struct FileGroup {
+            var path: String
+            var initialOldPath: String?
+            var firstKind: FileChange.Kind
+            var lastKind: FileChange.Kind
+            var additions: Int?
+            var deletions: Int?
+            var steps: [FileCommitStep]
+            var isActive = true
+        }
+
+        var groups: [FileGroup] = []
+        var indexByPath: [String: Int] = [:]
+
+        for commit in targetCommits.reversed() {
+            let changes = nameStatusByHash[commit.hash] ?? []
+            let stats = numstatByHash[commit.hash] ?? [:]
+            for change in changes {
+                let step = FileCommitStep(
+                    hash: commit.hash,
+                    parent: commit.parents.first,
+                    path: change.path,
+                    oldPath: change.oldPath,
+                    kind: change.kind
+                )
+                let stat = stats[change.path]
+                let lookupPath = change.oldPath ?? change.path
+
+                if let existingIdx = indexByPath[lookupPath], groups[existingIdx].isActive {
+                    if lookupPath != change.path {
+                        indexByPath.removeValue(forKey: lookupPath)
+                        if let occupiedIdx = indexByPath[change.path], occupiedIdx != existingIdx {
+                            groups[occupiedIdx].isActive = false
+                        }
+                        indexByPath[change.path] = existingIdx
+                    }
+                    groups[existingIdx].path = change.path
+                    groups[existingIdx].lastKind = change.kind
+                    if let stat {
+                        groups[existingIdx].additions = (groups[existingIdx].additions ?? 0) + stat.0
+                        groups[existingIdx].deletions = (groups[existingIdx].deletions ?? 0) + stat.1
+                    }
+                    groups[existingIdx].steps.append(step)
+                } else {
+                    if let occupiedIdx = indexByPath[change.path] {
+                        groups[occupiedIdx].isActive = false
+                    }
+                    let newIdx = groups.count
+                    groups.append(FileGroup(
+                        path: change.path,
+                        initialOldPath: change.oldPath ?? change.path,
+                        firstKind: change.kind,
+                        lastKind: change.kind,
+                        additions: stat?.0,
+                        deletions: stat?.1,
+                        steps: [step]
+                    ))
+                    indexByPath[change.path] = newIdx
+                }
+            }
+        }
+
+        var files: [FileChange] = []
+        var fileSteps: [String: [FileCommitStep]] = [:]
+        for group in groups where group.isActive {
+            let netKind: FileChange.Kind
+            let netOldPath: String?
+            if group.firstKind == .added {
+                netKind = group.lastKind == .deleted ? .deleted : .added
+                netOldPath = nil
+            } else if group.lastKind == .deleted {
+                netKind = .deleted
+                netOldPath = (group.initialOldPath != group.path) ? group.initialOldPath : nil
+            } else if let initial = group.initialOldPath, initial != group.path {
+                netKind = .renamed
+                netOldPath = initial
+            } else {
+                netKind = .modified
+                netOldPath = nil
+            }
+            files.append(FileChange(
+                path: group.path,
+                oldPath: netOldPath,
+                kind: netKind,
+                additions: group.additions,
+                deletions: group.deletions
+            ))
+            fileSteps[group.path] = group.steps
+        }
+        files.sort { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        return CommitSelectionSummary(
+            isNonContiguous: true,
+            files: files,
+            fileSteps: fileSteps,
+            skippedMergeCount: skippedMergeCount
+        )
+    }
 
     /// Files touched across `commits` (ordered newest first): for one commit, against its first parent; for two or
-    /// more, the cumulative diff from the oldest commit's first parent (or the empty tree for a root commit) to the newest.
+    /// more contiguous commits, the cumulative diff from the oldest commit's first parent to the newest; for
+    /// non-contiguous commits, aggregated strictly from the selected commits.
     static func commitFiles(_ commits: [Commit], in dir: URL) async throws -> [FileChange] {
-        guard let newest = commits.first else { return [] }
-        if commits.count == 1 {
-            return try await commitFiles(newest, in: dir)
-        }
-        let oldest = commits[commits.count - 1]
-        let base = oldest.parents.first ?? emptyTree
-        return try await compareFiles(base: base, head: newest.hash, in: dir)
+        try await commitSelectionSummary(commits, in: dir).files
     }
 }
 

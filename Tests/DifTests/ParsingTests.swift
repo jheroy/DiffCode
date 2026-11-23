@@ -140,15 +140,20 @@ final class InlineDiffTests: XCTestCase {
     }
 
     func testReindentedLineIsNotHighlighted() throws {
-        let result = try XCTUnwrap(InlineDiff.compute(old: ["foo(bar)"], new: ["        foo(bar)"]))
-        XCTAssertEqual(result.old, [[]])
-        XCTAssertEqual(result.new, [[]])
+        let pureIndent = try XCTUnwrap(InlineDiff.compute(old: ["foo(bar)"], new: ["        foo(bar)"]))
+        XCTAssertEqual(pureIndent.old, [[]])
+        XCTAssertEqual(pureIndent.new, [[0..<8]], "whitespace-only line highlights the exact added spaces")
+
+        let indentWithEdit = try XCTUnwrap(InlineDiff.compute(old: ["foo(bar)"], new: ["        foo(baz)"]))
+        XCTAssertEqual(indentWithEdit.old, [[4..<7]])
+        XCTAssertEqual(indentWithEdit.new, [[12..<15]], "leading indentation stays unhighlighted when real tokens changed")
     }
 
     func testWhollyNewLineKeepsOnlyItsBand() throws {
         let result = try XCTUnwrap(InlineDiff.compute(old: ["alpha beta"], new: ["alpha beta", "    gamma delta"]))
+        XCTAssertEqual(result.old, [[]])
         XCTAssertEqual(result.new[0], [])
-        XCTAssertEqual(result.new[1], [], "a line that differs end to end gets no second highlight")
+        XCTAssertEqual(result.new[1], [4..<15], "wholly added line inside a mixed hunk highlights its visible text")
     }
 
     func testNothingInCommonMeansNoWordDiff() {

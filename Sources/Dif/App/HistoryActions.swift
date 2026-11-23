@@ -16,6 +16,7 @@ extension AppStore {
         project.history = filter
         project.historyPaths = [:]
         project.logQuery = ""
+        project.logAuthors = []
         project.browsedPath = nil
         project.tab = .log
         project.commits = []
@@ -106,7 +107,7 @@ extension AppStore {
         case .file: return true
         case .externalFile: return false
         case .worktree: return side == .right && !request.isAgainstHead
-        case .commit: return false
+        case .commit, .commitSteps: return false
         }
     }
 
@@ -169,6 +170,21 @@ extension AppStore {
                 return HistoryFilter(path: request.oldPath ?? request.path, lines: oneBased(lines.range), rev: parent)
             }
             return HistoryFilter(path: request.path, lines: oneBased(lines.range), rev: hash)
+        case .commitSteps(let steps):
+            guard let newest = steps.last, let oldest = steps.first else { return nil }
+            guard let lines else {
+                if request.kind == .deleted {
+                    return oldest.parent.map { HistoryFilter(path: request.oldPath ?? request.path, rev: $0) }
+                }
+                let exists = FileManager.default.fileExists(atPath: project.url.appendingPathComponent(request.path).path)
+                return HistoryFilter(path: request.path, rev: exists ? "HEAD" : newest.hash)
+            }
+            if viewer.document?.isSyntheticReplay == true { return nil }
+            if lines.side == .left {
+                guard let parent = oldest.parent else { return nil }
+                return HistoryFilter(path: request.oldPath ?? request.path, lines: oneBased(lines.range), rev: parent)
+            }
+            return HistoryFilter(path: request.path, lines: oneBased(lines.range), rev: newest.hash)
         }
     }
 
@@ -254,7 +270,7 @@ extension AppStore {
               let id = project.compareSelectedID,
               let change = project.compareChanges.first(where: { ChangeRow.fileID($0.path) == id }) else { return }
         exitExternalFileMode()
-        if project.browsedPath != change.path { project.browsedPath = nil }
+        project.browsedPath = nil
         showCompared(change, with: comparison, in: project)
         noteRecent(project, change.path)
     }
@@ -264,8 +280,8 @@ extension AppStore {
         if request == viewer.request {
             viewer.reloadIfStale(base: comparison.base)
         } else {
-            let sameFile = viewer.request?.path == request.path && viewer.request?.root == request.root
-            viewer.open(request, preserveScroll: sameFile)
+            let sameDiff = viewer.request?.path == request.path && viewer.request?.root == request.root && viewer.request?.source != .file
+            viewer.open(request, preserveScroll: sameDiff)
         }
     }
 
@@ -318,6 +334,20 @@ extension AppStore {
         menu.addItem(.separator())
         addHistoryEditItems(to: menu, commit: commit, commits: menuCommits(commit, picked: project.selectedCommitIDs, in: project.commits),
                             list: project.commits, project: project)
+        menu.addItem(.separator())
+        let author = AuthorFilter.from(commit)
+        if project.logAuthors.contains(author) {
+            menu.addItem(ClosureMenuItem(L("Remove Author “\(author.displayName)” from Filter", "从筛选中移除作者“\(author.displayName)”")) { [weak project] in
+                project?.removeLogAuthor(author)
+            })
+        } else {
+            let title = project.logAuthors.isEmpty
+                ? L("Filter by Author “\(author.displayName)”", "按作者“\(author.displayName)”筛选")
+                : L("Add Author “\(author.displayName)” to Filter", "将作者“\(author.displayName)”加入筛选")
+            menu.addItem(ClosureMenuItem(title) { [weak project] in
+                project?.toggleLogAuthor(author)
+            })
+        }
         menu.addItem(.separator())
         menu.addItem(ClosureMenuItem(L("Copy Hash", "复制哈希")) { [weak self] in self?.copyText(commit.hash) })
         menu.addItem(ClosureMenuItem(L("Copy Message", "复制提交信息")) { [weak self] in self?.copyText(commit.subject) })

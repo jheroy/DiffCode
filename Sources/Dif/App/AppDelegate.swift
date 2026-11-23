@@ -25,23 +25,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         AppEnvironment.updater?.start()
         launched = true
 
-        // `dif <path>` from a terminal: every non-flag argument is a repository to open.
-        var urls = pendingURLs
-        var skipNext = false
-        for argument in CommandLine.arguments.dropFirst() {
-            if skipNext { skipNext = false; continue }
-            if argument.hasPrefix("-") { skipNext = argument.hasPrefix("-NS") || argument.hasPrefix("-Apple"); continue }
-            urls.append(URL(fileURLWithPath: argument))
-        }
-        if !urls.isEmpty { store.addProjects(urls) }
+        // `dif <path>` from a terminal or `diffcode://` URL: open repositories or jump directly to a file/line.
+        var targets = pendingURLs.compactMap(ExternalOpenParser.parseURL)
+        pendingURLs.removeAll()
+        targets += ExternalOpenParser.parseArguments(Array(CommandLine.arguments.dropFirst()))
+        if !targets.isEmpty { store.openExternalTargets(targets) }
         #if DEBUG || DIF_HOOKS
         DebugHooks.run(store: store, window: window)
         #endif
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
-        if launched { store.addProjects(urls) } else { pendingURLs += urls }
+        if launched {
+            let targets = urls.compactMap(ExternalOpenParser.parseURL)
+            if !targets.isEmpty { store.openExternalTargets(targets) }
+        } else {
+            pendingURLs += urls
+        }
+        NSApp.unhide(nil)
+        if window?.isMiniaturized == true { window?.deminiaturize(nil) }
         window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -400,10 +404,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
 
-        // Next / Previous Diff via ⌘↓ / ⌘↑ when viewer is active (not in a popup, terminal, text field, or list).
+        // Next / Previous Diff via ⌘↓ / ⌘↑ when viewer is active (not in a popup, terminal, or text field).
         if store.popup == nil, store.terminals.focusedID == nil,
            !(store.window?.firstResponder is NSTextView),
-           store.focusedListName == nil,
            store.viewer.isTextDocument,
            mods == .command {
             if event.keyCode == 125 {
@@ -412,6 +415,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             if event.keyCode == 126 {
                 store.viewer.stepDifference(-1)
+                return true
+            }
+        }
+
+        // Next / Previous Symbol Usage under cursor via ⌃⌥↓ / ⌃⌥↑ (matches GoLand v-mode).
+        if store.popup == nil, store.terminals.focusedID == nil,
+           !(store.window?.firstResponder is NSTextView),
+           store.viewer.isTextDocument,
+           mods == [.control, .option] {
+            if event.keyCode == 125 {
+                store.viewer.stepSymbolOccurrence(forward: true)
+                return true
+            }
+            if event.keyCode == 126 {
+                store.viewer.stepSymbolOccurrence(forward: false)
                 return true
             }
         }

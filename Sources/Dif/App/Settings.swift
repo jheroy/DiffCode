@@ -146,6 +146,22 @@ final class Settings {
     var showLineDiffBar: Bool
     /// Automatically open the 3-way merge window whenever Git stops at merge/rebase/cherry-pick/stash conflicts.
     var autoOpenThreeWayMerge: Bool
+
+    /// How cross-file LSP jumps open a target file that has Git changes.
+    enum LSPJumpOpenMode: String, CaseIterable, Sendable {
+        case file
+        case diff
+
+        var title: String {
+            switch self {
+            case .file: return L("Plain File", "纯文件")
+            case .diff: return L("Diff", "Diff 对比")
+            }
+        }
+    }
+
+    /// Whether cross-file LSP jumps open changed target files as plain file content or as a diff.
+    var lspJumpOpenMode: LSPJumpOpenMode
     /// Distinct local AI task roles that can independently select their provider and model.
     enum AITask: String, CaseIterable, Sendable {
         case commit
@@ -284,6 +300,7 @@ final class Settings {
         vimRelativeLineNumbers = defaults.object(forKey: "vimRelativeLineNumbers") as? Bool ?? false
         showLineDiffBar = defaults.object(forKey: "showLineDiffBar") as? Bool ?? true
         autoOpenThreeWayMerge = defaults.object(forKey: "autoOpenThreeWayMerge") as? Bool ?? true
+        lspJumpOpenMode = LSPJumpOpenMode(rawValue: defaults.string(forKey: "lspJumpOpenMode") ?? "") ?? .file
         let legacyProvider = AgentProvider(rawValue: defaults.string(forKey: "aiAgentProvider") ?? "") ?? .agy
         let legacyModels = defaults.dictionary(forKey: "aiAgentModels") as? [String: String] ?? [:]
         aiCommitProvider = AgentProvider(rawValue: defaults.string(forKey: "aiCommitProvider") ?? "") ?? legacyProvider
@@ -330,6 +347,7 @@ final class Settings {
         defaults.set(vimRelativeLineNumbers, forKey: "vimRelativeLineNumbers")
         defaults.set(showLineDiffBar, forKey: "showLineDiffBar")
         defaults.set(autoOpenThreeWayMerge, forKey: "autoOpenThreeWayMerge")
+        defaults.set(lspJumpOpenMode.rawValue, forKey: "lspJumpOpenMode")
         defaults.set(aiCommitProvider.rawValue, forKey: "aiCommitProvider")
         defaults.set(aiCommitModels, forKey: "aiCommitModels")
         defaults.set(aiGroupingProvider.rawValue, forKey: "aiGroupingProvider")

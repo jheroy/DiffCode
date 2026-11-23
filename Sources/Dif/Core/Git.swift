@@ -571,6 +571,124 @@ extension Git {
 
 // MARK: - Log
 
+/// An author identity used to filter commits in the Log (`git log --author`), distinguishing
+/// same-named authors with different emails.
+struct AuthorFilter: Identifiable, Hashable, Sendable {
+    var name: String
+    var email: String
+
+    var id: String { "\(name)\u{1F}\(email)" }
+    var gitIdentity: String { "\(name) <\(email)>" }
+    var displayName: String { name.isEmpty ? email : name }
+
+    static func from(_ commit: Commit) -> AuthorFilter {
+        AuthorFilter(name: commit.author, email: commit.email)
+    }
+}
+
+/// An author entry returned for the Log author picker, with commit count in the active scope.
+struct LogAuthor: Identifiable, Hashable, Sendable {
+    var author: AuthorFilter
+    var commitCount: Int
+
+    var id: String { author.id }
+    var name: String { author.name }
+    var email: String { author.email }
+}
+
+/// Searches and ranks authors for the Log multi-author filter picker.
+enum AuthorSearch {
+    private static let explicitSeparators = CharacterSet(charactersIn: ",，、;；|\n")
+
+    /// Filters `authors` by `query` (supporting single names, multi-term queries separated by commas,
+    /// `、`, `;`, `|`, or whitespace), keeping any `selected` authors absent from `authors` visible too.
+    static func filter(_ authors: [LogAuthor], query: String, selected: [AuthorFilter]) -> [LogAuthor] {
+        var candidates = authors
+        let known = Set(authors.map(\.author))
+        for author in selected where !known.contains(author) {
+            candidates.append(LogAuthor(author: author, commitCount: 0))
+        }
+
+        let selectedSet = Set(selected)
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            let picked = candidates.filter { selectedSet.contains($0.author) }
+            let rest = candidates.filter { !selectedSet.contains($0.author) }
+            return picked + rest
+        }
+
+        let terms: [String]
+        if trimmed.rangeOfCharacter(from: explicitSeparators) != nil {
+            terms = trimmed
+                .components(separatedBy: explicitSeparators)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+        } else {
+            let wholeMatches = match(candidates: candidates, terms: [trimmed])
+            if !wholeMatches.isEmpty {
+                return sortMatches(wholeMatches)
+            }
+            let spaceTerms = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
+            guard spaceTerms.count >= 2 else { return [] }
+            terms = spaceTerms
+        }
+
+        guard !terms.isEmpty else { return [] }
+        return sortMatches(match(candidates: candidates, terms: terms))
+    }
+
+    private static func match(candidates: [LogAuthor], terms: [String]) -> [(item: LogAuthor, score: Int)] {
+        candidates.compactMap { item in
+            var best: Int?
+            for term in terms {
+                if let s = score(item, term: term) {
+                    best = max(best ?? Int.min, s)
+                }
+            }
+            return best.map { (item, $0) }
+        }
+    }
+
+    private static func sortMatches(_ matches: [(item: LogAuthor, score: Int)]) -> [LogAuthor] {
+        matches.sorted { lhs, rhs in
+            if lhs.score != rhs.score { return lhs.score > rhs.score }
+            if lhs.item.commitCount != rhs.item.commitCount { return lhs.item.commitCount > rhs.item.commitCount }
+            let nameOrder = lhs.item.name.localizedStandardCompare(rhs.item.name)
+            if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+            return lhs.item.email.localizedStandardCompare(rhs.item.email) == .orderedAscending
+        }
+        .map(\.item)
+    }
+
+    private static func score(_ item: LogAuthor, term: String) -> Int? {
+        let lowerTerm = term.lowercased()
+        let lowerName = item.name.lowercased()
+        let lowerEmail = item.email.lowercased()
+
+        if lowerName == lowerTerm || (!lowerEmail.isEmpty && lowerEmail == lowerTerm) {
+            return 4000
+        }
+        if lowerName.hasPrefix(lowerTerm) || (!lowerEmail.isEmpty && lowerEmail.hasPrefix(lowerTerm)) {
+            return 3000
+        }
+        if item.name.localizedCaseInsensitiveContains(term)
+            || item.email.localizedCaseInsensitiveContains(term)
+            || item.author.gitIdentity.localizedCaseInsensitiveContains(term) {
+            return 2000
+        }
+        // Only run UTF-8 byte subsequence fuzzy matching on single-token ASCII queries to avoid false CJK byte hits.
+        if term.allSatisfy(\.isASCII), !term.contains(where: \.isWhitespace) {
+            let q = Array(lowerTerm.utf8)
+            let nameScore = Fuzzy.match(query: q, candidate: item.name, wantPositions: false)?.score
+            let emailScore = item.email.isEmpty ? nil : Fuzzy.match(query: q, candidate: item.email, wantPositions: false)?.score
+            if let best = [nameScore, emailScore].compactMap({ $0 }).max() {
+                return 1000 + best
+            }
+        }
+        return nil
+    }
+}
+
 struct Commit: Identifiable, Hashable {
     var hash: String
     var parents: [String]
@@ -591,6 +709,106 @@ extension Git {
     static let logFields = "%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s"
     static let logFormat = logFields + "%x1e"
 
+    /// Escapes POSIX Extended Regular Expression metacharacters so literal strings match safely under `-E`.
+    static func escapeERE(_ text: String) -> String {
+        let special: Set<Character> = ["\\", ".", "[", "]", "(", ")", "{", "}", "*", "+", "?", "^", "$", "|"]
+        var out = ""
+        out.reserveCapacity(text.count)
+        for ch in text {
+            if special.contains(ch) { out.append("\\") }
+            out.append(ch)
+        }
+        return out
+    }
+
+    /// `--author` / `--grep` arguments for Log and line-history queries.
+    /// Multiple `authors` are ORed by git (`--author` repeated) and ANDed with `query`.
+    static func authorFilterArguments(_ authors: [AuthorFilter], query: String = "") -> [String] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !authors.isEmpty else {
+            return q.isEmpty ? [] : ["-i", "--fixed-strings", "--grep=\(q)"]
+        }
+        var args = ["--no-mailmap", "-E"]
+        if !q.isEmpty { args.append("-i") }
+        for author in authors {
+            args.append("--author=^\(escapeERE(author.name)) <\(escapeERE(author.email))>$")
+        }
+        if !q.isEmpty {
+            args.append("--grep=\(escapeERE(q))")
+        }
+        return args
+    }
+
+    /// Lists distinct authors (with commit counts) in the given branch/ref/path scope, sorted by count descending.
+    static func authors(in dir: URL, allBranches: Bool, ref: String? = nil, paths: [String] = [],
+                        includeInternalRefs: Bool = false) async throws -> [LogAuthor] {
+        let scope = allBranches
+            ? allBranchesScope(includeInternalRefs: includeInternalRefs)
+            : (ref.map { [$0] } ?? ["HEAD"])
+        let pathArgs = paths.isEmpty ? [] : ["--"] + paths
+        do {
+            let data = try await run(["shortlog", "-sn", "--group=format:%an%x1f%ae"] + scope + pathArgs,
+                                     in: dir, okStatuses: [0, 128])
+            return parseShortlogGroup(data)
+        } catch let failure as Failure where failure.status == 129 {
+            // Fallback for older Git (< 2.38) without `--group=format:`.
+            let data = try await run(["shortlog", "-sne"] + scope + pathArgs, in: dir, okStatuses: [0, 128])
+            return parseShortlogEmail(data)
+        }
+    }
+
+    /// Parses `git shortlog -sn --group=format:%an%x1f%ae`: `<spaces><count>\t<name>\x1f<email>`.
+    static func parseShortlogGroup(_ data: Data) -> [LogAuthor] {
+        var counts: [AuthorFilter: Int] = [:]
+        for lineData in data.split(separator: 0x0A, omittingEmptySubsequences: true) {
+            let parts = lineData.split(separator: 0x09, maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2 else { continue }
+            let countStr = String(decoding: parts[0], as: UTF8.self).trimmingCharacters(in: .whitespaces)
+            guard let count = Int(countStr) else { continue }
+            let identity = parts[1].split(separator: 0x1F, maxSplits: 1, omittingEmptySubsequences: false)
+            guard identity.count == 2 else { continue }
+            let name = String(decoding: identity[0], as: UTF8.self)
+            var email = String(decoding: identity[1], as: UTF8.self)
+            if email.hasSuffix("\r") { email.removeLast() }
+            counts[AuthorFilter(name: name, email: email), default: 0] += count
+        }
+        return sortedLogAuthors(counts)
+    }
+
+    /// Parses `git shortlog -sne`: `<spaces><count>\t<name> <<email>>`.
+    static func parseShortlogEmail(_ data: Data) -> [LogAuthor] {
+        var counts: [AuthorFilter: Int] = [:]
+        let text = String(decoding: data, as: UTF8.self)
+        for rawLine in text.split(whereSeparator: \.isNewline) {
+            let line = String(rawLine)
+            guard let tab = line.firstIndex(of: "\t") else { continue }
+            let countStr = line[..<tab].trimmingCharacters(in: .whitespaces)
+            guard let count = Int(countStr) else { continue }
+            let identity = String(line[line.index(after: tab)...])
+            let author: AuthorFilter
+            if identity.hasSuffix(">"), let open = identity.range(of: " <", options: .backwards) {
+                let name = String(identity[..<open.lowerBound])
+                let emailStart = identity.index(open.lowerBound, offsetBy: 2)
+                let emailEnd = identity.index(before: identity.endIndex)
+                let email = emailStart <= emailEnd ? String(identity[emailStart..<emailEnd]) : ""
+                author = AuthorFilter(name: name, email: email)
+            } else {
+                author = AuthorFilter(name: identity, email: "")
+            }
+            counts[author, default: 0] += count
+        }
+        return sortedLogAuthors(counts)
+    }
+
+    private static func sortedLogAuthors(_ counts: [AuthorFilter: Int]) -> [LogAuthor] {
+        counts.map { LogAuthor(author: $0.key, commitCount: $0.value) }.sorted { lhs, rhs in
+            if lhs.commitCount != rhs.commitCount { return lhs.commitCount > rhs.commitCount }
+            let nameOrder = lhs.name.localizedStandardCompare(rhs.name)
+            if nameOrder != .orderedSame { return nameOrder == .orderedAscending }
+            return lhs.email.localizedStandardCompare(rhs.email) == .orderedAscending
+        }
+    }
+
     /// Revision arguments for "All branches": standard branches, remotes, tags, and HEAD by default,
     /// excluding internal tool refs such as `refs/t3/*`, `refs/notes/*`, `refs/stash`.
     /// Set `includeInternalRefs: true` to pass `--all` and show every ref under `refs/`.
@@ -601,27 +819,29 @@ extension Git {
 
     /// - Parameter ref: a full ref name (`refs/heads/x`) whose history to list instead of HEAD's. Ignored with `allBranches`.
     /// - Parameter includeInternalRefs: when `allBranches` is true, also walk internal refs such as `refs/t3/*` and `refs/stash`.
-    static func log(in dir: URL, skip: Int, limit: Int, query: String, allBranches: Bool, ref: String? = nil,
-                    includeInternalRefs: Bool = false) async throws -> [Commit] {
+    static func log(in dir: URL, skip: Int, limit: Int, query: String, authors: [AuthorFilter] = [],
+                    allBranches: Bool, ref: String? = nil, includeInternalRefs: Bool = false) async throws -> [Commit] {
         // A full ref name never starts with "-", so it cannot be read as an option.
         let scope = allBranches ? allBranchesScope(includeInternalRefs: includeInternalRefs) : (ref.map { [$0] } ?? [])
         // Full ref names, so a local "feature/x" and a remote "origin/x" can be told apart.
         var args = ["log", "--format=\(logFormat)", "--decorate=full", "--skip=\(skip)", "--max-count=\(limit)", "--date-order"] + scope
         let q = query.trimmingCharacters(in: .whitespaces)
-        if !q.isEmpty {
-            // Match the subject/body or the author, case-insensitively.
-            args += ["-i", "--fixed-strings", "--grep=\(q)"]
-        }
+        args += authorFilterArguments(authors, query: q)
         let data = try await run(args, in: dir, okStatuses: [0, 128])
         var commits = parseLog(data)
         if !q.isEmpty, skip == 0 {
-            // A query that looks like a hash should also find that commit; author matches are merged in too.
+            // A query that looks like a hash should also find that commit; author matches are merged in too when no explicit author filter is active.
             if q.count >= 4, q.allSatisfy({ $0.isHexDigit }),
                let hit = try? await run(["log", "-1", "--format=\(logFormat)", "--decorate=full", q], in: dir) {
-                let direct = parseLog(hit)
+                var direct = parseLog(hit)
+                if !authors.isEmpty {
+                    let allowed = Set(authors)
+                    direct = direct.filter { allowed.contains(AuthorFilter.from($0)) }
+                }
                 commits = direct + commits.filter { c in !direct.contains(where: { $0.hash == c.hash }) }
             }
-            if let byAuthor = try? await run(["log", "--format=\(logFormat)", "--decorate=full", "--max-count=\(limit)", "-i", "--author=\(q)"]
+            if authors.isEmpty,
+               let byAuthor = try? await run(["log", "--format=\(logFormat)", "--decorate=full", "--max-count=\(limit)", "-i", "--fixed-strings", "--author=\(q)"]
                                              + scope, in: dir) {
                 let seen = Set(commits.map(\.hash))
                 commits += parseLog(byAuthor).filter { !seen.contains($0.hash) }

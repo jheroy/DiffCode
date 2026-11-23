@@ -894,6 +894,10 @@ enum DebugHooks {
         case .externalFile(let display, _): source = "external(\(display))"
         case .worktree(let base): source = "worktree(\(base.prefix(7)))"
         case .commit(let hash, let parent): source = "commit(\(hash.prefix(7))<-\(parent?.prefix(7) ?? "root"))"
+        case .commitSteps(let steps):
+            let first = steps.first?.hash.prefix(7) ?? "-"
+            let last = steps.last?.hash.prefix(7) ?? "-"
+            source = "commitSteps(\(steps.count):\(first)..\(last))"
         }
         let doc = store.viewer.document
         return "\(request.path) \(source) \(doc?.leftTitle ?? "")→\(doc?.rightTitle ?? "") hunks=\(store.viewer.hunkCount)"

@@ -221,6 +221,46 @@ enum LSPDefinitionDecoder {
     }
 }
 
+/// Highlight kind reported by `textDocument/documentHighlight`.
+enum LSPDocumentHighlightKind: Int, Sendable, Codable, Equatable, Hashable {
+    case text = 1
+    case read = 2
+    case write = 3
+}
+
+/// One occurrence range returned by `textDocument/documentHighlight`.
+struct LSPDocumentHighlight: Sendable, Codable, Equatable, Hashable {
+    var range: LSPRange
+    var kind: LSPDocumentHighlightKind?
+}
+
+/// Decodes LSP `textDocument/documentHighlight` responses (`null` or `[DocumentHighlight]`).
+enum LSPDocumentHighlightDecoder {
+    static func decode(from value: JSONValue) -> [LSPDocumentHighlight] {
+        guard case .array(let items) = value else { return [] }
+        var results: [LSPDocumentHighlight] = []
+        results.reserveCapacity(items.count)
+        for item in items {
+            guard let rangeVal = item["range"],
+                  let startLine = rangeVal["start"]?["line"]?.intValue,
+                  let startChar = rangeVal["start"]?["character"]?.intValue,
+                  let endLine = rangeVal["end"]?["line"]?.intValue,
+                  let endChar = rangeVal["end"]?["character"]?.intValue else {
+                continue
+            }
+            let kind = item["kind"]?.intValue.flatMap(LSPDocumentHighlightKind.init(rawValue:))
+            results.append(LSPDocumentHighlight(
+                range: LSPRange(
+                    start: LSPPosition(line: startLine, character: startChar),
+                    end: LSPPosition(line: endLine, character: endChar)
+                ),
+                kind: kind
+            ))
+        }
+        return results
+    }
+}
+
 // MARK: - URI Conversion & Path Canonicalization
 
 /// Converts cleanly between local file `URL`s and LSP `file://` URIs, handling percent-encoding and symlinks.
@@ -535,12 +575,28 @@ enum LSPTextDocumentSyncKind: Int, Sendable, Codable, Equatable, Hashable {
 struct LSPServerCapabilities: Sendable, Equatable, Hashable {
     var textDocumentSync: LSPTextDocumentSyncKind
     var definitionProvider: Bool
+    var documentHighlightProvider: Bool
     var semanticTokensLegend: LSPSemanticTokensLegend?
     var semanticTokensFull: Bool
+
+    init(
+        textDocumentSync: LSPTextDocumentSyncKind,
+        definitionProvider: Bool,
+        documentHighlightProvider: Bool = false,
+        semanticTokensLegend: LSPSemanticTokensLegend?,
+        semanticTokensFull: Bool
+    ) {
+        self.textDocumentSync = textDocumentSync
+        self.definitionProvider = definitionProvider
+        self.documentHighlightProvider = documentHighlightProvider
+        self.semanticTokensLegend = semanticTokensLegend
+        self.semanticTokensFull = semanticTokensFull
+    }
 
     static let empty = LSPServerCapabilities(
         textDocumentSync: .full,
         definitionProvider: false,
+        documentHighlightProvider: false,
         semanticTokensLegend: nil,
         semanticTokensFull: false
     )
@@ -569,6 +625,16 @@ struct LSPServerCapabilities: Sendable, Equatable, Hashable {
             definitionProvider = false
         }
 
+        // documentHighlightProvider can be a boolean or an options object.
+        let documentHighlightProvider: Bool
+        if let flag = caps["documentHighlightProvider"]?.boolValue {
+            documentHighlightProvider = flag
+        } else if caps["documentHighlightProvider"]?.objectValue != nil {
+            documentHighlightProvider = true
+        } else {
+            documentHighlightProvider = false
+        }
+
         // semanticTokensProvider
         var legend: LSPSemanticTokensLegend?
         var fullSupport = false
@@ -590,6 +656,7 @@ struct LSPServerCapabilities: Sendable, Equatable, Hashable {
         return LSPServerCapabilities(
             textDocumentSync: syncKind,
             definitionProvider: definitionProvider,
+            documentHighlightProvider: documentHighlightProvider,
             semanticTokensLegend: legend,
             semanticTokensFull: fullSupport && legend != nil
         )

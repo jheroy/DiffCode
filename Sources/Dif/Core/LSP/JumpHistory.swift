@@ -10,6 +10,13 @@ struct JumpLocation: Equatable, Hashable, Sendable {
     /// 0-based UTF-16 column offset.
     var column: Int
     var isExternal: Bool
+    /// Exact viewer request (`.worktree`, `.commit`, `.commitSteps`, `.file`, `.externalFile`) so Back/Forward
+    /// restores the same diff or file view the user navigated from.
+    var request: DiffRequest? = nil
+    /// Active AI group hunk filter when `request` was recorded.
+    var groupHunks: Set<Int>? = nil
+    /// Sidebar tab raw value (`ProjectTab.rawValue`) active when `request` was recorded.
+    var projectTabRaw: String? = nil
 }
 
 /// Bounded Back/Forward navigation history stack for definition jumps.
@@ -93,7 +100,10 @@ struct JumpHistory: Equatable, Sendable {
     }
 
     private static func isSameSpot(_ a: JumpLocation, _ b: JumpLocation) -> Bool {
-        a.fileURL == b.fileURL && a.line == b.line
+        a.fileURL == b.fileURL
+            && a.line == b.line
+            && a.request == b.request
+            && a.groupHunks == b.groupHunks
     }
 }
 

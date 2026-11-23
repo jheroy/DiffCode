@@ -233,7 +233,7 @@ final class AppStore {
         restoreAIGroups(for: project)
     }
 
-    private func persistProjects() {
+    func persistProjects() {
         let defaults = UserDefaults.standard
         // Work trees listed by git are not the user's list: they come back from git.
         defaults.set(projects.filter { !$0.isDerived }.map(\.url.path), forKey: "projects")
@@ -337,6 +337,144 @@ final class AppStore {
                     self.showToast(L("No Git repository found there", "这里没有找到 Git 仓库"))
                 }
             }
+            self.persistProjects()
+        }
+    }
+
+    func openExternalTargets(_ targets: [ExternalOpenTarget]) {
+        Task { @MainActor in
+            await self.openExternalTargetsAsync(targets)
+        }
+    }
+
+    func openExternalTargetsAsync(_ targets: [ExternalOpenTarget]) async {
+        let access = FolderAccess.shared
+        let fileManager = FileManager.default
+        for target in targets where fileManager.fileExists(atPath: target.fileURL.path) {
+            access.remember(target.fileURL)
+        }
+
+        var landedDirectoryProject: Project?
+        var landedFile: (project: Project, relativePath: String, line: Int?, column: Int?)?
+        var landedExternalFile: (fileURL: URL, line: Int?, column: Int?)?
+        var touchedProjects = false
+        var rejected = 0
+        var refusal: Git.Refusal?
+        var missingFileName: String?
+
+        func findProject(matching root: URL) -> Project? {
+            let targetPath = LSPURI.canonicalFileURL(root).path
+            return self.projects.first { LSPURI.canonicalFileURL($0.url).path == targetPath }
+        }
+
+        for target in targets {
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: target.fileURL.path, isDirectory: &isDirectory) else {
+                missingFileName = missingFileName ?? target.fileURL.lastPathComponent
+                continue
+            }
+
+            if isDirectory.boolValue {
+                let roots = await Git.repositories(for: target.fileURL)
+                if roots.isEmpty {
+                    rejected += 1
+                    if refusal == nil { refusal = await Git.refusal(at: target.fileURL) }
+                    access.release(target.fileURL.path, keepingFor: self.projects.map(\.url.path))
+                }
+                for root in roots {
+                    let path = root.standardizedFileURL.path
+                    if !access.covers(path) {
+                        guard await self.requestAccess(to: root) else { continue }
+                    }
+                    if let existing = findProject(matching: root) {
+                        existing.isDerived = false
+                        self.unlockGrantedProjects()
+                        touchedProjects = true
+                        landedDirectoryProject = landedDirectoryProject ?? existing
+                        continue
+                    }
+                    let project = Project(url: root)
+                    self.install(project)
+                    project.refresh()
+                    touchedProjects = true
+                    landedDirectoryProject = landedDirectoryProject ?? project
+                }
+                continue
+            }
+
+            let parentDirectory = target.fileURL.deletingLastPathComponent()
+            if let root = await Git.repositoryRoot(for: parentDirectory) {
+                let rootPath = root.standardizedFileURL.path
+                if !access.covers(rootPath) {
+                    guard await self.requestAccess(to: root) else { continue }
+                }
+                let project: Project
+                if let existing = findProject(matching: root) {
+                    existing.isDerived = false
+                    self.unlockGrantedProjects()
+                    project = existing
+                } else {
+                    let created = Project(url: root)
+                    self.install(created)
+                    project = created
+                }
+                touchedProjects = true
+
+                if let relPath = LSPTargetResolver.relativePath(of: target.fileURL, inside: project.url) {
+                    landedFile = (project, relPath, target.line, target.column)
+                } else {
+                    landedExternalFile = (target.fileURL, target.line, target.column)
+                }
+            } else {
+                landedExternalFile = (target.fileURL, target.line, target.column)
+            }
+        }
+
+        if touchedProjects {
+            for project in self.projects where project.worktreeOf == nil {
+                self.syncWorktrees(of: project, force: true)
+            }
+        }
+
+        if (landedFile != nil || landedExternalFile != nil || landedDirectoryProject != nil),
+           popup != nil, popup != .dialog {
+            dismissPopup(restoreFocus: false)
+        }
+
+        if let file = landedFile {
+            if let index = projects.firstIndex(where: { $0.id == file.project.id }) {
+                let folded = ProjectTree.ancestors(of: index, parents: projectParents).map { projects[$0].url.path }
+                if !collapsedProjects.isDisjoint(with: folded) { collapsedProjects.subtract(folded) }
+            }
+            openFile(in: file.project, path: file.relativePath, line: file.line, column: file.column)
+            updateDormancy()
+            file.project.refresh()
+            viewer.focusCanvas()
+        } else if let ext = landedExternalFile {
+            openExternalFile(
+                fileURL: ext.fileURL,
+                repoRoot: nil,
+                workspaceRoot: nil,
+                displayPath: LSPTargetResolver.shortenedPath(ext.fileURL),
+                line: ext.line,
+                column: ext.column
+            )
+        } else if let project = landedDirectoryProject {
+            select(project)
+        } else if rejected > 0 {
+            if let refusal {
+                self.showRefusal(refusal)
+            } else if access.isNeeded {
+                self.showToast(L("No Git repository found there · choose the repository's own folder",
+                                 "这里没有找到 Git 仓库 · 请选择仓库本身所在的文件夹"))
+            } else {
+                self.showToast(L("No Git repository found there", "这里没有找到 Git 仓库"))
+            }
+        } else if let missing = missingFileName {
+            showToast(L("Path not found: \(missing)", "路径不存在：\(missing)"))
+        }
+
+        if touchedProjects {
             self.persistProjects()
         }
     }
@@ -653,19 +791,21 @@ final class AppStore {
         }
         viewer.setBaseStamp(project.status.headOID)
         if let path = project.browsedPath {
-            let request = resolvedRequest(worktreeRequest(for: path, in: project))
-            if request.source == .file, !FileManager.default.fileExists(atPath: project.url.appendingPathComponent(path).path) {
+            let request = resolvedRequest(plainFileRequest(for: path, in: project))
+            let exists = FileManager.default.fileExists(atPath: project.url.appendingPathComponent(path).path)
+            let keepingUnsaved = viewer.isDirty && viewer.request?.root == project.url && viewer.request?.path == path
+            if !exists && !keepingUnsaved {
                 // Deleted and committed, or gone with a checkout: nothing left to follow.
                 project.browsedPath = nil
             } else {
-                // The same file, as a diff while it has local changes (an agent or an editor touched it)
-                // and as a plain file once it has none.
+                // Keep showing the plain file view even while it has local changes.
                 markInChanges(path, in: project)
                 syncGroupHunkFilter(nil, for: request)
                 if request == viewer.request {
                     viewer.reloadIfStale(base: project.status.headOID)
                 } else {
-                    viewer.open(request, preserveScroll: viewer.request?.path == path && viewer.request?.root == project.url)
+                    let samePlainFile = viewer.request?.path == path && viewer.request?.root == project.url && viewer.request?.source == .file
+                    viewer.open(request, preserveScroll: samePlainFile)
                 }
                 return
             }
@@ -745,7 +885,7 @@ final class AppStore {
                             // without re-filtering the outgoing file.
                             pendingGroupHunkFocus = (root: project.url, path: file.path, hunkIndex: targetHunk)
                             syncGroupHunkFilter(targetHunks, for: request)
-                            let sameFile = viewer.request?.path == request.path && viewer.request?.root == request.root
+                            let sameFile = viewer.request?.path == request.path && viewer.request?.root == request.root && viewer.request?.source != .file
                             viewer.open(request, preserveScroll: sameFile)
                         }
                         return
@@ -771,7 +911,7 @@ final class AppStore {
                   let request = project.request(for: change, in: commits, ignoreWhitespace: settings.ignoreWhitespace) else {
                 // Keep showing the previous commit's diff while the next one loads.
                 var showingCommit = false
-                if let current = viewer.request, current.root == project.url, case .commit = current.source { showingCommit = true }
+                if let current = viewer.request, current.root == project.url, current.isCommitDiff { showingCommit = true }
                 if !showingCommit || commits.isEmpty || (!project.isLoadingCommit && project.commitFiles.isEmpty) {
                     viewer.highlightedGroupHunks = nil
                     viewer.clear()
@@ -791,8 +931,8 @@ final class AppStore {
             viewer.reloadIfStale(base: project.status.headOID)
         } else {
             // Same file, different status (e.g. untracked → added): keep the reader's place.
-            let sameFile = viewer.request?.path == request.path && viewer.request?.root == request.root
-            viewer.open(request, preserveScroll: sameFile)
+            let sameDiff = viewer.request?.path == request.path && viewer.request?.root == request.root && viewer.request?.source != .file
+            viewer.open(request, preserveScroll: sameDiff)
         }
     }
 
@@ -801,8 +941,7 @@ final class AppStore {
               let id = project.selectedChangeID,
               let change = project.changes.first(where: { ChangeRow.fileID($0.path) == id }) else { return }
         exitExternalFileMode()
-        // Picking another change ends browsing; the highlight following the browsed file does not.
-        if project.browsedPath != change.path { project.browsedPath = nil }
+        project.browsedPath = nil
         show(change, in: project)
         noteRecent(project, change.path)
         follow(change.path, in: project)
@@ -834,7 +973,7 @@ final class AppStore {
     }
 
     /// Keeps the Changes list's highlight on the file the viewer shows, or on nothing when that file has no changes.
-    private func markInChanges(_ path: String, in project: Project) {
+    func markInChanges(_ path: String, in project: Project) {
         guard project.tab == .changes else { return }
         if project.comparison != nil {
             if project.compareChanges.contains(where: { $0.path == path }) {
@@ -862,6 +1001,11 @@ final class AppStore {
     }
 
     // MARK: File tree
+
+    /// A plain working-tree file request (`source == .file`), regardless of whether the file has local changes.
+    func plainFileRequest(for path: String, in project: Project) -> DiffRequest {
+        DiffRequest(root: project.url, path: path, oldPath: nil, kind: nil, source: .file)
+    }
 
     /// How `path` is shown from the working tree: a diff while it has local changes, otherwise the file itself.
     /// While the Changes tab compares with another commit, the diff is against that commit.
@@ -918,17 +1062,17 @@ final class AppStore {
     func stepFile(_ delta: Int) -> Bool {
         guard let project = currentProject else { return false }
         exitExternalFileMode()
-        let listed = project.comparison != nil ? project.compareChanges : project.changes
-        if let path = project.browsedPath, !(project.tab == .changes && listed.contains { $0.path == path }) {
-            // Browsing a file the list column does not hold: walk the files the tree shows.
+        if let path = project.browsedPath {
+            // Browsing plain files from the tree or search: walk the files the tree shows.
             let files = project.treeRows().filter { !$0.isDirectory }
-            guard !files.isEmpty else { return false }
-            let current = files.firstIndex { $0.path == path } ?? files.firstIndex { $0.id == project.treeSelectedID }
-            let index = current.map { $0 + delta } ?? (delta > 0 ? 0 : files.count - 1)
-            guard index >= 0, index < files.count else { return false }
-            project.treeSelectedID = files[index].id
-            treeSelectionChanged(project)
-            return true
+            if !files.isEmpty {
+                let current = files.firstIndex { $0.path == path } ?? files.firstIndex { $0.id == project.treeSelectedID }
+                let index = current.map { $0 + delta } ?? (delta > 0 ? 0 : files.count - 1)
+                guard index >= 0, index < files.count else { return false }
+                project.treeSelectedID = files[index].id
+                treeSelectionChanged(project)
+                return true
+            }
         }
         switch project.tab {
         case .changes where project.comparison != nil:
@@ -983,7 +1127,7 @@ final class AppStore {
         return index >= 0 && index < files.count ? files[index] : nil
     }
 
-    /// Opens a file by path (from a search or jump): as a diff when it has local changes, otherwise as a plain file.
+    /// Opens a file by path (from the tree, search, or LSP jump) directly as plain file content.
     func openFile(in project: Project, path: String, line: Int?, column: Int? = nil) {
         if selectedProjectID != project.id {
             currentProject?.cancelAIGroupGeneration()
@@ -995,16 +1139,188 @@ final class AppStore {
         follow(path, in: project)
     }
 
+    /// Opens a cross-file LSP jump target in `project` honoring `settings.lspJumpOpenMode`.
+    /// When set to `.diff` and the target file has changes (in the active comparison or working tree),
+    /// opens its diff view at `line`/`column`; otherwise falls back to plain file view.
+    func openFileForLSP(in project: Project, path: String, line: Int?, column: Int? = nil) {
+        guard settings.lspJumpOpenMode == .diff else {
+            openFile(in: project, path: path, line: line, column: column)
+            return
+        }
+        if selectedProjectID != project.id {
+            currentProject?.cancelAIGroupGeneration()
+            pendingGroupHunkFocus = nil
+            selectedProjectID = project.id
+            persistProjects()
+        }
+        if project.tab == .changes, let comparison = project.comparison {
+            if let compared = project.comparedChange(path) {
+                for id in ChangeTree.ancestors(of: path, in: project.compareCollapsed) {
+                    project.compareCollapsed.remove(id)
+                }
+                project.compareSelectedID = ChangeRow.fileID(path)
+                let rawRequest = project.request(
+                    compared: compared,
+                    with: comparison,
+                    ignoreWhitespace: settings.ignoreWhitespace
+                )
+                openDiffForLSP(rawRequest: rawRequest, path: path, in: project, line: line, column: column)
+                return
+            }
+            // Not part of the active comparison: fall back to plain file without cancelling comparison.
+            openFile(in: project, path: path, line: line, column: column)
+            return
+        }
+        if let change = project.change(forPath: path) {
+            if project.tab != .changes { project.tab = .changes }
+            for id in ChangeTree.ancestors(of: path, in: project.collapsed) {
+                project.collapsed.remove(id)
+            }
+            project.selectedChangeID = ChangeRow.fileID(path)
+            let rawRequest = project.request(for: change, ignoreWhitespace: settings.ignoreWhitespace)
+            openDiffForLSP(rawRequest: rawRequest, path: path, in: project, line: line, column: column)
+            return
+        }
+        openFile(in: project, path: path, line: line, column: column)
+    }
+
+    private func openDiffForLSP(rawRequest: DiffRequest, path: String, in project: Project, line: Int?, column: Int?) {
+        exitExternalFileMode()
+        pendingGroupHunkFocus = nil
+        project.browsedPath = nil
+        let request = resolvedRequest(rawRequest)
+        viewer.setBaseStamp(project.status.headOID)
+        syncGroupHunkFilter(nil, for: request)
+        noteRecent(project, path)
+        viewer.open(request, line: line, column: column, preserveScroll: false)
+        follow(path, in: project)
+    }
+
     private func browse(_ path: String, in project: Project, line: Int?, column: Int? = nil) {
         exitExternalFileMode()
+        pendingGroupHunkFocus = nil
         noteRecent(project, path)
         project.browsedPath = path
         viewer.setBaseStamp(project.status.headOID)
-        let request = resolvedRequest(worktreeRequest(for: path, in: project))
+        let request = resolvedRequest(plainFileRequest(for: path, in: project))
         syncGroupHunkFilter(nil, for: request)
         markInChanges(path, in: project)
         let sameFile = viewer.request?.path == path && viewer.request?.root == project.url
-        viewer.open(request, line: line, column: column, preserveScroll: sameFile && line == nil)
+        var targetLine = line
+        var targetColumn = column
+        if targetLine == nil, sameFile, viewer.request?.source != .file,
+           viewer.isTextDocument, viewer.document != nil, !viewer.isLoading {
+            let pos = viewer.currentCaretPosition()
+            targetLine = pos.row + 1
+            targetColumn = pos.column
+        }
+        let preserveScroll = sameFile && viewer.request?.source == .file && targetLine == nil
+        viewer.open(request, line: targetLine, column: targetColumn, preserveScroll: preserveScroll)
+    }
+
+    /// True when the viewer is currently showing a non-plain diff/commit view of a working-tree file that exists on disk.
+    var canOpenCurrentFile: Bool {
+        guard let project = currentProject,
+              let request = viewer.request,
+              request.root == project.url,
+              request.source != .file,
+              !request.isExternalFile,
+              !viewer.isSpreadsheet else { return false }
+        let _ = project.changes
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: request.fileURL.path, isDirectory: &isDir) && !isDir.boolValue
+    }
+
+    /// Opens the file currently shown in Diff / Commit view directly as editable plain file content, keeping the caret line.
+    func openCurrentFile() {
+        guard let project = currentProject,
+              let request = viewer.request,
+              request.root == project.url else { return }
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: request.fileURL.path, isDirectory: &isDir), !isDir.boolValue else {
+            showToast(L("This file is not in the working tree", "这个文件不在当前工作区里"))
+            return
+        }
+        var line: Int?
+        var column: Int?
+        if viewer.isTextDocument, viewer.document != nil, !viewer.isLoading {
+            let pos = viewer.currentCaretPosition()
+            line = pos.row + 1
+            column = pos.column
+            recordJumpOrigin(from: request, line0Based: pos.row, column: pos.column)
+        }
+        openFile(in: project, path: request.path, line: line, column: column)
+        viewer.focusCanvas()
+    }
+
+    /// True when the viewer is showing a plain working-tree file that has changes to compare against.
+    var canShowDiffForCurrentFile: Bool {
+        guard let project = currentProject,
+              let request = viewer.request,
+              request.root == project.url,
+              request.source == .file,
+              !viewer.isSpreadsheet else { return false }
+        if project.tab == .changes, project.comparison != nil {
+            return project.comparedChange(request.path) != nil
+        }
+        return project.change(forPath: request.path) != nil
+    }
+
+    /// Switches from the current plain-file view back to its diff view, keeping the caret line.
+    func showDiffForCurrentFile() {
+        guard let project = currentProject,
+              let request = viewer.request,
+              request.root == project.url else { return }
+        let path = request.path
+        let diffRequest: DiffRequest
+        if project.tab == .changes, let comparison = project.comparison, let compared = project.comparedChange(path) {
+            project.compareSelectedID = ChangeRow.fileID(path)
+            diffRequest = resolvedRequest(project.request(compared: compared, with: comparison, ignoreWhitespace: settings.ignoreWhitespace))
+        } else if let change = project.change(forPath: path) {
+            if project.tab != .changes { project.tab = .changes }
+            if project.comparison != nil { project.comparison = nil }
+            for id in ChangeTree.ancestors(of: path, in: project.collapsed) { project.collapsed.remove(id) }
+            project.selectedChangeID = ChangeRow.fileID(path)
+            diffRequest = resolvedRequest(project.request(for: change, ignoreWhitespace: settings.ignoreWhitespace))
+        } else {
+            return
+        }
+        exitExternalFileMode()
+        pendingGroupHunkFocus = nil
+        project.browsedPath = nil
+        viewer.setBaseStamp(project.status.headOID)
+        syncGroupHunkFilter(nil, for: diffRequest)
+        var line: Int?
+        var column: Int?
+        if viewer.isTextDocument, viewer.document != nil, !viewer.isLoading {
+            let pos = viewer.currentCaretPosition()
+            line = pos.row + 1
+            column = pos.column
+            recordJumpOrigin(from: request, line0Based: pos.row, column: pos.column)
+        }
+        noteRecent(project, path)
+        viewer.open(diffRequest, line: line, column: column, preserveScroll: false)
+        viewer.focusCanvas()
+    }
+
+    /// Opens the working-tree diff for `change` (for example from the file tree's context menu).
+    func showChangeDiff(_ change: FileChange, in project: Project) {
+        if selectedProjectID != project.id {
+            currentProject?.cancelAIGroupGeneration()
+            selectedProjectID = project.id
+            persistProjects()
+        }
+        exitExternalFileMode()
+        pendingGroupHunkFocus = nil
+        project.browsedPath = nil
+        if project.comparison != nil { endComparison(in: project) }
+        if project.tab != .changes { project.tab = .changes }
+        for id in ChangeTree.ancestors(of: change.path, in: project.collapsed) { project.collapsed.remove(id) }
+        project.selectedChangeID = ChangeRow.fileID(change.path)
+        viewer.setBaseStamp(project.status.headOID)
+        show(change, in: project, groupHunks: nil)
+        noteRecent(project, change.path)
+        viewer.focusCanvas()
     }
 
     func noteRecent(_ project: Project, _ path: String) {
@@ -1381,6 +1697,11 @@ final class AppStore {
             if addCommitPickItems(to: menu, project: project) { menu.addItem(.separator()) }
         }
         if let project = currentProject { addHistoryItems(to: menu, project: project) }
+        if canOpenCurrentFile {
+            menu.addItem(ClosureMenuItem(L("Open File Content", "直接打开当前文件内容")) { [weak self] in self?.openCurrentFile() })
+        } else if canShowDiffForCurrentFile {
+            menu.addItem(ClosureMenuItem(L("Show Diff", "查看差异")) { [weak self] in self?.showDiffForCurrentFile() })
+        }
         menu.addItem(ClosureMenuItem(L("Select in File Tree", "在文件树中定位")) { [weak self] in self?.locateInTree() })
         if AppEnvironment.hasTerminal {
             menu.addItem(ClosureMenuItem(L("Insert Path into Terminal", "把路径插入终端")) { [weak self] in self?.insertReferenceInTerminal() })

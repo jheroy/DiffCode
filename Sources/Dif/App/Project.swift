@@ -136,8 +136,8 @@ final class Project: Identifiable {
     /// The merge message put in the box, so that it goes again if the merge is abandoned rather than committed.
     @ObservationIgnored private var prefilledMessage: String?
 
-    /// A file opened by its path (from the tree or a search) rather than picked in the Changes or Log list.
-    /// The viewer keeps following it: a diff while it has local changes, the plain file otherwise.
+    /// A file opened as plain file content (from the tree, search, LSP jump, or the viewer header's Open File action)
+    /// rather than picked in Changes, Groups, or Log. Stays in plain-file view even when the file has local changes.
     var browsedPath: String?
 
     // Files
@@ -158,6 +158,11 @@ final class Project: Identifiable {
     /// Every selected commit (⌘-click, ⇧-click, ⌘A). Includes `selectedCommitID` when one is active.
     var selectedCommitIDs: Set<String> = []
     var logQuery = ""
+    /// Selected authors to filter the Log by (OR across selected entries).
+    var logAuthors: [AuthorFilter] = []
+    /// Cached authors available in the current Log scope for the author picker.
+    var availableLogAuthors: [LogAuthor] = []
+    var isLoadingLogAuthors = false
     var logAllBranches = false
     /// A branch or tag whose history the Log lists instead of HEAD's (a full ref name), picked in the Git graph.
     var logRef: String?
@@ -175,6 +180,9 @@ final class Project: Identifiable {
         }
     }
     var commitFiles: [FileChange] = []
+    var commitSelectionIsNonContiguous = false
+    @ObservationIgnored var commitFileSteps: [String: [FileCommitStep]] = [:]
+    var commitSkippedMergeCount = 0
     var commitBody = ""
     var isLoadingCommit = false
     var selectedCommitFileID: String?
@@ -255,6 +263,8 @@ final class Project: Identifiable {
     @ObservationIgnored private var refreshScheduled = false
     @ObservationIgnored private var lastRefresh = Date.distantPast
     @ObservationIgnored private var logTask: Task<Void, Never>?
+    @ObservationIgnored private var logAuthorsTask: Task<Void, Never>?
+    @ObservationIgnored private var logAuthorsScopeKey: String?
     @ObservationIgnored private var commitTask: Task<Void, Never>?
     @ObservationIgnored private var commitLoadGeneration = 0
     @ObservationIgnored private var loadedCommitSelectionIDs: Set<String> = []
@@ -718,6 +728,7 @@ final class Project: Identifiable {
             self.refreshTask = nil
             if self.logStale, self.tab == .log {
                 self.logStale = false
+                self.logAuthorsScopeKey = nil
                 self.loadLog(reset: true)
             }
             // Files edited, or a commit made: what differs from the commit compared with changes too.
@@ -745,9 +756,19 @@ final class Project: Identifiable {
     }
 
     /// Diff request for `change` across `commits` (ordered newest first): for one commit, against its first parent;
-    /// for several, from the oldest commit's first parent (nil for a root commit) to the newest commit.
+    /// for contiguous commits, from the oldest commit's first parent to the newest commit; for non-contiguous
+    /// selections, only the selected commits' steps for this file.
     func request(for change: FileChange, in commits: [Commit], ignoreWhitespace: Bool) -> DiffRequest? {
         guard let newest = commits.first, let oldest = commits.last else { return nil }
+        if commitSelectionIsNonContiguous, let steps = commitFileSteps[change.path], !steps.isEmpty {
+            if steps.count == 1 {
+                let step = steps[0]
+                return DiffRequest(root: url, path: step.path, oldPath: step.oldPath, kind: step.kind,
+                                   source: .commit(hash: step.hash, parent: step.parent), ignoreWhitespace: ignoreWhitespace)
+            }
+            return DiffRequest(root: url, path: change.path, oldPath: change.oldPath, kind: change.kind,
+                               source: .commitSteps(steps), ignoreWhitespace: ignoreWhitespace)
+        }
         return DiffRequest(root: url, path: change.path, oldPath: change.oldPath, kind: change.kind,
                            source: .commit(hash: newest.hash, parent: oldest.parents.first), ignoreWhitespace: ignoreWhitespace)
     }
@@ -773,6 +794,73 @@ final class Project: Identifiable {
 
     // MARK: Log
 
+    func toggleLogAuthor(_ author: AuthorFilter) {
+        if let index = logAuthors.firstIndex(of: author) {
+            logAuthors.remove(at: index)
+        } else {
+            logAuthors.append(author)
+        }
+        loadLog(reset: true)
+    }
+
+    func addLogAuthors(_ authors: [AuthorFilter]) {
+        let existing = Set(logAuthors)
+        let additions = authors.filter { !existing.contains($0) }
+        guard !additions.isEmpty else { return }
+        logAuthors.append(contentsOf: additions)
+        loadLog(reset: true)
+    }
+
+    func removeLogAuthor(_ author: AuthorFilter) {
+        let countBefore = logAuthors.count
+        logAuthors.removeAll { $0 == author }
+        if logAuthors.count != countBefore {
+            loadLog(reset: true)
+        }
+    }
+
+    func clearLogAuthors() {
+        guard !logAuthors.isEmpty else { return }
+        logAuthors.removeAll()
+        loadLog(reset: true)
+    }
+
+    func loadLogAuthors(force: Bool = false) {
+        let scopeKey = [
+            status.headOID ?? "",
+            logAllBranches ? "1" : "0",
+            logRef ?? "",
+            history?.path ?? "",
+            history?.rev ?? "",
+            history?.lines.map { "\($0.lowerBound)-\($0.upperBound)" } ?? "",
+        ].joined(separator: "\u{1F}")
+        if !force, logAuthorsScopeKey == scopeKey, !availableLogAuthors.isEmpty, !logStale {
+            return
+        }
+        logAuthorsTask?.cancel()
+        isLoadingLogAuthors = true
+        let all = logAllBranches
+        let ref = logRef
+        let history = self.history
+        let knownPaths = historyPaths
+        logAuthorsTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result: [LogAuthor]
+            if let history {
+                let scopeAll = history.rev == "HEAD" && all
+                let scopeRef: String? = history.rev != "HEAD" ? history.rev : (scopeAll ? nil : ref)
+                let paths = Array(Set(knownPaths.values).union([history.path])).sorted()
+                result = (try? await Git.authors(in: self.url, allBranches: scopeAll, ref: scopeRef, paths: paths)) ?? []
+            } else {
+                result = (try? await Git.authors(in: self.url, allBranches: all, ref: ref)) ?? []
+            }
+            if Task.isCancelled { return }
+            self.availableLogAuthors = result
+            self.logAuthorsScopeKey = scopeKey
+            self.isLoadingLogAuthors = false
+        }
+    }
+
     /// - Parameters:
     ///   - atLeast: load this many commits in one go, so a commit picked further down (in the Git graph) is in the list.
     ///   - completion: runs once the page is in place, unless a newer load replaced this one.
@@ -781,7 +869,7 @@ final class Project: Identifiable {
         logTask?.cancel()
         isLoadingLog = true
         let skip = reset ? 0 : commits.count
-        let query = logQuery, all = logAllBranches, ref = logRef, history = self.history
+        let query = logQuery, authors = logAuthors, all = logAllBranches, ref = logRef, history = self.history
         let limit = max(Self.logPageSize, atLeast)
         let knowsPaths = !historyPaths.isEmpty
         logTask = Task { @MainActor [weak self] in
@@ -791,7 +879,7 @@ final class Project: Identifiable {
             if let history {
                 if let lines = history.lines {
                     async let commits = Git.lineHistory(history.path, lines: lines, rev: history.rev, in: self.url,
-                                                        skip: skip, limit: limit, query: query)
+                                                        skip: skip, limit: limit, query: query, authors: authors)
                     // `git log -L` cannot name the file in each commit; the file's own history can.
                     if reset || !knowsPaths {
                         paths = (try? await Git.fileHistory(history.path, in: self.url, skip: 0, limit: 5000, scope: [history.rev]))?.paths ?? [:]
@@ -800,12 +888,14 @@ final class Project: Identifiable {
                 } else {
                     // From the commit asked for (a file deleted since, say), otherwise from what the Log lists.
                     let scope = history.rev != "HEAD" ? [history.rev] : (all ? Git.allBranchesScope(includeInternalRefs: false) : (ref.map { [$0] } ?? []))
-                    let result = try? await Git.fileHistory(history.path, in: self.url, skip: skip, limit: limit, query: query, scope: scope)
+                    let result = try? await Git.fileHistory(history.path, in: self.url, skip: skip, limit: limit,
+                                                            query: query, authors: authors, scope: scope)
                     page = result?.commits ?? []
                     paths = result?.paths ?? [:]
                 }
             } else {
-                page = (try? await Git.log(in: self.url, skip: skip, limit: limit, query: query, allBranches: all, ref: ref)) ?? []
+                page = (try? await Git.log(in: self.url, skip: skip, limit: limit, query: query, authors: authors,
+                                           allBranches: all, ref: ref)) ?? []
             }
             if Task.isCancelled { return }
             if reset { self.historyPaths = paths } else { self.historyPaths.merge(paths) { old, _ in old } }
@@ -841,6 +931,9 @@ final class Project: Identifiable {
         guard let primary = selected.first else {
             isLoadingCommit = false
             commitFiles = []
+            commitSelectionIsNonContiguous = false
+            commitFileSteps = [:]
+            commitSkippedMergeCount = 0
             commitBody = ""
             selectedCommitFileID = nil
             commitCollapsed.removeAll()
@@ -852,12 +945,18 @@ final class Project: Identifiable {
         isLoadingCommit = true
         commitTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            async let filesResult = Git.commitFiles(selected, in: self.url)
+            async let summaryResult = Git.commitSelectionSummary(selected, in: self.url)
             async let bodyResult: String = selected.count == 1 ? Git.commitBody(primary.hash, in: self.url) : ""
-            let files = (try? await filesResult) ?? []
+            let summary = (try? await summaryResult) ?? CommitSelectionSummary(
+                isNonContiguous: false, files: [], fileSteps: [:], skippedMergeCount: 0
+            )
+            let files = summary.files
             let body = await bodyResult
             if Task.isCancelled || self.commitLoadGeneration != generation || self.commitSelectionIDs != selectionIDs { return }
             self.isLoadingCommit = false
+            self.commitSelectionIsNonContiguous = summary.isNonContiguous
+            self.commitFileSteps = summary.fileSteps
+            self.commitSkippedMergeCount = summary.skippedMergeCount
             self.commitFiles = files
             self.commitBody = body
             // Reset collapsed folders when switching to an unrelated commit selection; otherwise prune stale IDs.

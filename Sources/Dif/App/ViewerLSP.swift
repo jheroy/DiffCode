@@ -29,25 +29,37 @@ extension ViewerModel {
     /// Debounce delay after keystrokes before sending `didChange` and refreshing semantic tokens.
     static let lspChangeDelay: TimeInterval = 0.18
 
-    /// Whether the currently displayed document is eligible for LSP semantic tokens and `⌘+Click` navigation.
+    /// Whether the currently displayed document is eligible for LSP navigation (`⌘+Click` / context menu).
+    /// Active for live workspace files, and for historical commit diffs whose file still exists on disk
+    /// (resolved read-only against the working tree without overwriting LSP's open document state).
     var isCurrentDocumentLSPEnabled: Bool {
         guard AppEnvironment.hasLSP,
               let request,
               let doc = document,
               case .text = doc.content,
-              request.isLiveFile,
               LSPServerRegistry.descriptor(for: doc.language) != nil else {
             return false
         }
-        return true
+        if request.isLiveFile { return true }
+        return request.isCommitDiff && request.kind != .deleted && Self.isRegularFileOnDisk(request.fileURL)
+    }
+
+    /// Whether `ViewerModel` should synchronize `doc.right` text and semantic tokens with `LSPManager`.
+    /// Strictly limited to live workspace files so historical snapshots never overwrite working-tree buffers.
+    var isCurrentDocumentLSPSyncEnabled: Bool {
+        isCurrentDocumentLSPEnabled && (request?.isLiveFile == true)
+    }
+
+    private static func isRegularFileOnDisk(_ url: URL) -> Bool {
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) && !isDir.boolValue
     }
 
     /// Synchronizes LSP document state whenever a new document is applied in the viewer.
     func syncLSPForCurrentDocument() {
-        let enabled = isCurrentDocumentLSPEnabled
-        container?.canvas.isLSPEnabled = enabled
+        container?.canvas.isLSPEnabled = isCurrentDocumentLSPEnabled
 
-        guard enabled, let request, let doc = document else {
+        guard isCurrentDocumentLSPSyncEnabled, let request, let doc = document else {
             closeLSPDocument()
             return
         }
@@ -108,9 +120,8 @@ extension ViewerModel {
 
     /// Re-verifies LSP canvas flag & active document sync on same-file early returns in `ViewerModel.open`.
     func ensureLSPSyncedAfterEarlyReturn() {
-        let enabled = isCurrentDocumentLSPEnabled
-        container?.canvas.isLSPEnabled = enabled
-        guard enabled, let request else { return }
+        container?.canvas.isLSPEnabled = isCurrentDocumentLSPEnabled
+        guard isCurrentDocumentLSPSyncEnabled, let request else { return }
         let canonical = LSPURI.canonicalFileURL(request.fileURL)
         if lspDocument?.fileURL != canonical {
             syncLSPForCurrentDocument()
@@ -212,7 +223,7 @@ extension ViewerModel {
     /// Self-heals if the server restarted, was idle-reaped, or an earlier open did not complete.
     @discardableResult
     func ensureLSPDocumentSynced() async -> ActiveLSPDocument? {
-        guard isCurrentDocumentLSPEnabled else { return nil }
+        guard isCurrentDocumentLSPSyncEnabled else { return nil }
         if lspDocument == nil {
             syncLSPForCurrentDocument()
         }
