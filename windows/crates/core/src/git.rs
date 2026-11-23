@@ -920,8 +920,8 @@ impl Commit {
 }
 
 /// One commit's fields, separated by 0x1f; `LOG_FORMAT` ends each record with 0x1e.
-pub const LOG_FIELDS: &str = "%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s";
-pub const LOG_FORMAT: &str = "%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s%x1e";
+pub const LOG_FIELDS: &str = "%H%x1f%P%x1f%aN%x1f%aE%x1f%at%x1f%D%x1f%s";
+pub const LOG_FORMAT: &str = "%H%x1f%P%x1f%aN%x1f%aE%x1f%at%x1f%D%x1f%s%x1e";
 
 /// - `reference`: a full ref name (`refs/heads/x`) whose history to list instead of HEAD's. Ignored with `all_branches`.
 pub fn log(
@@ -966,6 +966,7 @@ pub fn log(
         }
         let mut author_args: Vec<String> = vec![
             "log".into(),
+            "--use-mailmap".into(),
             format!("--format={LOG_FORMAT}"),
             "--decorate=full".into(),
             format!("--max-count={limit}"),
@@ -1354,5 +1355,32 @@ u UU N... 100644 100644 100644 100644 a b c conflict.txt\0\
         assert_eq!(line_count_of(b"a\nb"), 2);
         assert_eq!(line_count_of(b"a\nb\n"), 2);
         assert_eq!(line_count_of(b""), 0);
+    }
+
+    #[test]
+    fn log_respects_mailmap_for_display_and_author_query() {
+        if !is_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            cmd(root, ["-c", "commit.gpgsign=false"].iter().chain(args).copied()).run().unwrap();
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.name=Old Alias", "-c", "user.email=old@example.com", "commit", "-q", "-m", "first", "--date=2026-01-01T10:00:00Z"]);
+        std::fs::write(root.join("a.txt"), "two\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["-c", "user.name=Canonical Name", "-c", "user.email=canon@example.com", "commit", "-q", "-m", "second", "--date=2026-01-02T10:00:00Z"]);
+        std::fs::write(root.join(".mailmap"), "Canonical Name <canon@example.com> Old Alias <old@example.com>\n").unwrap();
+
+        let commits = log(root, 0, 50, "", false, None).unwrap();
+        assert_eq!(commits.len(), 2);
+        assert!(commits.iter().all(|c| c.author == "Canonical Name" && c.email == "canon@example.com"));
+
+        let searched = log(root, 0, 50, "Canonical Name", false, None).unwrap();
+        assert_eq!(searched.iter().map(|c| c.subject.as_str()).collect::<Vec<_>>(), vec!["second", "first"]);
     }
 }

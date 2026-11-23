@@ -6,53 +6,287 @@ import SwiftUI
 extension AppStore {
     // MARK: History
 
-    /// Lists in the Log the commits that changed a file, or some of its lines, and shows the file's diff in the first.
-    /// - Parameter hash: a commit to pick instead of the newest (one clicked in the Annotate column).
+    /// Lists in the Log the commits that changed a file, or some of its lines, in a dedicated switchable tab
+    /// (reusing an existing tab with the same `filter`) so existing Log selections and filters are preserved.
+    /// - Parameter hash: a commit to pick instead of the newest (one clicked in the Annotate column or Selection History).
     func showHistory(_ filter: HistoryFilter, in project: Project, select hash: String? = nil) {
         exitExternalFileMode()
         if selectedProjectID != project.id {
             selectedProjectID = project.id
         }
-        project.history = filter
-        project.historyPaths = [:]
-        project.logQuery = ""
-        project.logAuthors = []
+        project.syncActiveLogTabFromLive()
+
+        if let existing = project.logTabs.first(where: { $0.history == filter }) {
+            _ = project.switchLogTab(to: existing.id)
+            project.browsedPath = nil
+            project.tab = .log
+            if !listVisible { withAnimation(.snappy(duration: 0.2)) { listVisible = true } }
+            let isStale = project.logTabs.first(where: { $0.id == existing.id })?.isStale ?? false
+            if let hash {
+                project.selectedCommitFileID = nil
+                project.hasLoadedCommitSelection = false
+                project.setCommitSelection(primary: hash, ids: [hash])
+                if project.commits.contains(where: { $0.hash == hash }), !isStale {
+                    project.logRevealToken &+= 1
+                    commitSelectionChanged(project)
+                } else {
+                    project.loadLog(
+                        reset: true,
+                        atLeast: 2000,
+                        restorePrimary: hash,
+                        restoreSelection: [hash]
+                    ) { [weak self, weak project] in
+                        guard let self, let project, project.history == filter else { return }
+                        self.commitSelectionChanged(project)
+                    }
+                }
+            } else if project.commits.isEmpty || isStale {
+                loadActiveLogTab(for: project)
+            } else if !project.hasLoadedCommitSelection && !project.selectedCommits.isEmpty {
+                commitSelectionChanged(project)
+            } else {
+                syncViewer()
+            }
+            persistLogState(for: project)
+            focusList()
+            return
+        }
+
+        let newTab = LogTab(
+            history: filter,
+            selectedCommitID: hash,
+            selectedCommitIDs: hash.map { [$0] } ?? [],
+            needsSelectionRestore: hash != nil
+        )
+        project.addAndActivateLogTab(newTab)
         project.browsedPath = nil
         project.tab = .log
-        project.commits = []
-        project.selectedCommitID = hash
-        project.selectedCommitFileID = nil
         if !listVisible { withAnimation(.snappy(duration: 0.2)) { listVisible = true } }
-        // A commit asked for by name may be far down a long history: load enough of it in one go.
-        project.loadLog(reset: true, atLeast: hash == nil ? 0 : 2000) { [weak self, weak project] in
-            guard let self, let project, project.history == filter else { return }
-            guard let hash, !project.commits.contains(where: { $0.hash == hash }) else {
-                self.commitSelectionChanged(project)
-                return
-            }
-            // Not in the file's history as listed (a commit on another branch, say): shown at the top anyway.
-            Task { @MainActor [weak self, weak project] in
-                guard let self, let project, project.history == filter else { return }
-                if let commit = await Git.commit(hash, in: project.url) {
-                    project.commits.insert(commit, at: 0)
-                    project.selectedCommitID = hash
-                }
-                self.commitSelectionChanged(project)
-            }
+        let targetTabID = newTab.id
+        project.loadLog(
+            reset: true,
+            atLeast: hash == nil ? 0 : 2000,
+            restorePrimary: hash,
+            restoreSelection: hash.map { [$0] } ?? []
+        ) { [weak self, weak project] in
+            guard let self, let project, project.activeLogTabID == targetTabID, project.history == filter else { return }
+            self.commitSelectionChanged(project)
         }
+        persistLogState(for: project)
         focusList()
     }
 
-    /// Back from a file's history to the branch the Log listed before.
+    /// Closes the current file/line history tab (returning to the previous tab) or resets it to the full Log.
     func endHistory() {
         exitExternalFileMode()
         guard let project = currentProject, project.history != nil else { return }
-        project.history = nil
-        project.historyPaths = [:]
-        project.commits = []
-        project.loadLog(reset: true) { [weak self, weak project] in
+        closeLogTab(project.activeLogTabID, in: project)
+    }
+
+    /// Loads the currently active Log tab's commits and syncs commit files/viewer, restoring persisted selections when needed.
+    func loadActiveLogTab(
+        for project: Project,
+        preserveExistingSelection: Bool = false,
+        forceCommitReload: Bool = false
+    ) {
+        let targetTabID = project.activeLogTabID
+        let shouldRestore = project.needsLogSelectionRestore || preserveExistingSelection
+        let restorePrimary = shouldRestore ? project.selectedCommitID : nil
+        let restoreSelection = shouldRestore ? project.selectedCommitIDs : []
+        let minLoad = (restorePrimary != nil || !restoreSelection.isEmpty)
+            ? max(Project.logPageSize, min(max(project.commits.count, 500), 2000))
+            : 0
+        project.loadLog(
+            reset: true,
+            atLeast: minLoad,
+            restorePrimary: restorePrimary,
+            restoreSelection: restoreSelection
+        ) { [weak self, weak project] in
+            guard let self, let project, project.activeLogTabID == targetTabID else { return }
+            if project.id == self.selectedProjectID, project.tab == .log {
+                self.commitSelectionChanged(project, force: forceCommitReload)
+            } else {
+                project.loadSelectedCommit(force: forceCommitReload) {}
+            }
+        }
+    }
+
+    func selectLogTab(_ id: UUID, in project: Project) {
+        exitExternalFileMode()
+        guard project.switchLogTab(to: id) else { return }
+        project.browsedPath = nil
+        if project.tab != .log { project.tab = .log }
+        let isStale = project.logTabs.first(where: { $0.id == id })?.isStale ?? false
+        if project.commits.isEmpty || isStale {
+            loadActiveLogTab(for: project)
+        } else if !project.hasLoadedCommitSelection && !project.selectedCommits.isEmpty {
+            commitSelectionChanged(project)
+        } else {
+            syncViewer()
+        }
+        persistLogState(for: project)
+    }
+
+    func newLogTab(in project: Project? = nil) {
+        guard let project = project ?? currentProject else { return }
+        exitExternalFileMode()
+        let tab = LogTab()
+        project.addAndActivateLogTab(tab)
+        project.browsedPath = nil
+        if project.tab != .log { project.tab = .log }
+        if !listVisible { withAnimation(.snappy(duration: 0.2)) { listVisible = true } }
+        loadActiveLogTab(for: project)
+        persistLogState(for: project)
+        focusList()
+    }
+
+    func duplicateLogTab(_ id: UUID, in project: Project) {
+        exitExternalFileMode()
+        project.syncActiveLogTabFromLive()
+        guard let source = project.logTabs.first(where: { $0.id == id }) else { return }
+        let copy = source.duplicated()
+        project.addAndActivateLogTab(copy)
+        project.browsedPath = nil
+        if project.tab != .log { project.tab = .log }
+        if copy.commits.isEmpty || copy.isStale {
+            loadActiveLogTab(for: project)
+        } else if !project.hasLoadedCommitSelection && !project.selectedCommits.isEmpty {
+            commitSelectionChanged(project)
+        } else {
+            syncViewer()
+        }
+        persistLogState(for: project)
+    }
+
+    func closeLogTab(_ id: UUID, in project: Project) {
+        exitExternalFileMode()
+        let result = project.closeLogTab(id)
+        if result.changedActive {
+            project.browsedPath = nil
+            let isStale = project.logTabs.first(where: { $0.id == project.activeLogTabID })?.isStale ?? false
+            if result.resetOnlyTab || project.commits.isEmpty || isStale {
+                loadActiveLogTab(for: project)
+            } else if !project.hasLoadedCommitSelection && !project.selectedCommits.isEmpty {
+                commitSelectionChanged(project)
+            } else {
+                syncViewer()
+            }
+        }
+        persistLogState(for: project)
+    }
+
+    func closeOtherLogTabs(keeping id: UUID, in project: Project) {
+        exitExternalFileMode()
+        project.syncActiveLogTabFromLive()
+        guard let kept = project.logTabs.first(where: { $0.id == id }) else { return }
+        let switched = project.activeLogTabID != id
+        project.logTabs = [kept]
+        project.logTabMRU.removeAll()
+        if switched {
+            project.applyLogTabToLive(kept)
+            project.browsedPath = nil
+            if project.tab != .log { project.tab = .log }
+            if kept.commits.isEmpty || kept.isStale {
+                loadActiveLogTab(for: project)
+            } else if !project.hasLoadedCommitSelection && !project.selectedCommits.isEmpty {
+                commitSelectionChanged(project)
+            } else {
+                syncViewer()
+            }
+        }
+        persistLogState(for: project)
+    }
+
+    func closeHistoryLogTabs(in project: Project) {
+        exitExternalFileMode()
+        project.syncActiveLogTabFromLive()
+        let remaining = project.logTabs.filter { $0.history == nil }
+        let activeRemoved = project.history != nil
+        if remaining.isEmpty {
+            let fresh = LogTab()
+            project.logTabs = [fresh]
+            project.logTabMRU.removeAll()
+            project.applyLogTabToLive(fresh)
+            project.browsedPath = nil
+            loadActiveLogTab(for: project)
+        } else {
+            project.logTabs = remaining
+            let survivingIDs = Set(remaining.map(\.id))
+            project.logTabMRU.removeAll { !survivingIDs.contains($0) }
+            if activeRemoved {
+                let nextID = project.logTabMRU.last(where: { survivingIDs.contains($0) }) ?? remaining[0].id
+                if let nextTab = remaining.first(where: { $0.id == nextID }) {
+                    project.applyLogTabToLive(nextTab)
+                    project.browsedPath = nil
+                    if nextTab.commits.isEmpty || nextTab.isStale {
+                        loadActiveLogTab(for: project)
+                    } else if !project.hasLoadedCommitSelection && !project.selectedCommits.isEmpty {
+                        commitSelectionChanged(project)
+                    } else {
+                        syncViewer()
+                    }
+                }
+            }
+        }
+        persistLogState(for: project)
+    }
+
+    func closeActiveLogTab() {
+        guard let project = currentProject, project.tab == .log else { return }
+        closeLogTab(project.activeLogTabID, in: project)
+    }
+
+    func cycleLogTab(_ delta: Int) {
+        guard let project = currentProject,
+              project.tab == .log,
+              project.logTabs.count > 1,
+              let index = project.logTabs.firstIndex(where: { $0.id == project.activeLogTabID }) else { return }
+        let next = (index + delta + project.logTabs.count) % project.logTabs.count
+        selectLogTab(project.logTabs[next].id, in: project)
+    }
+
+    // MARK: Log Persistence
+
+    func restoreLogState(for project: Project) {
+        guard let state = logStateStorage.load(for: project.url) else { return }
+        project.restoreLogState(state)
+    }
+
+    func persistLogState(for project: Project) {
+        logPersistTasks.removeValue(forKey: project.id)?.cancel()
+        if let state = project.persistedLogState() {
+            logStateStorage.save(state, for: project.url)
+        } else {
+            logStateStorage.delete(for: project.url)
+        }
+    }
+
+    func schedulePersistLogState(for project: Project) {
+        logPersistTasks.removeValue(forKey: project.id)?.cancel()
+        logPersistTasks[project.id] = Task { @MainActor [weak self, weak project] in
+            do {
+                try await Task.sleep(for: .milliseconds(300))
+            } catch {
+                return
+            }
             guard let self, let project else { return }
-            self.commitSelectionChanged(project)
+            self.logPersistTasks.removeValue(forKey: project.id)
+            self.persistLogState(for: project)
+        }
+    }
+
+    func deletePersistedLogState(for project: Project) {
+        logPersistTasks.removeValue(forKey: project.id)?.cancel()
+        logStateStorage.delete(for: project.url)
+    }
+
+    func flushAllPersistedLogStates() {
+        for (_, task) in logPersistTasks {
+            task.cancel()
+        }
+        logPersistTasks.removeAll()
+        for project in projects {
+            persistLogState(for: project)
         }
     }
 

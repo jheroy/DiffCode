@@ -99,6 +99,8 @@ final class AppStore {
     @ObservationIgnored var pendingGroupHunkFocus: (root: URL, path: String, hunkIndex: Int)?
     @ObservationIgnored let aiGroupStorage = AIGroupStorage.shared
     @ObservationIgnored var aiGroupPersistTasks: [UUID: Task<Void, Never>] = [:]
+    @ObservationIgnored var logStateStorage = LogStateStorage.shared
+    @ObservationIgnored var logPersistTasks: [UUID: Task<Void, Never>] = [:]
 
     @ObservationIgnored var recent: [RecentFile] = []
     /// Rollbacks and deletes that can still be undone, oldest first.
@@ -228,6 +230,7 @@ final class AppStore {
 
     private func install(_ project: Project) {
         project.onRefreshed = { [weak self] p in self?.projectDidRefresh(p) }
+        project.onLogStateChanged = { [weak self] p in self?.schedulePersistLogState(for: p) }
         project.onInclusionChanged = { [weak self, weak project] in
             if let self, let project, project === self.currentProject { self.updateCommitTicks() }
         }
@@ -235,6 +238,7 @@ final class AppStore {
         project.startWatching()
         projects.append(project)
         restoreAIGroups(for: project)
+        restoreLogState(for: project)
     }
 
     func persistProjects() {
@@ -541,6 +545,7 @@ final class AppStore {
         project.cancelCommitMessageGeneration()
         project.cancelAIGroupGeneration()
         deletePersistedAIGroups(for: project)
+        deletePersistedLogState(for: project)
         project.stopWatching()
         projects.removeAll { $0.id == project.id }
         FolderAccess.shared.release(project.url.path, keepingFor: projects.map(\.url.path))
@@ -713,7 +718,9 @@ final class AppStore {
         guard let project = currentProject else { return }
         project.invalidateFiles()
         project.refresh()
-        if project.tab == .log { project.loadLog(reset: true) }
+        if project.tab == .log {
+            loadActiveLogTab(for: project, preserveExistingSelection: true, forceCommitReload: true)
+        }
         viewer.reload()
     }
 
@@ -908,7 +915,7 @@ final class AppStore {
                 viewer.clear()
             }
         case .log:
-            if project.commits.isEmpty, !project.isLoadingLog { project.loadLog(reset: true) }
+            if project.commits.isEmpty, !project.isLoadingLog { loadActiveLogTab(for: project) }
             let commits = project.selectedCommits
             guard !commits.isEmpty, let id = project.selectedCommitFileID,
                   let change = project.commitFiles.first(where: { ChangeRow.fileID($0.path) == id }),
@@ -951,11 +958,12 @@ final class AppStore {
         follow(change.path, in: project)
     }
 
-    func commitSelectionChanged(_ project: Project) {
+    func commitSelectionChanged(_ project: Project, force: Bool = false) {
         exitExternalFileMode()
-        project.loadSelectedCommit { [weak self, weak project] in
+        project.loadSelectedCommit(force: force) { [weak self, weak project] in
             guard let self, let project, project.id == self.selectedProjectID, project.tab == .log else { return }
             self.syncViewer()
+            self.schedulePersistLogState(for: project)
         }
     }
 
@@ -963,6 +971,8 @@ final class AppStore {
         guard project.id == selectedProjectID, project.tab == .log else { return }
         exitExternalFileMode()
         syncViewer()
+        project.syncActiveLogTabFromLive()
+        schedulePersistLogState(for: project)
         if project.browsedPath == nil, let path = viewer.request?.path { follow(path, in: project) }
     }
 
@@ -1057,6 +1067,7 @@ final class AppStore {
             project.tab = targetTab
             project.browsedPath = nil
             syncViewer()
+            schedulePersistLogState(for: project)
         }
         focusList()
     }

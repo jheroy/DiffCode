@@ -346,6 +346,17 @@ extension AppStore {
     func showCommitInLog(_ hash: String) {
         guard let project = currentProject else { return }
         let index = gitGraph.rows.firstIndex { $0.id == hash } ?? 0
+        project.syncActiveLogTabFromLive()
+        let activeSnapshot = project.liveLogTabSnapshot(for: project.activeLogTabID)
+        if activeSnapshot.history != nil || activeSnapshot.isCustomized {
+            if let plain = project.logTabs.first(where: { $0.history == nil && !$0.isCustomized }) {
+                _ = project.switchLogTab(to: plain.id)
+            } else {
+                project.addAndActivateLogTab(LogTab())
+            }
+        }
+        project.history = nil
+        project.historyPaths = [:]
         switch gitGraph.scope {
         case .all:
             project.logAllBranches = true
@@ -359,17 +370,20 @@ extension AppStore {
         }
         project.logQuery = ""
         project.logAuthors = []
+        project.selectedCommitFileID = nil
+        project.hasLoadedCommitSelection = false
+        project.setCommitSelection(primary: hash, ids: [hash])
         dismissPopup(restoreFocus: false)
         if !listVisible { withAnimation(.snappy(duration: 0.2)) { listVisible = true } }
         project.browsedPath = nil
         project.tab = .log
-        project.selectedCommitID = hash
+        let targetTabID = project.activeLogTabID
         // Enough of the history in one go that the commit is in the list, however far down the graph it was.
-        project.loadLog(reset: true, atLeast: index + 50) { [weak self, weak project] in
-            guard let self, let project else { return }
-            if project.commits.contains(where: { $0.hash == hash }) { project.selectedCommitID = hash }
+        project.loadLog(reset: true, atLeast: index + 50, restorePrimary: hash, restoreSelection: [hash]) { [weak self, weak project] in
+            guard let self, let project, project.activeLogTabID == targetTabID else { return }
             self.commitSelectionChanged(project)
         }
+        persistLogState(for: project)
         focusList()
     }
 }

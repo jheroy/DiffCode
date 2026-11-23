@@ -573,7 +573,7 @@ extension Git {
 
 /// An author identity used to filter commits in the Log (`git log --author`), distinguishing
 /// same-named authors with different emails.
-struct AuthorFilter: Identifiable, Hashable, Sendable {
+struct AuthorFilter: Identifiable, Hashable, Codable, Sendable {
     var name: String
     var email: String
 
@@ -706,7 +706,7 @@ struct Commit: Identifiable, Hashable, Sendable {
 
 extension Git {
     /// One commit's fields, separated by 0x1f; `logFormat` ends each record with 0x1e.
-    static let logFields = "%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s"
+    static let logFields = "%H%x1f%P%x1f%aN%x1f%aE%x1f%at%x1f%D%x1f%s"
     static let logFormat = logFields + "%x1e"
 
     /// Escapes POSIX Extended Regular Expression metacharacters so literal strings match safely under `-E`.
@@ -728,7 +728,7 @@ extension Git {
         guard !authors.isEmpty else {
             return q.isEmpty ? [] : ["-i", "--fixed-strings", "--grep=\(q)"]
         }
-        var args = ["--no-mailmap", "-E"]
+        var args = ["--use-mailmap", "-E"]
         if !q.isEmpty { args.append("-i") }
         for author in authors {
             args.append("--author=^\(escapeERE(author.name)) <\(escapeERE(author.email))>$")
@@ -747,7 +747,7 @@ extension Git {
             : (ref.map { [$0] } ?? ["HEAD"])
         let pathArgs = paths.isEmpty ? [] : ["--"] + paths
         do {
-            let data = try await run(["shortlog", "-sn", "--group=format:%an%x1f%ae"] + scope + pathArgs,
+            let data = try await run(["shortlog", "-sn", "--group=format:%aN%x1f%aE"] + scope + pathArgs,
                                      in: dir, okStatuses: [0, 128])
             return parseShortlogGroup(data)
         } catch let failure as Failure where failure.status == 129 {
@@ -757,7 +757,7 @@ extension Git {
         }
     }
 
-    /// Parses `git shortlog -sn --group=format:%an%x1f%ae`: `<spaces><count>\t<name>\x1f<email>`.
+    /// Parses `git shortlog -sn --group=format:%aN%x1f%aE`: `<spaces><count>\t<name>\x1f<email>`.
     static func parseShortlogGroup(_ data: Data) -> [LogAuthor] {
         var counts: [AuthorFilter: Int] = [:]
         for lineData in data.split(separator: 0x0A, omittingEmptySubsequences: true) {
@@ -841,7 +841,7 @@ extension Git {
                 commits = direct + commits.filter { c in !direct.contains(where: { $0.hash == c.hash }) }
             }
             if authors.isEmpty,
-               let byAuthor = try? await run(["log", "--format=\(logFormat)", "--decorate=full", "--max-count=\(limit)", "-i", "--fixed-strings", "--author=\(q)"]
+               let byAuthor = try? await run(["log", "--use-mailmap", "--format=\(logFormat)", "--decorate=full", "--max-count=\(limit)", "-i", "--fixed-strings", "--author=\(q)"]
                                              + scope, in: dir) {
                 let seen = Set(commits.map(\.hash))
                 commits += parseLog(byAuthor).filter { !seen.contains($0.hash) }

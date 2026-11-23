@@ -575,6 +575,8 @@ struct KeyboardList<Row: Identifiable, Content: View>: View where Row.ID == Stri
     var onLastRowAppear: (() -> Void)?
     /// Bump to centre the selected row, however far away it is.
     var revealToken = 0
+    /// Scroll to `selection` when the list first appears (for restored/switched tabs).
+    var revealOnAppear = false
     /// Reports how far the list is scrolled, in points.
     var onScroll: ((CGFloat) -> Void)?
     /// Rows that can be clicked but never selected (section headers); the arrow keys step over them.
@@ -664,6 +666,13 @@ struct KeyboardList<Row: Identifiable, Content: View>: View where Row.ID == Stri
                 // After this update's layout, so rows that were just revealed can be scrolled to.
                 DispatchQueue.main.async {
                     if let id = selection { withAnimation(.snappy(duration: 0.22)) { proxy.scrollTo(id, anchor: .center) } }
+                }
+            }
+            .onAppear {
+                if revealOnAppear, let id = selection {
+                    DispatchQueue.main.async {
+                        proxy.scrollTo(id, anchor: .center)
+                    }
                 }
             }
         }

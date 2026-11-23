@@ -526,6 +526,31 @@ extension Git {
               let data = try? await run(["log", "-1", "--format=\(logFormat)", "--decorate=full", rev, "--"], in: dir) else { return nil }
         return parseLog(data).first
     }
+
+    /// Looks up specific commits by hash in a single git invocation, falling back per-hash if any object is missing.
+    static func commits(hashes: [String], in dir: URL) async -> [Commit] {
+        var seen: Set<String> = []
+        var cleaned: [String] = []
+        for raw in hashes {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("-"), seen.insert(trimmed).inserted else { continue }
+            cleaned.append(trimmed)
+        }
+        guard !cleaned.isEmpty else { return [] }
+
+        let args = ["log", "--no-walk=unsorted", "--ignore-missing", "--format=\(logFormat)", "--decorate=full"] + cleaned + ["--"]
+        if let data = try? await run(args, in: dir) {
+            return parseLog(data)
+        }
+        var recovered: [Commit] = []
+        recovered.reserveCapacity(cleaned.count)
+        for hash in cleaned {
+            if let item = await commit(hash, in: dir) {
+                recovered.append(item)
+            }
+        }
+        return recovered
+    }
 }
 
 /// One commit returned by `git log -L`, carrying both commit metadata and the patch restricted to the tracked lines.

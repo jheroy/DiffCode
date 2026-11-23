@@ -4,24 +4,6 @@ import Observation
 /// What the list column shows. The file tree lives in the sidebar and is always there.
 enum ProjectTab: String { case changes, groups, log }
 
-/// The Log narrowed to one file's commits, or to the commits that changed some of its lines.
-struct HistoryFilter: Equatable, Sendable {
-    /// The file's path in `rev`.
-    var path: String
-    /// 1-based lines of the file as `rev` has it; nil for the whole file.
-    var lines: ClosedRange<Int>?
-    /// Where the history starts, and where `lines` are counted.
-    var rev: String = "HEAD"
-
-    var name: String { (path as NSString).lastPathComponent }
-
-    /// "Main.kt", "Main.kt:12-20".
-    var label: String {
-        guard let lines else { return name }
-        return lines.count > 1 ? "\(name):\(lines.lowerBound)-\(lines.upperBound)" : "\(name):\(lines.lowerBound)"
-    }
-}
-
 /// The Changes tab comparing the working tree with another commit or branch instead of HEAD:
 /// everything that changed since then, committed or not, as when reviewing what an agent did.
 /// Or comparing two commits with each other, picked together in the Log or the Git graph.
@@ -194,6 +176,14 @@ final class Project: Identifiable {
     /// The path the history's file had in each commit listed (it may have been renamed).
     @ObservationIgnored var historyPaths: [String: String] = [:]
 
+    // Log tabs
+    var logTabs: [LogTab]
+    var activeLogTabID: UUID
+    var logRevealToken = 0
+    @ObservationIgnored var logTabMRU: [UUID] = []
+    @ObservationIgnored var needsLogSelectionRestore = false
+    @ObservationIgnored var hasLoadedCommitSelection = false
+
     // AI Hunk Grouping
     /// Latest AI logical grouping of uncommitted hunks (restored from disk on project load when present).
     var aiGroupResult: AIHunkGroupingResult? = nil {
@@ -263,11 +253,14 @@ final class Project: Identifiable {
     @ObservationIgnored private var refreshScheduled = false
     @ObservationIgnored private var lastRefresh = Date.distantPast
     @ObservationIgnored private var logTask: Task<Void, Never>?
+    @ObservationIgnored private var logLoadGeneration = 0
     @ObservationIgnored private var logAuthorsTask: Task<Void, Never>?
     @ObservationIgnored private var logAuthorsScopeKey: String?
     @ObservationIgnored private var commitTask: Task<Void, Never>?
     @ObservationIgnored private var commitLoadGeneration = 0
     @ObservationIgnored private var loadedCommitSelectionIDs: Set<String> = []
+    @ObservationIgnored private var loadingCommitSelectionIDs: [String]?
+    @ObservationIgnored private var pendingCommitCompletions: [() -> Void] = []
     @ObservationIgnored private var compareTask: Task<Void, Never>?
     @ObservationIgnored private var fileIndex: [String]?
     @ObservationIgnored private var fileIndexStale = true
@@ -283,12 +276,17 @@ final class Project: Identifiable {
 
     /// Called on the main thread after each status refresh.
     @ObservationIgnored var onRefreshed: ((Project) -> Void)?
+    /// Called on the main thread when Log tabs, filters, or selections change.
+    @ObservationIgnored var onLogStateChanged: ((Project) -> Void)?
     /// Called on the main thread when watched files change (before the debounced refresh).
     @ObservationIgnored var isVisibleProvider: () -> Bool = { true }
 
     static let logPageSize = 200
 
     init(url: URL) {
+        let initialTab = LogTab()
+        self.logTabs = [initialTab]
+        self.activeLogTabID = initialTab.id
         self.url = url.standardizedFileURL
         self.name = url.lastPathComponent
     }
@@ -653,7 +651,10 @@ final class Project: Identifiable {
             DispatchQueue.main.async {
                 guard let self = project else { return }
                 self.fileIndexStale = true
-                if gitStateChanged, !self.commits.isEmpty { self.logStale = true }
+                if gitStateChanged {
+                    if !self.commits.isEmpty { self.logStale = true }
+                    self.markInactiveLogTabsStale()
+                }
                 self.scheduleRefresh()
             }
         }
@@ -729,7 +730,12 @@ final class Project: Identifiable {
             if self.logStale, self.tab == .log {
                 self.logStale = false
                 self.logAuthorsScopeKey = nil
-                self.loadLog(reset: true)
+                self.loadLog(
+                    reset: true,
+                    atLeast: max(Self.logPageSize, min(self.commits.count, 2000)),
+                    restorePrimary: self.selectedCommitID,
+                    restoreSelection: self.selectedCommitIDs
+                )
             }
             // Files edited, or a commit made: what differs from the commit compared with changes too.
             // Two commits compared with each other stay as they are.
@@ -792,14 +798,201 @@ final class Project: Identifiable {
         selectedCommits.map(\.id)
     }
 
-    // MARK: Log
+    // MARK: Log & Log Tabs
+
+    /// Updates `selectedCommitIDs` before `selectedCommitID` so `selectedCommitID.didSet` never drops multi-selection.
+    func setCommitSelection(primary: String?, ids: Set<String>) {
+        var normalized = ids
+        if let primary {
+            normalized.insert(primary)
+        }
+        let resolvedPrimary = primary ?? normalized.first
+        if selectedCommitIDs != normalized {
+            selectedCommitIDs = normalized
+        }
+        if selectedCommitID != resolvedPrimary {
+            selectedCommitID = resolvedPrimary
+        }
+    }
+
+    /// Returns the live snapshot for the active Log tab, or the stored snapshot for any inactive tab.
+    func liveLogTabSnapshot(for id: UUID) -> LogTab {
+        guard id == activeLogTabID else {
+            return logTabs.first(where: { $0.id == id }) ?? LogTab(id: id)
+        }
+        let stored = logTabs.first(where: { $0.id == id })
+        return LogTab(
+            id: id,
+            history: history,
+            logQuery: logQuery,
+            logAuthors: logAuthors,
+            logAllBranches: logAllBranches,
+            logRef: logRef,
+            selectedCommitID: selectedCommitID,
+            selectedCommitIDs: selectedCommitIDs,
+            selectedCommitFileID: selectedCommitFileID,
+            commitCollapsed: commitCollapsed,
+            needsSelectionRestore: needsLogSelectionRestore,
+            commits: commits,
+            historyPaths: historyPaths,
+            hasMoreCommits: hasMoreCommits,
+            commitFiles: commitFiles,
+            commitSelectionIsNonContiguous: commitSelectionIsNonContiguous,
+            commitFileSteps: commitFileSteps,
+            commitSkippedMergeCount: commitSkippedMergeCount,
+            commitBody: commitBody,
+            loadedCommitSelectionIDs: loadedCommitSelectionIDs,
+            hasLoadedCommitSelection: hasLoadedCommitSelection,
+            isStale: stored?.isStale ?? false
+        )
+    }
+
+    /// Writes the Project's active Log properties into `logTabs` for `activeLogTabID`.
+    func syncActiveLogTabFromLive() {
+        let snapshot = liveLogTabSnapshot(for: activeLogTabID)
+        if let index = logTabs.firstIndex(where: { $0.id == activeLogTabID }) {
+            logTabs[index] = snapshot
+        } else {
+            logTabs.append(snapshot)
+        }
+    }
+
+    /// Loads `tab` into the Project's live Log properties and cancels any previous tab's in-flight tasks.
+    func applyLogTabToLive(_ tab: LogTab) {
+        logTask?.cancel()
+        logTask = nil
+        logLoadGeneration &+= 1
+        isLoadingLog = false
+
+        logAuthorsTask?.cancel()
+        logAuthorsTask = nil
+        isLoadingLogAuthors = false
+        logAuthorsScopeKey = nil
+
+        commitTask?.cancel()
+        commitTask = nil
+        commitLoadGeneration += 1
+        loadingCommitSelectionIDs = nil
+        pendingCommitCompletions.removeAll()
+        isLoadingCommit = false
+
+        activeLogTabID = tab.id
+        history = tab.history
+        historyPaths = tab.historyPaths
+        logQuery = tab.logQuery
+        logAuthors = tab.logAuthors
+        logAllBranches = tab.logAllBranches
+        logRef = tab.logRef
+        commits = tab.commits
+        hasMoreCommits = tab.hasMoreCommits
+        commitFiles = tab.commitFiles
+        commitSelectionIsNonContiguous = tab.commitSelectionIsNonContiguous
+        commitFileSteps = tab.commitFileSteps
+        commitSkippedMergeCount = tab.commitSkippedMergeCount
+        commitBody = tab.commitBody
+        selectedCommitFileID = tab.selectedCommitFileID
+        commitCollapsed = tab.commitCollapsed
+        loadedCommitSelectionIDs = tab.loadedCommitSelectionIDs
+        hasLoadedCommitSelection = tab.hasLoadedCommitSelection
+        needsLogSelectionRestore = tab.needsSelectionRestore
+        logStale = tab.isStale
+
+        setCommitSelection(primary: tab.selectedCommitID, ids: tab.selectedCommitIDs)
+        logRevealToken &+= 1
+    }
+
+    /// Switches to another Log tab if it exists and is not already active.
+    @discardableResult
+    func switchLogTab(to id: UUID) -> Bool {
+        guard id != activeLogTabID,
+              let targetIndex = logTabs.firstIndex(where: { $0.id == id }) else {
+            return false
+        }
+        let outgoingID = activeLogTabID
+        syncActiveLogTabFromLive()
+        logTabMRU.removeAll { $0 == outgoingID || $0 == id }
+        logTabMRU.append(outgoingID)
+        applyLogTabToLive(logTabs[targetIndex])
+        return true
+    }
+
+    /// Appends `tab` to `logTabs` and activates it, preserving the outgoing tab in MRU order.
+    func addAndActivateLogTab(_ tab: LogTab) {
+        let outgoingID = activeLogTabID
+        syncActiveLogTabFromLive()
+        logTabMRU.removeAll { $0 == outgoingID || $0 == tab.id }
+        logTabMRU.append(outgoingID)
+        logTabs.append(tab)
+        applyLogTabToLive(tab)
+    }
+
+    /// Closes `id` (or resets the sole tab to a clean default Log tab).
+    func closeLogTab(_ id: UUID) -> (changedActive: Bool, resetOnlyTab: Bool) {
+        syncActiveLogTabFromLive()
+        guard let index = logTabs.firstIndex(where: { $0.id == id }) else {
+            return (false, false)
+        }
+        if logTabs.count == 1 {
+            let fresh = LogTab()
+            logTabs = [fresh]
+            logTabMRU.removeAll()
+            applyLogTabToLive(fresh)
+            return (true, true)
+        }
+        let wasActive = (id == activeLogTabID)
+        logTabs.remove(at: index)
+        logTabMRU.removeAll { $0 == id }
+        if wasActive {
+            let nextID = logTabMRU.last(where: { candidate in logTabs.contains { $0.id == candidate } })
+                ?? logTabs[max(0, index - 1)].id
+            if let nextTab = logTabs.first(where: { $0.id == nextID }) {
+                applyLogTabToLive(nextTab)
+            }
+            return (true, false)
+        }
+        return (false, false)
+    }
+
+    func markInactiveLogTabsStale() {
+        for index in logTabs.indices where logTabs[index].id != activeLogTabID && !logTabs[index].commits.isEmpty {
+            logTabs[index].isStale = true
+        }
+    }
+
+    func persistedLogState() -> PersistedLogState? {
+        syncActiveLogTabFromLive()
+        if tab == .changes, logTabs.count == 1, !logTabs[0].hasPersistableState {
+            return nil
+        }
+        return PersistedLogState(
+            activeProjectTab: tab.rawValue,
+            activeTabID: activeLogTabID,
+            tabs: logTabs.map { $0.persisted() }
+        )
+    }
+
+    func restoreLogState(_ state: PersistedLogState) {
+        guard !state.tabs.isEmpty else { return }
+        let restored = state.tabs.map { LogTab(persisted: $0) }
+        logTabs = restored
+        logTabMRU.removeAll()
+        let activeTab = state.activeTabID.flatMap { targetID in restored.first { $0.id == targetID } } ?? restored[0]
+        applyLogTabToLive(activeTab)
+        if let rawTab = state.activeProjectTab,
+           let restoredTab = ProjectTab(rawValue: rawTab),
+           !(AppEnvironment.isAppStore && restoredTab == .groups) {
+            tab = restoredTab
+        }
+    }
 
     func toggleLogAuthor(_ author: AuthorFilter) {
+        needsLogSelectionRestore = false
         if let index = logAuthors.firstIndex(of: author) {
             logAuthors.remove(at: index)
         } else {
             logAuthors.append(author)
         }
+        onLogStateChanged?(self)
         loadLog(reset: true)
     }
 
@@ -807,7 +1000,9 @@ final class Project: Identifiable {
         let existing = Set(logAuthors)
         let additions = authors.filter { !existing.contains($0) }
         guard !additions.isEmpty else { return }
+        needsLogSelectionRestore = false
         logAuthors.append(contentsOf: additions)
+        onLogStateChanged?(self)
         loadLog(reset: true)
     }
 
@@ -815,13 +1010,17 @@ final class Project: Identifiable {
         let countBefore = logAuthors.count
         logAuthors.removeAll { $0 == author }
         if logAuthors.count != countBefore {
+            needsLogSelectionRestore = false
+            onLogStateChanged?(self)
             loadLog(reset: true)
         }
     }
 
     func clearLogAuthors() {
         guard !logAuthors.isEmpty else { return }
+        needsLogSelectionRestore = false
         logAuthors.removeAll()
+        onLogStateChanged?(self)
         loadLog(reset: true)
     }
 
@@ -863,41 +1062,104 @@ final class Project: Identifiable {
 
     /// - Parameters:
     ///   - atLeast: load this many commits in one go, so a commit picked further down (in the Git graph) is in the list.
+    ///   - restorePrimary: optional primary commit hash to preserve/locate after resetting.
+    ///   - restoreSelection: optional full commit hash set to preserve/locate after resetting.
     ///   - completion: runs once the page is in place, unless a newer load replaced this one.
-    func loadLog(reset: Bool, atLeast: Int = 0, completion: (() -> Void)? = nil) {
+    func loadLog(
+        reset: Bool,
+        atLeast: Int = 0,
+        restorePrimary: String? = nil,
+        restoreSelection: Set<String> = [],
+        completion: (() -> Void)? = nil
+    ) {
         if isLoadingLog, !reset { return }
         logTask?.cancel()
+        logLoadGeneration &+= 1
+        let generation = logLoadGeneration
+        let targetTabID = activeLogTabID
         isLoadingLog = true
+
         let skip = reset ? 0 : commits.count
         let query = logQuery, authors = logAuthors, all = logAllBranches, ref = logRef, history = self.history
-        let limit = max(Self.logPageSize, atLeast)
+        let initialLimit = max(Self.logPageSize, atLeast)
         let knowsPaths = !historyPaths.isEmpty
-        logTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            var page: [Commit] = []
-            var paths: [String: String] = [:]
+
+        let desiredPrimary = reset ? (restorePrimary ?? (needsLogSelectionRestore ? selectedCommitID : nil)) : nil
+        var desiredSelection: Set<String> = reset
+            ? (!restoreSelection.isEmpty ? restoreSelection : (needsLogSelectionRestore ? selectedCommitIDs : []))
+            : []
+        if let desiredPrimary {
+            desiredSelection.insert(desiredPrimary)
+        }
+
+        let repoURL = url
+
+        func fetchPage(pageLimit: Int, needsPaths: Bool) async -> (commits: [Commit], paths: [String: String]) {
             if let history {
                 if let lines = history.lines {
-                    async let commits = Git.lineHistory(history.path, lines: lines, rev: history.rev, in: self.url,
-                                                        skip: skip, limit: limit, query: query, authors: authors)
+                    async let loadedCommits = Git.lineHistory(history.path, lines: lines, rev: history.rev, in: repoURL,
+                                                              skip: skip, limit: pageLimit, query: query, authors: authors)
                     // `git log -L` cannot name the file in each commit; the file's own history can.
-                    if reset || !knowsPaths {
-                        paths = (try? await Git.fileHistory(history.path, in: self.url, skip: 0, limit: 5000, scope: [history.rev]))?.paths ?? [:]
+                    let loadedPaths: [String: String]
+                    if needsPaths {
+                        loadedPaths = (try? await Git.fileHistory(history.path, in: repoURL, skip: 0, limit: 5000, scope: [history.rev]))?.paths ?? [:]
+                    } else {
+                        loadedPaths = [:]
                     }
-                    page = (try? await commits) ?? []
+                    return ((try? await loadedCommits) ?? [], loadedPaths)
                 } else {
-                    // From the commit asked for (a file deleted since, say), otherwise from what the Log lists.
                     let scope = history.rev != "HEAD" ? [history.rev] : (all ? Git.allBranchesScope(includeInternalRefs: false) : (ref.map { [$0] } ?? []))
-                    let result = try? await Git.fileHistory(history.path, in: self.url, skip: skip, limit: limit,
+                    let result = try? await Git.fileHistory(history.path, in: repoURL, skip: skip, limit: pageLimit,
                                                             query: query, authors: authors, scope: scope)
-                    page = result?.commits ?? []
-                    paths = result?.paths ?? [:]
+                    return (result?.commits ?? [], result?.paths ?? [:])
                 }
             } else {
-                page = (try? await Git.log(in: self.url, skip: skip, limit: limit, query: query, authors: authors,
-                                           allBranches: all, ref: ref)) ?? []
+                let loaded = (try? await Git.log(in: repoURL, skip: skip, limit: pageLimit, query: query, authors: authors,
+                                                 allBranches: all, ref: ref)) ?? []
+                return (loaded, [:])
             }
-            if Task.isCancelled { return }
+        }
+
+        logTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var effectiveLimit = initialLimit
+            let first = await fetchPage(pageLimit: effectiveLimit, needsPaths: reset || !knowsPaths)
+            if Task.isCancelled || self.logLoadGeneration != generation || self.activeLogTabID != targetTabID { return }
+
+            var page = first.commits
+            var paths = first.paths
+            var rawPageCount = page.count
+
+            if reset, !desiredSelection.isEmpty {
+                var missing = desiredSelection.subtracting(Set(page.map(\.hash)))
+                if !missing.isEmpty, rawPageCount >= effectiveLimit, effectiveLimit < 2000 {
+                    effectiveLimit = 2000
+                    let deeper = await fetchPage(pageLimit: effectiveLimit, needsPaths: false)
+                    if Task.isCancelled || self.logLoadGeneration != generation || self.activeLogTabID != targetTabID { return }
+                    page = deeper.commits
+                    if !deeper.paths.isEmpty { paths = deeper.paths }
+                    rawPageCount = page.count
+                    missing = desiredSelection.subtracting(Set(page.map(\.hash)))
+                }
+                if !missing.isEmpty {
+                    var extra = await Git.commits(hashes: Array(missing), in: repoURL)
+                    if Task.isCancelled || self.logLoadGeneration != generation || self.activeLogTabID != targetTabID { return }
+                    if !authors.isEmpty {
+                        let allowed = Set(authors)
+                        extra = extra.filter { allowed.contains(AuthorFilter.from($0)) }
+                    }
+                    let existing = Set(page.map(\.hash))
+                    let uniqueExtra = extra.filter { !existing.contains($0.hash) }.sorted { $0.date > $1.date }
+                    if !uniqueExtra.isEmpty {
+                        if history != nil {
+                            page.insert(contentsOf: uniqueExtra, at: 0)
+                        } else {
+                            page.append(contentsOf: uniqueExtra)
+                        }
+                    }
+                }
+            }
+
             if reset { self.historyPaths = paths } else { self.historyPaths.merge(paths) { old, _ in old } }
             if reset {
                 self.commits = page
@@ -905,30 +1167,71 @@ final class Project: Identifiable {
                 let known = Set(self.commits.map(\.hash))
                 self.commits += page.filter { !known.contains($0.hash) }
             }
-            self.hasMoreCommits = page.count >= limit
+            self.hasMoreCommits = rawPageCount >= effectiveLimit
             self.isLoadingLog = false
-            if reset, self.selectedCommit == nil {
-                let firstID = self.commits.first?.id
-                self.selectedCommitID = firstID
-                self.selectedCommitIDs = firstID.map { [$0] } ?? []
-            } else if reset {
-                let known = Set(self.commits.map(\.id))
-                self.selectedCommitIDs = self.selectedCommitIDs.intersection(known)
-                if self.selectedCommitIDs.isEmpty, let id = self.selectedCommitID {
-                    self.selectedCommitIDs = [id]
+            self.logStale = false
+            self.needsLogSelectionRestore = false
+
+            if reset {
+                if !desiredSelection.isEmpty {
+                    let known = Set(self.commits.map(\.id))
+                    let surviving = desiredSelection.intersection(known)
+                    if !surviving.isEmpty {
+                        let resolvedPrimary = (desiredPrimary.flatMap { surviving.contains($0) ? $0 : nil })
+                            ?? self.commits.first(where: { surviving.contains($0.id) })?.id
+                        self.setCommitSelection(primary: resolvedPrimary, ids: surviving)
+                        if self.loadedCommitSelectionIDs != surviving {
+                            self.hasLoadedCommitSelection = false
+                        }
+                        self.logRevealToken &+= 1
+                    } else {
+                        let firstID = self.commits.first?.id
+                        self.setCommitSelection(primary: firstID, ids: firstID.map { [$0] } ?? [])
+                        self.hasLoadedCommitSelection = false
+                    }
+                } else if self.selectedCommit == nil {
+                    let firstID = self.commits.first?.id
+                    self.setCommitSelection(primary: firstID, ids: firstID.map { [$0] } ?? [])
+                    self.hasLoadedCommitSelection = false
+                } else {
+                    let known = Set(self.commits.map(\.id))
+                    var surviving = self.selectedCommitIDs.intersection(known)
+                    if surviving.isEmpty, let id = self.selectedCommitID, known.contains(id) {
+                        surviving = [id]
+                    }
+                    if surviving.isEmpty {
+                        let firstID = self.commits.first?.id
+                        self.setCommitSelection(primary: firstID, ids: firstID.map { [$0] } ?? [])
+                    } else {
+                        let resolvedPrimary = (self.selectedCommitID.flatMap { surviving.contains($0) ? $0 : nil })
+                            ?? self.commits.first(where: { surviving.contains($0.id) })?.id
+                        self.setCommitSelection(primary: resolvedPrimary, ids: surviving)
+                    }
+                    if self.loadedCommitSelectionIDs != Set(self.commitSelectionIDs) {
+                        self.hasLoadedCommitSelection = false
+                    }
                 }
             }
+
+            if let idx = self.logTabs.firstIndex(where: { $0.id == targetTabID }) {
+                self.logTabs[idx].isStale = false
+            }
+            self.syncActiveLogTabFromLive()
             completion?()
+            self.onLogStateChanged?(self)
         }
     }
 
     /// Loads the file list of the selected commit or commit range. `completion` runs once the list is in place.
-    func loadSelectedCommit(completion: @escaping () -> Void) {
-        commitTask?.cancel()
-        commitLoadGeneration += 1
-        let generation = commitLoadGeneration
+    func loadSelectedCommit(force: Bool = false, completion: @escaping () -> Void) {
+        let targetTabID = activeLogTabID
         let selected = selectedCommits
         guard let primary = selected.first else {
+            commitTask?.cancel()
+            commitTask = nil
+            commitLoadGeneration += 1
+            loadingCommitSelectionIDs = nil
+            pendingCommitCompletions.removeAll()
             isLoadingCommit = false
             commitFiles = []
             commitSelectionIsNonContiguous = false
@@ -938,11 +1241,39 @@ final class Project: Identifiable {
             selectedCommitFileID = nil
             commitCollapsed.removeAll()
             loadedCommitSelectionIDs = []
+            hasLoadedCommitSelection = false
+            syncActiveLogTabFromLive()
             completion()
             return
         }
+
         let selectionIDs = selected.map(\.id)
+        let selectionSet = Set(selectionIDs)
+
+        if !force, hasLoadedCommitSelection, loadedCommitSelectionIDs == selectionSet {
+            commitTask?.cancel()
+            commitTask = nil
+            commitLoadGeneration += 1
+            loadingCommitSelectionIDs = nil
+            pendingCommitCompletions.removeAll()
+            isLoadingCommit = false
+            completion()
+            return
+        }
+
+        if !force, isLoadingCommit, loadingCommitSelectionIDs == selectionIDs {
+            pendingCommitCompletions.append(completion)
+            return
+        }
+
+        commitTask?.cancel()
+        commitLoadGeneration += 1
+        let generation = commitLoadGeneration
+        loadingCommitSelectionIDs = selectionIDs
+        pendingCommitCompletions = [completion]
         isLoadingCommit = true
+        let isInitialRestore = loadedCommitSelectionIDs.isEmpty
+
         commitTask = Task { @MainActor [weak self] in
             guard let self else { return }
             async let summaryResult = Git.commitSelectionSummary(selected, in: self.url)
@@ -952,37 +1283,56 @@ final class Project: Identifiable {
             )
             let files = summary.files
             let body = await bodyResult
-            if Task.isCancelled || self.commitLoadGeneration != generation || self.commitSelectionIDs != selectionIDs { return }
+            if Task.isCancelled
+                || self.commitLoadGeneration != generation
+                || self.activeLogTabID != targetTabID
+                || self.commitSelectionIDs != selectionIDs {
+                return
+            }
+
             self.isLoadingCommit = false
+            self.loadingCommitSelectionIDs = nil
             self.commitSelectionIsNonContiguous = summary.isNonContiguous
             self.commitFileSteps = summary.fileSteps
             self.commitSkippedMergeCount = summary.skippedMergeCount
             self.commitFiles = files
             self.commitBody = body
+
             // Reset collapsed folders when switching to an unrelated commit selection; otherwise prune stale IDs.
-            let newSelectionSet = Set(selectionIDs)
-            if self.loadedCommitSelectionIDs.isDisjoint(with: newSelectionSet) {
+            if !self.loadedCommitSelectionIDs.isEmpty && self.loadedCommitSelectionIDs.isDisjoint(with: selectionSet) {
                 self.commitCollapsed.removeAll()
             } else {
                 self.commitCollapsed.formIntersection(Self.commitFolderIDs(for: files))
             }
-            self.loadedCommitSelectionIDs = newSelectionSet
-            // A file's history shows that file in each commit, under whatever name it had there.
-            if let history = self.history {
+            self.loadedCommitSelectionIDs = selectionSet
+            self.hasLoadedCommitSelection = true
+
+            let keep = self.selectedCommitFileID.flatMap { id in
+                files.contains { ChangeRow.fileID($0.path) == id } ? id : nil
+            }
+            if isInitialRestore, let keep {
+                self.selectedCommitFileID = keep
+            } else if let history = self.history {
+                // A file's history shows that file in each commit, under whatever name it had there.
                 let candidates: [String] = selected.count == 1
                     ? [self.historyPaths[primary.hash] ?? history.path, history.path]
                     : selected.compactMap { self.historyPaths[$0.hash] } + [history.path]
                 if let file = files.first(where: { candidates.contains($0.path) })
                     ?? files.first(where: { f in f.oldPath.map { candidates.contains($0) } ?? false }) {
                     self.selectedCommitFileID = ChangeRow.fileID(file.path)
-                    completion()
-                    return
+                } else {
+                    self.selectedCommitFileID = keep ?? ChangeTree.orderedFiles(changes: files, flat: false, filter: "", splitUnversioned: false)
+                        .first.map { ChangeRow.fileID($0.path) }
                 }
+            } else {
+                self.selectedCommitFileID = keep ?? ChangeTree.orderedFiles(changes: files, flat: false, filter: "", splitUnversioned: false)
+                    .first.map { ChangeRow.fileID($0.path) }
             }
-            let keep = self.selectedCommitFileID.flatMap { id in files.contains { ChangeRow.fileID($0.path) == id } ? id : nil }
-            self.selectedCommitFileID = keep ?? ChangeTree.orderedFiles(changes: files, flat: false, filter: "", splitUnversioned: false)
-                .first.map { ChangeRow.fileID($0.path) }
-            completion()
+
+            self.syncActiveLogTabFromLive()
+            let completions = self.pendingCommitCompletions
+            self.pendingCommitCompletions.removeAll()
+            completions.forEach { $0() }
         }
     }
 
@@ -1001,10 +1351,12 @@ final class Project: Identifiable {
 
     func collapseAllCommitFolders() {
         commitCollapsed = commitFolderIDs
+        onLogStateChanged?(self)
     }
 
     func expandAllCommitFolders() {
         commitCollapsed.removeAll()
+        onLogStateChanged?(self)
     }
 
     // MARK: Comparison

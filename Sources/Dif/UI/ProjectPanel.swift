@@ -968,6 +968,7 @@ struct LogPanel: View {
                 VStack(spacing: 0) {
                     VStack(spacing: 0) {
                         ProjectTabsHeader(project: project)
+                        LogTabBar(project: project)
                         HStack(spacing: 4) {
                             FilterField(text: Binding(get: { project.logQuery }, set: { value in
                                 project.logQuery = value
@@ -987,8 +988,10 @@ struct LogPanel: View {
                             }
                             IconButton(symbol: "arrow.triangle.branch", help: L("Show all branches", "显示所有分支"),
                                        isActive: project.logAllBranches, size: 11.5) {
+                                project.needsLogSelectionRestore = false
                                 project.logAllBranches.toggle()
                                 if project.logAllBranches { project.logRef = nil }
+                                store.schedulePersistLogState(for: project)
                                 project.loadLog(reset: true)
                             }
                             .padding(.top, 6)
@@ -1000,18 +1003,13 @@ struct LogPanel: View {
                                               onRemove: { project.removeLogAuthor($0) },
                                               onClearAll: { project.clearLogAuthors() })
                         }
-                        if let history = project.history {
-                            // The Log lists one file's commits (or its lines'); ✕ goes back to the branch.
-                            FilterChip(symbol: history.lines == nil ? "clock.arrow.circlepath" : "text.line.first.and.arrowtriangle.forward",
-                                       text: L("History of \(history.label)", "\(history.label) 的历史"),
-                                       help: history.rev == "HEAD" ? history.path : "\(history.path) @ \(history.rev.prefix(7))",
-                                       clearHelp: L("Back to the whole Log", "回到完整历史")) { store.endHistory() }
-                        }
                         if let label = project.logRefLabel {
                             // The Log lists a branch picked in the Git graph; ✕ goes back to the current branch.
                             FilterChip(symbol: "arrow.triangle.branch", text: label, help: label,
                                        clearHelp: L("Back to the current branch", "回到当前分支")) {
+                                project.needsLogSelectionRestore = false
                                 project.logRef = nil
+                                store.schedulePersistLogState(for: project)
                                 project.loadLog(reset: true)
                             }
                         }
@@ -1058,9 +1056,12 @@ struct LogPanel: View {
                                      },
                                      onDoubleClick: { _ in filesFocusToken += 1 },
                                      onLastRowAppear: { if project.hasMoreCommits { project.loadLog(reset: false) } },
+                                     revealToken: project.logRevealToken,
+                                     revealOnAppear: true,
                                      menu: { commit in store.logCommitMenu(commit, in: project) }) { commit, _, _ in
                             CommitRowView(commit: commit)
                         }
+                        .id(project.activeLogTabID)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1107,6 +1108,14 @@ struct LogPanel: View {
             }
         }
         .onChange(of: project.id) { _, _ in
+            searchWork?.cancel()
+            searchWork = nil
+            manualFilesHeight = nil
+            showAuthorPopover = false
+        }
+        .onChange(of: project.activeLogTabID) { _, _ in
+            searchWork?.cancel()
+            searchWork = nil
             manualFilesHeight = nil
             showAuthorPopover = false
         }
@@ -1120,8 +1129,8 @@ struct LogPanel: View {
         .onAppear {
             // A load already running (one asked for by the Git graph) is not replaced by a plain one.
             if project.commits.isEmpty {
-                if !project.isLoadingLog { project.loadLog(reset: true) }
-            } else if project.commitFiles.isEmpty {
+                if !project.isLoadingLog { store.loadActiveLogTab(for: project) }
+            } else if project.commitFiles.isEmpty && !project.selectedCommits.isEmpty {
                 store.commitSelectionChanged(project)
             }
         }
@@ -1129,9 +1138,152 @@ struct LogPanel: View {
 
     private func scheduleSearch() {
         searchWork?.cancel()
-        let work = DispatchWorkItem { project.loadLog(reset: true) }
+        let targetTabID = project.activeLogTabID
+        let work = DispatchWorkItem {
+            guard project.activeLogTabID == targetTabID else { return }
+            project.needsLogSelectionRestore = false
+            store.schedulePersistLogState(for: project)
+            project.loadLog(reset: true)
+        }
         searchWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+    }
+}
+
+private struct LogTabBar: View {
+    @Bindable var project: Project
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        let hasHistoryTabs = project.logTabs.contains { project.liveLogTabSnapshot(for: $0.id).history != nil }
+        VStack(spacing: 0) {
+            HStack(spacing: 4) {
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 4) {
+                            ForEach(project.logTabs) { tab in
+                                let snapshot = project.liveLogTabSnapshot(for: tab.id)
+                                let isActive = tab.id == project.activeLogTabID
+                                let canClose = project.logTabs.count > 1 || snapshot.isCustomized
+                                LogTabPill(
+                                    tab: snapshot,
+                                    isActive: isActive,
+                                    canClose: canClose,
+                                    isSoleTab: project.logTabs.count <= 1,
+                                    onSelect: { store.selectLogTab(tab.id, in: project) },
+                                    onClose: { store.closeLogTab(tab.id, in: project) }
+                                )
+                                .id(tab.id)
+                                .contextMenu {
+                                    Button(L("Duplicate Tab", "复制标签")) {
+                                        store.duplicateLogTab(tab.id, in: project)
+                                    }
+                                    if canClose {
+                                        Divider()
+                                        Button(project.logTabs.count > 1
+                                               ? L("Close Tab", "关闭标签")
+                                               : L("Reset Tab", "重置标签")) {
+                                            store.closeLogTab(tab.id, in: project)
+                                        }
+                                    }
+                                    if project.logTabs.count > 1 {
+                                        Button(L("Close Other Tabs", "关闭其他标签")) {
+                                            store.closeOtherLogTabs(keeping: tab.id, in: project)
+                                        }
+                                        if hasHistoryTabs {
+                                            Button(L("Close File History Tabs", "关闭全部文件历史标签")) {
+                                                store.closeHistoryLogTabs(in: project)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                    }
+                    .onAppear {
+                        proxy.scrollTo(project.activeLogTabID)
+                    }
+                    .onChange(of: project.activeLogTabID) { _, id in
+                        withAnimation(.snappy(duration: 0.18)) {
+                            proxy.scrollTo(id)
+                        }
+                    }
+                }
+
+                IconButton(symbol: "plus", help: L("New Log Tab", "新建历史标签"), size: 10.5) {
+                    store.newLogTab(in: project)
+                }
+                .padding(.trailing, 4)
+            }
+            .frame(height: UI.s(30))
+
+            Rectangle().fill(Color.difHairline).frame(height: 1)
+        }
+    }
+}
+
+private struct LogTabPill: View {
+    var tab: LogTab
+    var isActive: Bool
+    var canClose: Bool
+    var isSoleTab: Bool
+    var onSelect: () -> Void
+    var onClose: () -> Void
+
+    @State private var hovering = false
+    @State private var closeHovering = false
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Button(action: onSelect) {
+                HStack(spacing: 4) {
+                    Image(systemName: tab.symbolName)
+                        .font(.ui(size: 10, weight: .semibold))
+                        .foregroundStyle(isActive ? Color.difAccent : Color.difText3)
+                    Text(tab.displayTitle)
+                        .font(.ui(size: 11.5, weight: isActive ? .semibold : .medium))
+                        .foregroundStyle(isActive ? Color.difText : Color.difText2)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: UI.s(155), alignment: .leading)
+                }
+                .padding(.leading, 7)
+                .padding(.trailing, canClose ? 2 : 7)
+                .padding(.vertical, 3.5)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if canClose {
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.ui(size: 8, weight: .bold))
+                        .foregroundStyle(closeHovering ? Color.difText : Color.difText3)
+                        .frame(width: UI.s(15), height: UI.s(15))
+                        .background(
+                            RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                                .fill(closeHovering ? Color.difHover : Color.clear)
+                        )
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, 4)
+                .onHover { closeHovering = $0 }
+                .help(isSoleTab ? L("Reset Tab", "重置标签") : L("Close Tab", "关闭标签"))
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(isActive ? Color.difChip : (hovering ? Color.difHover : Color.clear))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(isActive ? Color.difHairline : Color.clear, lineWidth: 1)
+        )
+        .onHover { hovering = $0 }
+        .help(tab.tooltip)
     }
 }
 
@@ -1442,6 +1594,7 @@ private struct CommitDetail: View {
     private func toggle(_ row: ChangeRow) {
         guard row.file == nil else { return }
         if project.commitCollapsed.contains(row.id) { project.commitCollapsed.remove(row.id) } else { project.commitCollapsed.insert(row.id) }
+        store.schedulePersistLogState(for: project)
     }
 }
 

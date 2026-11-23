@@ -455,4 +455,91 @@ final class LogAuthorFilterRepositoryTests: XCTestCase {
         XCTAssertNotNil(conflictDoc.note)
         XCTAssertFalse(conflictDoc.right.lines.contains(where: { $0.contains("<<<<<<<") }))
     }
+
+    func testMailmapMergesAuthorsAndFiltersAcrossLogFileHistoryAndLineHistory() async throws {
+        let canonical = AuthorFilter(name: "Canonical Dev", email: "canon@example.com")
+        let aliasOne = AuthorFilter(name: "Alias One", email: "old1@example.com")
+        let aliasTwo = AuthorFilter(name: "Alias Two", email: "old2@example.com")
+        let other = AuthorFilter(name: "Other Dev", email: "other@example.com")
+
+        let repo = FileManager.default.temporaryDirectory.appendingPathComponent("dif-mailmap-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: repo) }
+
+        func runRepoGit(_ args: String...) throws {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: Git.executable)
+            process.arguments = ["-c", "commit.gpgsign=false", "-c", "log.mailmap=false"] + args
+            process.currentDirectoryURL = repo
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0, "git \(args.joined(separator: " "))")
+        }
+        func writeRepo(_ path: String, _ text: String) throws {
+            try Data(text.utf8).write(to: repo.appendingPathComponent(path))
+        }
+        func commitRepo(by author: AuthorFilter, message: String, date: String) throws {
+            try runRepoGit("-c", "user.name=\(author.name)", "-c", "user.email=\(author.email)",
+                           "commit", "-q", "-m", message, "--date=\(date)")
+        }
+
+        try runRepoGit("init", "-q", "-b", "main")
+        try writeRepo("app.txt", "line1\nline2\nline3\n")
+        try runRepoGit("add", "-A")
+        try commitRepo(by: aliasOne, message: "alias one initial", date: "2026-04-01T10:00:00Z")
+
+        try writeRepo("app.txt", "line1\nline2 other\nline3\n")
+        try runRepoGit("add", "-A")
+        try commitRepo(by: other, message: "other edit", date: "2026-04-02T10:00:00Z")
+
+        try writeRepo("app.txt", "line1\nline2 alias2\nline3\n")
+        try runRepoGit("add", "-A")
+        try commitRepo(by: aliasTwo, message: "alias two edit", date: "2026-04-03T10:00:00Z")
+
+        try writeRepo("extra.txt", "canon work\n")
+        try runRepoGit("add", "-A")
+        try commitRepo(by: canonical, message: "canonical add", date: "2026-04-04T10:00:00Z")
+
+        let mailmap = """
+        Canonical Dev <canon@example.com> Alias One <old1@example.com>
+        Canonical Dev <canon@example.com> <old2@example.com>
+        """
+        try writeRepo(".mailmap", mailmap)
+
+        // 1. Git.authors merges aliases into a single canonical author with combined commit count.
+        let authors = try await Git.authors(in: repo, allBranches: false)
+        XCTAssertEqual(authors, [
+            LogAuthor(author: canonical, commitCount: 3),
+            LogAuthor(author: other, commitCount: 1),
+        ])
+
+        // 2. Git.log displays canonical author/email on every mapped commit and filters all aliases.
+        let allLog = try await Git.log(in: repo, skip: 0, limit: 50, query: "", allBranches: false)
+        XCTAssertEqual(allLog.count, 4)
+        XCTAssertEqual(allLog.filter { AuthorFilter.from($0) == canonical }.count, 3)
+
+        let filteredLog = try await Git.log(in: repo, skip: 0, limit: 50, query: "", authors: [canonical], allBranches: false)
+        XCTAssertEqual(filteredLog.map(\.subject), ["canonical add", "alias two edit", "alias one initial"])
+
+        let searchedByAuthor = try await Git.log(in: repo, skip: 0, limit: 50, query: "Canonical Dev", allBranches: false)
+        XCTAssertEqual(searchedByAuthor.map(\.subject), ["canonical add", "alias two edit", "alias one initial"])
+
+        // 3. Git.fileHistory merges and filters mapped commits consistently.
+        let fileFiltered = try await Git.fileHistory("app.txt", in: repo, skip: 0, limit: 50, authors: [canonical])
+        XCTAssertEqual(fileFiltered.commits.map(\.subject), ["alias two edit", "alias one initial"])
+        XCTAssertTrue(fileFiltered.commits.allSatisfy { AuthorFilter.from($0) == canonical })
+
+        // 4. Git.lineHistory and lineHistoryEntries respect .mailmap when filtering and displaying commits.
+        let lineFiltered = try await Git.lineHistory("app.txt", lines: 2...2, rev: "HEAD", in: repo,
+                                                     skip: 0, limit: 50, authors: [canonical])
+        XCTAssertEqual(lineFiltered.map(\.subject), ["alias two edit", "alias one initial"])
+        XCTAssertTrue(lineFiltered.allSatisfy { AuthorFilter.from($0) == canonical })
+
+        let lineEntries = try await Git.lineHistoryEntries("app.txt", lines: 2...2, rev: "HEAD", in: repo,
+                                                           skip: 0, limit: 50, authors: [canonical])
+        XCTAssertEqual(lineEntries.map(\.commit.subject), ["alias two edit", "alias one initial"])
+        XCTAssertTrue(lineEntries.allSatisfy { AuthorFilter.from($0.commit) == canonical })
+    }
 }

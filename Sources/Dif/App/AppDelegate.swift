@@ -179,6 +179,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         store.settings.save()
         store.flushAllPersistedAIGroups()
+        store.flushAllPersistedLogStates()
         store.terminals.terminateAll()
         if AppEnvironment.hasLSP {
             // Best-effort clean shutdown of language servers without hanging app quit.

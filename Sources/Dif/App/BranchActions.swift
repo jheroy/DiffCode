@@ -745,7 +745,16 @@ extension AppStore {
     private func syncTagSelectionAfterRename(_ oldName: String, to newName: String, in project: Project) {
         let oldRef = "refs/tags/\(oldName)"
         let newRef = "refs/tags/\(newName)"
-        if project.logRef == oldRef { project.logRef = newRef }
+        var touched = false
+        if project.logRef == oldRef {
+            project.logRef = newRef
+            touched = true
+        }
+        for i in project.logTabs.indices where project.logTabs[i].logRef == oldRef {
+            project.logTabs[i].logRef = newRef
+            touched = true
+        }
+        if touched { schedulePersistLogState(for: project) }
         if gitGraph.projectID == project.id, gitGraph.scope == .ref(oldRef) {
             gitGraph.scope = .ref(newRef)
             gitGraph.selectedBranchID = "ref:" + newRef
@@ -754,7 +763,16 @@ extension AppStore {
 
     private func syncTagSelectionAfterDelete(_ name: String, in project: Project) {
         let deletedRef = "refs/tags/\(name)"
-        if project.logRef == deletedRef { project.logRef = nil }
+        var touched = false
+        if project.logRef == deletedRef {
+            project.logRef = nil
+            touched = true
+        }
+        for i in project.logTabs.indices where project.logTabs[i].logRef == deletedRef {
+            project.logTabs[i].logRef = nil
+            touched = true
+        }
+        if touched { schedulePersistLogState(for: project) }
         if gitGraph.projectID == project.id, gitGraph.scope == .ref(deletedRef) {
             gitGraph.scope = .all
             gitGraph.selectedBranchID = "scope:all"
