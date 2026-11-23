@@ -1211,6 +1211,8 @@ final class LSPTests: XCTestCase {
                 line = (params.get("position") or {}).get("line", 0)
                 if line == 99:
                     send({"jsonrpc": "2.0", "id": req_id, "result": None})
+                elif line == 97:
+                    send({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32603, "message": "busy"}})
                 else:
                     send({
                         "jsonrpc": "2.0",
@@ -1248,8 +1250,15 @@ final class LSPTests: XCTestCase {
         XCTAssertEqual(highlights[1].kind, .read)
         XCTAssertEqual(highlights[1].range.start, LSPPosition(line: 3, character: 5))
 
-        let nullHighlights = await manager.documentHighlight(fileURL: fileURL, line: 99, character: 0)
-        XCTAssertTrue(nullHighlights.isEmpty)
+        let nullResult = await manager.documentHighlightResult(fileURL: fileURL, line: 99, character: 0)
+        XCTAssertEqual(nullResult, .highlights([]))
+
+        let errResult = await manager.documentHighlightResult(fileURL: fileURL, line: 97, character: 0)
+        XCTAssertEqual(errResult, .failed)
+
+        await manager.setEnabled(false)
+        let disabledResult = await manager.documentHighlightResult(fileURL: fileURL, line: 2, character: 2)
+        XCTAssertEqual(disabledResult, .unavailable)
 
         await manager.shutdownAll()
     }

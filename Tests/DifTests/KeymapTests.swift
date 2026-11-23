@@ -374,4 +374,227 @@ final class KeymapTests: XCTestCase {
         let hunk2Row = container.canvas.hunkRow(2)
         XCTAssertEqual(container.canvas.hunkIndex(at: CGPoint(x: 200, y: (CGFloat(hunk2Row) + 0.5) * lh)), 2)
     }
+
+    func testSymbolOccurrenceNavigatorMapHighlightsToSnapshotRespectsScope() {
+        let diskLines = [
+            "package demo",
+            "func alpha() int {",
+            "\tx := 1",
+            "\ty := x + 2",
+            "\treturn x + y",
+            "}",
+            "func beta() int {",
+            "\tx := 10",
+            "\treturn x",
+            "}",
+        ]
+        let snapshotLines = [
+            "package demo",
+            "// added comment shifting lines",
+            "func alpha() int {",
+            "\tx := 99",
+            "\ty := x + 2",
+            "\treturn x + y",
+            "}",
+            "func beta() int {",
+            "\tx := 10",
+            "\treturn x",
+            "}",
+        ]
+        // gopls only returned `x` inside `alpha()`, never `beta()`.
+        let alphaHighlights = [
+            LSPDocumentHighlight(range: LSPRange(start: LSPPosition(line: 2, character: 1), end: LSPPosition(line: 2, character: 2)), kind: .write),
+            LSPDocumentHighlight(range: LSPRange(start: LSPPosition(line: 3, character: 6), end: LSPPosition(line: 3, character: 7)), kind: .read),
+            LSPDocumentHighlight(range: LSPRange(start: LSPPosition(line: 4, character: 8), end: LSPPosition(line: 4, character: 9)), kind: .read),
+        ]
+        let mapped = SymbolOccurrenceNavigator.mapHighlightsToSnapshot(
+            alphaHighlights,
+            diskLines: diskLines,
+            snapshotLines: snapshotLines,
+            symbolName: "x",
+            side: .left
+        )
+        XCTAssertEqual(mapped, [
+            SearchMatch(side: .left, line: 3, range: 1..<2),
+            SearchMatch(side: .left, line: 4, range: 6..<7),
+            SearchMatch(side: .left, line: 5, range: 8..<9),
+        ])
+    }
+
+    @MainActor
+    func testViewerModelStepSymbolOccurrenceRespectsGoScopeAndNeverFallsBackOnErrorOrEmpty() async throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dif-keymap-lsp-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let canonicalDir = LSPURI.canonicalFileURL(dir)
+        let scriptURL = canonicalDir.appendingPathComponent("mock_scope_lsp.py")
+        let fileURL = canonicalDir.appendingPathComponent("main.go")
+        let source = """
+        package main
+        import "fmt"
+        func alpha() int {
+        \tx := 1
+        \tif true {
+        \t\tx := 2
+        \t\t_ = x
+        \t}
+        \tfmt.Println(x)
+        \treturn x
+        }
+        func beta() int {
+        \tx := 10
+        \treturn x
+        }
+        """
+        try source.write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let mockScript = """
+        #!/usr/bin/env python3
+        import json, sys
+
+        def send(msg):
+            body = json.dumps(msg).encode("utf-8")
+            header = f"Content-Length: {len(body)}\\r\\n\\r\\n".encode("ascii")
+            sys.stdout.buffer.write(header + body)
+            sys.stdout.buffer.flush()
+
+        def read_msg():
+            headers = {}
+            while True:
+                line = sys.stdin.buffer.readline()
+                if not line:
+                    return None
+                if line in (b"\\r\\n", b"\\n"):
+                    break
+                if b":" in line:
+                    k, v = line.decode("ascii").split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+            length = int(headers.get("content-length", "0"))
+            body = sys.stdin.buffer.read(length)
+            return json.loads(body.decode("utf-8")) if body else None
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            method = msg.get("method")
+            req_id = msg.get("id")
+            params = msg.get("params") or {}
+            if method == "initialize":
+                send({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "capabilities": {
+                            "textDocumentSync": 1,
+                            "documentHighlightProvider": True,
+                        }
+                    },
+                })
+            elif method == "textDocument/documentHighlight":
+                pos = params.get("position") or {}
+                line = pos.get("line", 0)
+                char = pos.get("character", 0)
+                if line in (3, 8, 9) and char in (1, 13, 8):
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": [
+                            {"range": {"start": {"line": 3, "character": 1}, "end": {"line": 3, "character": 2}}, "kind": 3},
+                            {"range": {"start": {"line": 8, "character": 13}, "end": {"line": 8, "character": 14}}, "kind": 2},
+                            {"range": {"start": {"line": 9, "character": 8}, "end": {"line": 9, "character": 9}}, "kind": 2},
+                        ],
+                    })
+                elif line == 8 and char in (1, 2, 3): # fmt -> returns `"fmt"` on line 1 (7..12) and `fmt` on line 8 (1..4)
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": [
+                            {"range": {"start": {"line": 1, "character": 7}, "end": {"line": 1, "character": 12}}, "kind": 1},
+                            {"range": {"start": {"line": 8, "character": 1}, "end": {"line": 8, "character": 4}}, "kind": 2},
+                        ],
+                    })
+                elif line == 12: # simulate busy/error
+                    send({"jsonrpc": "2.0", "id": req_id, "error": {"code": -32603, "message": "busy"}})
+                else:
+                    send({"jsonrpc": "2.0", "id": req_id, "result": []})
+            elif method == "shutdown":
+                send({"jsonrpc": "2.0", "id": req_id, "result": None})
+            elif method == "exit":
+                break
+        """
+        try mockScript.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+
+        let mockResolved = LSPResolvedServer(
+            descriptor: LSPServerRegistry.go,
+            executablePath: "/usr/bin/python3",
+            arguments: [scriptURL.path],
+            environment: ProcessInfo.processInfo.environment
+        )
+        let manager = LSPManager(
+            isEnabled: true,
+            serverOverrides: [LSPServerRegistry.go.id: mockResolved]
+        )
+
+        let suiteName = "KeymapTests.LSPScope.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = Settings(defaults: defaults)
+        settings.vimMode = true
+        let viewer = ViewerModel()
+        viewer.settings = settings
+        viewer.lspManager = manager
+        var toasts: [String] = []
+        viewer.onToast = { toasts.append($0) }
+
+        let container = CodeScrollContainer(frame: NSRect(x: 0, y: 0, width: 900, height: 400))
+        container.layoutSubtreeIfNeeded()
+        viewer.attach(container)
+
+        let lines = source.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let doc = DiffDocument(left: TextBuffer(lines: lines), right: TextBuffer(lines: lines), hunks: [], language: .go, isPlainFile: true)
+        viewer.request = DiffRequest(root: canonicalDir, path: "main.go", kind: nil, source: .file)
+        viewer.document = doc
+        container.show(doc, mode: .sideBySide, preserveScroll: false)
+        viewer.syncLSPForCurrentDocument()
+
+        // 1. Outer `x` (line 3, col 1) must cycle ONLY across lines 3, 8, 9 (never shadowed line 5/6 or beta's 12/13).
+        container.canvas.placeCaret(line: 3, column: 1)
+        viewer.stepSymbolOccurrence(forward: true)
+        await viewer.symbolHighlightTask?.value
+        XCTAssertEqual(container.canvas.activeCaretPosition(), TextPosition(row: 8, column: 13))
+        XCTAssertEqual(container.canvas.matches.map(\.line), [3, 8, 9])
+
+        viewer.stepSymbolOccurrence(forward: true)
+        XCTAssertEqual(container.canvas.activeCaretPosition(), TextPosition(row: 9, column: 8))
+        viewer.stepSymbolOccurrence(forward: true)
+        XCTAssertEqual(container.canvas.activeCaretPosition(), TextPosition(row: 3, column: 1))
+
+        // 2. Clamped column at upper edge of `fmt` (col 4 on `.` in `fmt.Println`) hits `fmt` and cycles onto `"fmt"` cleanly.
+        container.canvas.placeCaret(line: 8, column: 4)
+        viewer.stepSymbolOccurrence(forward: true)
+        await viewer.symbolHighlightTask?.value
+        XCTAssertEqual(container.canvas.activeCaretPosition(), TextPosition(row: 1, column: 7))
+        viewer.stepSymbolOccurrence(forward: true)
+        XCTAssertEqual(container.canvas.activeCaretPosition(), TextPosition(row: 8, column: 1))
+
+        // 3. Empty `[]` from LSP (shadowed line 5) must NOT fall back to whole-word cross-scope matches.
+        container.canvas.placeCaret(line: 5, column: 2)
+        viewer.stepSymbolOccurrence(forward: true)
+        await viewer.symbolHighlightTask?.value
+        XCTAssertEqual(container.canvas.activeCaretPosition(), TextPosition(row: 5, column: 2))
+
+        // 4. RPC failure (line 12) must NOT fall back to whole-word cross-scope matches and emits busy toast.
+        container.canvas.placeCaret(line: 12, column: 1)
+        viewer.stepSymbolOccurrence(forward: true)
+        await viewer.symbolHighlightTask?.value
+        XCTAssertEqual(container.canvas.activeCaretPosition(), TextPosition(row: 12, column: 1))
+        XCTAssertFalse(toasts.isEmpty)
+
+        await manager.shutdownAll()
+    }
 }

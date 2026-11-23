@@ -9,6 +9,7 @@ final class Settings {
 
     static let uiFontRange: ClosedRange<Double> = 11...17
     static let terminalFontRange: ClosedRange<Double> = 9...24
+    static let stickyLinesRange: ClosedRange<Int> = 1...10
     /// The sidebar holds the project list and the file tree, so it may grow wider than a plain source list.
     static let sidebarRange: ClosedRange<Double> = 200...480
     /// The commit message box, including its button row; dragged by the line above it.
@@ -142,6 +143,12 @@ final class Settings {
     var vimMode: Bool
     /// Show relative line numbers in the code gutter when Vim mode is enabled.
     var vimRelativeLineNumbers: Bool
+    /// Custom Vim cursor color as `#RRGGBB` hex, or `nil` to follow the active theme's text color.
+    var vimCursorColorHex: String?
+    /// Pin enclosing function/type headers at the top of the code viewer while scrolling (GoLand Sticky Lines).
+    var stickyLines: Bool
+    /// Maximum number of sticky header lines pinned simultaneously.
+    var stickyLinesMaxCount: Int
     /// Show the Beyond Compare-style bottom inline line diff bar under the code viewer.
     var showLineDiffBar: Bool
     /// Automatically open the 3-way merge window whenever Git stops at merge/rebase/cherry-pick/stash conflicts.
@@ -298,6 +305,10 @@ final class Settings {
         followFile = defaults.object(forKey: "followFile") as? Bool ?? false
         vimMode = defaults.object(forKey: "vimMode") as? Bool ?? true
         vimRelativeLineNumbers = defaults.object(forKey: "vimRelativeLineNumbers") as? Bool ?? false
+        vimCursorColorHex = NSColor.normalizedHexColor(defaults.string(forKey: "vimCursorColor"))
+        stickyLines = defaults.object(forKey: "stickyLines") as? Bool ?? true
+        let maxSticky = defaults.object(forKey: "stickyLinesMaxCount") as? Int ?? StickyLinesEngine.defaultMaxLines
+        stickyLinesMaxCount = min(Self.stickyLinesRange.upperBound, max(Self.stickyLinesRange.lowerBound, maxSticky))
         showLineDiffBar = defaults.object(forKey: "showLineDiffBar") as? Bool ?? true
         autoOpenThreeWayMerge = defaults.object(forKey: "autoOpenThreeWayMerge") as? Bool ?? true
         lspJumpOpenMode = LSPJumpOpenMode(rawValue: defaults.string(forKey: "lspJumpOpenMode") ?? "") ?? .file
@@ -345,6 +356,9 @@ final class Settings {
         defaults.set(followFile, forKey: "followFile")
         defaults.set(vimMode, forKey: "vimMode")
         defaults.set(vimRelativeLineNumbers, forKey: "vimRelativeLineNumbers")
+        defaults.set(NSColor.normalizedHexColor(vimCursorColorHex), forKey: "vimCursorColor")
+        defaults.set(stickyLines, forKey: "stickyLines")
+        defaults.set(stickyLinesMaxCount, forKey: "stickyLinesMaxCount")
         defaults.set(showLineDiffBar, forKey: "showLineDiffBar")
         defaults.set(autoOpenThreeWayMerge, forKey: "autoOpenThreeWayMerge")
         defaults.set(lspJumpOpenMode.rawValue, forKey: "lspJumpOpenMode")

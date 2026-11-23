@@ -340,6 +340,15 @@ enum DebugHooks {
             let canvas = store.viewer.container?.canvas
             let text = canvas?.selectedText() ?? "<none>"
             FileHandle.standardError.write(Data("selection: \(text.debugDescription) scrollY=\(store.viewer.container?.scrollY ?? -1) popup=\(String(describing: store.popup)) sidebar=\(Int(store.settings.sidebarWidth)) list=\(Int(store.settings.listWidth)) term=\(Int(store.settings.terminalHeight)) tab=\(store.currentProject?.tab.rawValue ?? "-") browsed=\(store.currentProject?.browsedPath ?? "-") change=\(store.currentProject?.selectedChangeID ?? "-") focus=\((store.window?.firstResponder as? NSView)?.identifier?.rawValue ?? store.window?.firstResponder.map { String(describing: type(of: $0)) } ?? "nil") tree=\(store.currentProject?.treeSelectedID ?? "-") unified=\(store.settings.unified) changes=\(store.currentProject?.status.changes.count ?? -1) hunk=\(String(describing: store.viewer.focusedHunk)) file=\(store.viewer.request?.path ?? "-") hunks=\(store.viewer.hunkCount) multi=\(store.currentProject?.selectedChangeIDs.count ?? 0) undo=\(store.undoStack.count) toast=\(store.toast ?? "-") dialog=\(store.dialog?.title ?? "-") included=\(store.currentProject?.includedChanges.count ?? -1) message=\(store.currentProject?.commitMessage.debugDescription ?? "-") lastCommit=\(store.currentProject?.lastCommit?.shortHash ?? "-") termVisible=\(store.terminals.isVisible)\n".utf8))
+        case "sticky":
+            store.viewer.setStickyLines(argument != "off")
+        case "stickystate":
+            if let canvas = store.viewer.container?.canvas {
+                let vis = canvas.visibleStickyLines
+                let leftDesc = vis.left.map { "\($0.scope.sourceLine + 1)@\(Int($0.y))" }.joined(separator: ",")
+                let rightDesc = vis.right.map { "\($0.scope.sourceLine + 1)@\(Int($0.y))" }.joined(separator: ",")
+                FileHandle.standardError.write(Data("sticky: on=\(canvas.stickyLinesEnabled) max=\(canvas.stickyLinesMaxCount) leftH=\(Int(canvas.stickyHeight(for: .left))) rightH=\(Int(canvas.stickyHeight(for: .right))) left=[\(leftDesc)] right=[\(rightDesc)]\n".utf8))
+            }
         case "autoscroll":
             // "autoscroll:5" or "autoscroll:5:100" — scrolls for that many seconds at 12 (or the given)
             // points per 120 Hz tick, driven by the run loop like a real scroll.

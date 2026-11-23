@@ -1072,4 +1072,125 @@ final class VimTests: XCTestCase {
         XCTAssertEqual(container.canvas.activeCaretPosition()?.row, 119)
         XCTAssertFalse(store.jumpHistory.canGoForward)
     }
+
+    // MARK: 9. Vim Caret Geometry on Tabs & Custom Cursor Color
+
+    @MainActor
+    func testVimCaretOnTabUsesSingleTrailingCharWidth() throws {
+        let prevAssumeKey = CodeCanvasView.assumeKeyWindow
+        CodeCanvasView.assumeKeyWindow = true
+        defer { CodeCanvasView.assumeKeyWindow = prevAssumeKey }
+
+        let data = Data("\tregistry.Register()\nab\tcd\n".utf8)
+        let editable = try XCTUnwrap(TextCodec.decodeForEditing(data))
+        let doc = DiffDocument(left: .empty, right: TextBuffer(lines: editable.lines), hunks: [], language: .go, isPlainFile: true)
+        doc.editing = EditInfo(format: editable.format, crlf: editable.crlf, fingerprint: TextCodec.fingerprint(data))
+        let session = try XCTUnwrap(EditorSession(document: doc, root: URL(fileURLWithPath: "/tmp"), path: "tab.go", ignoreWhitespace: false))
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 300),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let container = CodeScrollContainer(frame: NSRect(x: 0, y: 0, width: 600, height: 300))
+        window.contentView = container
+        container.layoutSubtreeIfNeeded()
+
+        let canvas = container.canvas
+        canvas.vimModeEnabled = true
+        canvas.setDocument(doc, mode: .single)
+        canvas.editor = session
+        window.makeFirstResponder(canvas)
+
+        let cw = canvas.codeFont.charWidth
+
+        // Normal mode on leading `\t` (spans 4 columns: textInset .. textInset + 4*cw):
+        // block cursor sits in the trailing single-character cell [textInset + 3*cw, textInset + 4*cw].
+        canvas.placeCaret(line: 0, column: 0)
+        canvas.flush()
+        XCTAssertTrue(canvas.isCaretShown)
+        XCTAssertEqual(canvas.caretRect.width, cw, accuracy: 1.0)
+        XCTAssertEqual(canvas.caretRect.minX, canvas.textInset + cw * 3, accuracy: 1.0)
+
+        // Compare with non-tab `r` right after the tab at column 1: starts at textInset + 4*cw.
+        canvas.placeCaret(line: 0, column: 1)
+        canvas.flush()
+        XCTAssertEqual(canvas.caretRect.minX, canvas.textInset + cw * 4, accuracy: 1.0)
+        XCTAssertEqual(canvas.caretRect.width, cw, accuracy: 1.0)
+
+        // Partial tab after 2 chars (`ab\tcd`, column 2 spans 2*cw .. 4*cw): trailing cell is at 3*cw.
+        canvas.placeCaret(line: 1, column: 2)
+        canvas.flush()
+        XCTAssertEqual(canvas.caretRect.minX, canvas.textInset + cw * 3, accuracy: 1.0)
+        XCTAssertEqual(canvas.caretRect.width, cw, accuracy: 1.0)
+
+        // Visual mode underline on `\t` also occupies only the trailing single-character cell.
+        canvas.placeCaret(line: 0, column: 0)
+        XCTAssertTrue(canvas.handleVimKey(VimKey("v")))
+        canvas.flush()
+        XCTAssertEqual(canvas.caretRect.minX, canvas.textInset + cw * 3, accuracy: 1.0)
+        XCTAssertEqual(canvas.caretRect.width, cw, accuracy: 1.0)
+
+        // Insert mode (`i` before `\t`) keeps the vertical bar at the start of the tab (`textInset`).
+        XCTAssertTrue(canvas.handleVimKey(VimKey(.escape)))
+        XCTAssertTrue(canvas.handleVimKey(VimKey("i")))
+        canvas.flush()
+        XCTAssertEqual(canvas.caretRect.width, 1.5, accuracy: 0.1)
+        XCTAssertEqual(canvas.caretRect.minX, canvas.textInset, accuracy: 1.0)
+    }
+
+    @MainActor
+    func testVimCursorColorPersistenceAndCanvasRendering() throws {
+        let suite = "com.nanshanbei.DiffCode.tests.vimcursor.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let initial = Settings(defaults: defaults)
+        XCTAssertNil(initial.vimCursorColorHex)
+
+        initial.vimCursorColorHex = "ff6b00"
+        initial.save()
+        let reloaded = Settings(defaults: defaults)
+        XCTAssertEqual(reloaded.vimCursorColorHex, "#FF6B00")
+
+        reloaded.vimCursorColorHex = nil
+        reloaded.save()
+        let cleared = Settings(defaults: defaults)
+        XCTAssertNil(cleared.vimCursorColorHex)
+
+        let prevAssumeKey = CodeCanvasView.assumeKeyWindow
+        CodeCanvasView.assumeKeyWindow = true
+        defer { CodeCanvasView.assumeKeyWindow = prevAssumeKey }
+
+        let doc = DiffDocument(left: .empty, right: TextBuffer(lines: ["hello"]), hunks: [], language: .plain, isPlainFile: true)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 200),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let container = CodeScrollContainer(frame: NSRect(x: 0, y: 0, width: 400, height: 200))
+        window.contentView = container
+        let canvas = container.canvas
+        canvas.vimModeEnabled = true
+        canvas.setDocument(doc, mode: .single)
+        window.makeFirstResponder(canvas)
+        canvas.placeCaret(line: 0, column: 0)
+
+        let custom = try XCTUnwrap(NSColor.fromHex("#FF6B00")).cgColor
+        canvas.vimCursorColor = custom
+        canvas.flush()
+
+        let normalColor = try XCTUnwrap(canvas.caretColor?.converted(to: CGColorSpace(name: CGColorSpace.sRGB)!, intent: .defaultIntent, options: nil))
+        let normalComps = try XCTUnwrap(normalColor.components)
+        XCTAssertEqual(normalComps[0], 1.0, accuracy: 0.02)
+        XCTAssertEqual(normalComps[1], CGFloat(0x6B) / 255.0, accuracy: 0.02)
+        XCTAssertEqual(normalComps[2], 0.0, accuracy: 0.02)
+        XCTAssertEqual(normalComps[3], 0.42, accuracy: 0.02)
+
+        canvas.vimCursorColor = nil
+        canvas.flush()
+        XCTAssertNotNil(canvas.caretColor)
+    }
 }

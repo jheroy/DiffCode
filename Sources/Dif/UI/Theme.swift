@@ -32,6 +32,31 @@ extension NSColor {
     static func dyn(_ light: UInt32, _ dark: UInt32, lightAlpha: CGFloat = 1, darkAlpha: CGFloat = 1) -> NSColor {
         dynamic(light: NSColor(hex: light, alpha: lightAlpha), dark: NSColor(hex: dark, alpha: darkAlpha))
     }
+
+    static func parseHexColor(_ raw: String) -> UInt32? {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("#") { s.removeFirst() }
+        guard s.count == 6, let value = UInt32(s, radix: 16) else { return nil }
+        return value
+    }
+
+    static func normalizedHexColor(_ raw: String?) -> String? {
+        guard let raw, let value = parseHexColor(raw) else { return nil }
+        return String(format: "#%06X", value)
+    }
+
+    static func fromHex(_ hex: String) -> NSColor? {
+        guard let value = parseHexColor(hex) else { return nil }
+        return NSColor(hex: value)
+    }
+
+    var hexString: String? {
+        guard let srgb = usingColorSpace(.sRGB) else { return nil }
+        let r = Int((min(1, max(0, srgb.redComponent)) * 255).rounded())
+        let g = Int((min(1, max(0, srgb.greenComponent)) * 255).rounded())
+        let b = Int((min(1, max(0, srgb.blueComponent)) * 255).rounded())
+        return String(format: "#%02X%02X%02X", r, g, b)
+    }
 }
 
 /// Chrome colours, resolved automatically for light and dark appearance.
@@ -168,6 +193,10 @@ struct CanvasTheme {
     let separator: CGColor
     let rulerThumb: CGColor
     let accent: CGColor
+    let stickyBg: CGColor
+    let stickyHoverBg: CGColor
+    let stickyBorder: CGColor
+    let stickyShadow: CGColor
 
     private static func c(_ hex: UInt32, _ alpha: CGFloat = 1) -> CGColor { NSColor(hex: hex, alpha: alpha).cgColor }
 
@@ -338,7 +367,11 @@ struct CanvasTheme {
         focusLine: c(0xFFFFFF, 0.06),
         separator: c(0x393B40),
         rulerThumb: c(0xFFFFFF, 0.12),
-        accent: c(0x548AF7)
+        accent: c(0x548AF7),
+        stickyBg: c(0x23252A),
+        stickyHoverBg: c(0x2D3038),
+        stickyBorder: c(0x393B40),
+        stickyShadow: c(0x000000, 0.34)
     )
 
     static let light = CanvasTheme(
@@ -364,7 +397,11 @@ struct CanvasTheme {
         focusLine: c(0x000000, 0.045),
         separator: c(0xEBECF0),
         rulerThumb: c(0x000000, 0.10),
-        accent: c(0x3574F0)
+        accent: c(0x3574F0),
+        stickyBg: c(0xF9FAFC),
+        stickyHoverBg: c(0xEEF2F8),
+        stickyBorder: c(0xDFE2E8),
+        stickyShadow: c(0x000000, 0.10)
     )
 
     func line(_ kind: Hunk.Kind) -> CGColor {

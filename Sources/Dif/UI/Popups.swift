@@ -1669,6 +1669,23 @@ struct SettingsView: View {
             settings.save()
             store.viewer.setVimRelativeLineNumbers(enabled)
         }
+        .onChange(of: settings.vimCursorColorHex) { _, hex in
+            settings.save()
+            store.viewer.setVimCursorColorHex(hex)
+        }
+        .onChange(of: settings.stickyLines) { _, enabled in
+            settings.save()
+            store.viewer.setStickyLines(enabled)
+        }
+        .onChange(of: settings.stickyLinesMaxCount) { _, count in
+            settings.save()
+            store.viewer.setStickyLinesMaxCount(count)
+        }
+        .onDisappear {
+            if NSColorPanel.sharedColorPanelExists && NSColorPanel.shared.isVisible {
+                NSColorPanel.shared.close()
+            }
+        }
         .onChange(of: settings.aiCommitProvider) { _, provider in
             if !AppEnvironment.isAppStore {
                 store.loadAgentModels(for: provider, forceRefresh: false)
@@ -1807,6 +1824,72 @@ struct SettingsView: View {
                         .toggleStyle(.switch)
                         .controlSize(.small)
                         .labelsHidden()
+                }
+                .padding(.leading, 12)
+                row(L("Cursor color", "光标颜色")) {
+                    HStack(spacing: 8) {
+                        if let hex = settings.vimCursorColorHex {
+                            Text(hex)
+                                .font(.ui(size: 11, design: .monospaced))
+                                .foregroundStyle(Color.difText3)
+                            Button(L("Reset", "恢复默认")) {
+                                settings.vimCursorColorHex = nil
+                            }
+                            .buttonStyle(.plain)
+                            .font(.ui(size: 11.5))
+                            .foregroundStyle(Color.difAccent)
+                        } else {
+                            Text(L("Theme default", "跟随主题"))
+                                .font(.ui(size: 11.5))
+                                .foregroundStyle(Color.difText3)
+                        }
+                        ColorPicker(
+                            "",
+                            selection: vimCursorColorBinding(settings: settings, previewTheme: previewTheme),
+                            supportsOpacity: false
+                        )
+                        .labelsHidden()
+                    }
+                }
+                .padding(.leading, 12)
+            }
+        }
+        .padding(.top, 4)
+        VStack(alignment: .leading, spacing: 10) {
+            sectionHeader(L("Sticky Lines", "粘性行"))
+            VStack(alignment: .leading, spacing: 4) {
+                row(L("Show sticky lines", "显示粘性行 (Sticky Lines)")) {
+                    Toggle("", isOn: $settings.stickyLines)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .labelsHidden()
+                }
+                Text(L("Pin enclosing functions, methods, structs and classes while scrolling",
+                       "滚动时在顶部固定当前所在的函数、方法、结构体或类声明"))
+                    .font(.ui(size: 11.5))
+                    .foregroundStyle(Color.difText3)
+            }
+            if settings.stickyLines {
+                row(L("Maximum pinned lines", "最多固定行数")) {
+                    HStack(spacing: 8) {
+                        IconButton(symbol: "minus", help: L("Decrease", "减少")) {
+                            settings.stickyLinesMaxCount = max(
+                                Settings.stickyLinesRange.lowerBound,
+                                settings.stickyLinesMaxCount - 1
+                            )
+                        }
+                        .disabled(settings.stickyLinesMaxCount <= Settings.stickyLinesRange.lowerBound)
+                        Text("\(settings.stickyLinesMaxCount)")
+                            .font(.ui(size: 12.5, design: .rounded))
+                            .frame(width: UI.s(36))
+                        IconButton(symbol: "plus", help: L("Increase", "增加")) {
+                            settings.stickyLinesMaxCount = min(
+                                Settings.stickyLinesRange.upperBound,
+                                settings.stickyLinesMaxCount + 1
+                            )
+                        }
+                        .disabled(settings.stickyLinesMaxCount >= Settings.stickyLinesRange.upperBound)
+                    }
                 }
                 .padding(.leading, 12)
             }
@@ -2068,6 +2151,22 @@ struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    private func vimCursorColorBinding(settings: Settings, previewTheme: CanvasTheme) -> Binding<Color> {
+        Binding(
+            get: {
+                if let hex = settings.vimCursorColorHex, let ns = NSColor.fromHex(hex) {
+                    return Color(nsColor: ns)
+                }
+                return Color(nsColor: NSColor(cgColor: previewTheme.text) ?? .textColor)
+            },
+            set: { newColor in
+                if let hex = NSColor(newColor).hexString {
+                    settings.vimCursorColorHex = hex
+                }
+            }
+        )
     }
 
     private func row<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {

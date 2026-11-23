@@ -550,24 +550,36 @@ actor LSPManager {
         )
     }
 
-    /// Resolves `textDocument/documentHighlight` at a 0-based `(line, character)` UTF-16 position.
-    func documentHighlight(
+    /// Resolves `textDocument/documentHighlight` at a 0-based `(line, character)` UTF-16 position,
+    /// distinguishing valid highlights from unavailability (`unavailable`) vs transient RPC failure/timeout (`failed`).
+    func documentHighlightResult(
         uri: String,
         line: Int,
         character: Int,
         text: String? = nil,
         language: LanguageSpec? = nil,
         workspaceRoot: URL? = nil
-    ) async -> [LSPDocumentHighlight] {
-        guard isEffectivelyEnabled else { return [] }
+    ) async -> LSPDocumentHighlightResult {
+        guard isEffectivelyEnabled else { return .unavailable }
         let normalizedURI = LSPURI.normalize(uri)
+        let fileURL = LSPURI.fileURL(from: normalizedURI)
+        let descriptor = language.flatMap { LSPServerRegistry.descriptor(for: $0) }
+            ?? fileURL.flatMap { LSPServerRegistry.descriptor(for: LanguageSpec.detect(path: $0.path)) }
+        guard let descriptor else { return .unavailable }
+        if serverOverrides[descriptor.id] == nil, unavailableServerIDs.contains(descriptor.id) {
+            return .unavailable
+        }
+
         guard let (key, server) = await ensureDocumentOpen(
             normalizedURI: normalizedURI,
             text: text,
             language: language,
             workspaceRoot: workspaceRoot
-        ), server.capabilities.documentHighlightProvider else {
-            return []
+        ) else {
+            return unavailableServerIDs.contains(descriptor.id) ? .unavailable : .failed
+        }
+        guard server.capabilities.documentHighlightProvider else {
+            return .unavailable
         }
 
         servers[key]?.lastActivity = .now
@@ -583,11 +595,54 @@ actor LSPManager {
             let response = try await server.transport.request(
                 method: "textDocument/documentHighlight",
                 params: params,
-                timeout: .seconds(1)
+                timeout: .seconds(10)
             )
             servers[key]?.lastActivity = .now
-            return LSPDocumentHighlightDecoder.decode(from: response)
+            return .highlights(LSPDocumentHighlightDecoder.decode(from: response))
         } catch {
+            return .failed
+        }
+    }
+
+    /// Convenience `fileURL` overload for `documentHighlightResult`.
+    func documentHighlightResult(
+        fileURL: URL,
+        line: Int,
+        character: Int,
+        text: String? = nil,
+        language: LanguageSpec? = nil,
+        repoRoot: URL? = nil
+    ) async -> LSPDocumentHighlightResult {
+        await documentHighlightResult(
+            uri: LSPURI.uri(from: fileURL),
+            line: line,
+            character: character,
+            text: text,
+            language: language,
+            workspaceRoot: repoRoot
+        )
+    }
+
+    /// Resolves `textDocument/documentHighlight` at a 0-based `(line, character)` UTF-16 position.
+    func documentHighlight(
+        uri: String,
+        line: Int,
+        character: Int,
+        text: String? = nil,
+        language: LanguageSpec? = nil,
+        workspaceRoot: URL? = nil
+    ) async -> [LSPDocumentHighlight] {
+        switch await documentHighlightResult(
+            uri: uri,
+            line: line,
+            character: character,
+            text: text,
+            language: language,
+            workspaceRoot: workspaceRoot
+        ) {
+        case .highlights(let highlights):
+            return highlights
+        case .unavailable, .failed:
             return []
         }
     }

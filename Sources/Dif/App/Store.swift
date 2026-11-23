@@ -1656,6 +1656,17 @@ final class AppStore {
     func viewerContextMenu() -> NSMenu? {
         guard viewer.request != nil else { return nil }
         let menu = NSMenu()
+        if let canvas = viewer.container?.canvas, let sticky = canvas.contextStickyLine {
+            menu.addItem(ClosureMenuItem(L("Jump to Line \(sticky.line + 1)", "跳转到第 \(sticky.line + 1) 行")) { [weak self, weak canvas] in
+                guard let self, let canvas else { return }
+                self.viewer.canvas(canvas, didClickStickyLine: sticky.line, side: sticky.side, slotIndex: 0)
+            })
+            menu.addItem(.separator())
+            menu.addItem(ClosureMenuItem(L("Hide Sticky Lines", "隐藏粘性行")) { [weak self] in
+                self?.viewer.setStickyLines(false)
+            })
+            return menu
+        }
         if AppEnvironment.hasLSP,
            let canvas = viewer.container?.canvas,
            canvas.isLSPEnabled,

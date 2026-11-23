@@ -261,6 +261,15 @@ enum LSPDocumentHighlightDecoder {
     }
 }
 
+/// Distinguishes a valid LSP `documentHighlight` response from unavailability vs transient RPC failure.
+enum LSPDocumentHighlightResult: Sendable, Equatable {
+    case highlights([LSPDocumentHighlight])
+    /// LSP is disabled, no server is configured/installed for this language, or the server lacks `documentHighlightProvider`.
+    case unavailable
+    /// Server is installed for this language, but startup/open/RPC failed or timed out.
+    case failed
+}
+
 // MARK: - URI Conversion & Path Canonicalization
 
 /// Converts cleanly between local file `URL`s and LSP `file://` URIs, handling percent-encoding and symlinks.

@@ -72,6 +72,8 @@ protocol CodeCanvasDelegate: AnyObject {
     func canvas(_ canvas: CodeCanvasView, expandFoldSegment segmentIndex: Int)
     /// The user clicked inside change `index`: switch the focused hunk to it without scrolling.
     func canvas(_ canvas: CodeCanvasView, didSelectHunk index: Int)
+    /// A pinned sticky header line was clicked (`line` is 0-based buffer line on `side`, `slotIndex` is 0-based slot).
+    func canvas(_ canvas: CodeCanvasView, didClickStickyLine line: Int, side: Side, slotIndex: Int)
 }
 
 // MARK: - Layers
@@ -83,6 +85,110 @@ private class StillLayer: CALayer {
 
 private final class StillShapeLayer: CAShapeLayer {
     override func action(forKey event: String) -> CAAction? { nil }
+}
+
+private final class StillGradientLayer: CAGradientLayer {
+    override func action(forKey event: String) -> CAAction? { nil }
+}
+
+/// Rasterises one sticky header row's gutter or syntax-highlighted text with the same CoreText pipeline as `TileLayer`.
+private final class StickyTileLayer: CALayer {
+    enum Kind { case gutter, text }
+
+    weak var canvas: CodeCanvasView?
+    var kind = Kind.text
+    var paneSide = Side.right
+    var sourceSide = Side.right
+    var sourceLine = 0
+    var unifiedRowIndex: Int?
+    var isHovered = false
+    var drawOffsetX: CGFloat = 0
+
+    override init() { super.init() }
+
+    override init(layer: Any) {
+        super.init(layer: layer)
+        guard let other = layer as? StickyTileLayer else { return }
+        canvas = other.canvas
+        kind = other.kind
+        paneSide = other.paneSide
+        sourceSide = other.sourceSide
+        sourceLine = other.sourceLine
+        unifiedRowIndex = other.unifiedRowIndex
+        isHovered = other.isHovered
+        drawOffsetX = other.drawOffsetX
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    override func action(forKey event: String) -> CAAction? { nil }
+
+    override func draw(in ctx: CGContext) {
+        nonisolated(unsafe) let tile = self, context = ctx
+        MainActor.assumeIsolated { tile.canvas?.drawStickyTile(tile, in: context) }
+    }
+}
+
+private final class StickySlotRow {
+    let rowLayer = StillLayer()
+    let diffTintLayer = StillLayer()
+    let textClipLayer = StillLayer()
+    let textLayer = StickyTileLayer()
+    let gutterLayer = StickyTileLayer()
+    var renderKey = ""
+
+    init(slotIndex: Int, paneSide: Side) {
+        rowLayer.anchorPoint = .zero
+        rowLayer.masksToBounds = true
+        rowLayer.zPosition = CGFloat(20 - slotIndex)
+
+        diffTintLayer.anchorPoint = .zero
+        diffTintLayer.zPosition = 0.5
+        diffTintLayer.isHidden = true
+        rowLayer.addSublayer(diffTintLayer)
+
+        textClipLayer.anchorPoint = .zero
+        textClipLayer.masksToBounds = true
+        textClipLayer.zPosition = 1
+        rowLayer.addSublayer(textClipLayer)
+
+        textLayer.kind = .text
+        textLayer.paneSide = paneSide
+        textLayer.anchorPoint = .zero
+        textClipLayer.addSublayer(textLayer)
+
+        gutterLayer.kind = .gutter
+        gutterLayer.paneSide = paneSide
+        gutterLayer.anchorPoint = .zero
+        gutterLayer.zPosition = 2
+        rowLayer.addSublayer(gutterLayer)
+    }
+}
+
+private final class StickyPaneOverlay {
+    let side: Side
+    let container = StillLayer()
+    let border = StillLayer()
+    let shadow = StillGradientLayer()
+    var slots: [StickySlotRow] = []
+
+    init(side: Side) {
+        self.side = side
+        container.anchorPoint = .zero
+        container.masksToBounds = true
+        container.zPosition = 12
+        container.isHidden = true
+
+        shadow.anchorPoint = .zero
+        shadow.zPosition = 12.1
+        shadow.startPoint = CGPoint(x: 0.5, y: 0)
+        shadow.endPoint = CGPoint(x: 0.5, y: 1)
+        shadow.isHidden = true
+
+        border.anchorPoint = .zero
+        border.zPosition = 12.2
+        border.isHidden = true
+    }
 }
 
 /// A strip of rasterised glyphs. It is drawn exactly once; after that the compositor only moves it.
@@ -280,6 +386,7 @@ final class CodeCanvasView: NSView {
     var codeFont = CodeFont(size: 12) {
         didSet {
             guard codeFont != oldValue else { return }
+            stickyRenderEpoch &+= 1
             invalidateTextCaches()
             container?.updateDocumentSize()
             invalidate(.everything)
@@ -502,6 +609,7 @@ final class CodeCanvasView: NSView {
     var annotations: LineAnnotations? {
         didSet {
             guard annotations != oldValue else { return }
+            stickyRenderEpoch &+= 1
             annotationLabels.removeAll()
             if hoveredAnnotationLine != nil { setHoveredAnnotation(nil) }
             // Only the right pane's gutter shows them; the text moves over when the column's width changes.
@@ -544,7 +652,60 @@ final class CodeCanvasView: NSView {
     private var lineCacheOld: [Int: CTLine] = [:]
     private var lineCacheCost = 0
     private var numberCache: [Int: CTLine] = [:]
+    private var strongNumberCache: [Int: CTLine] = [:]
     private var signLines: [CTLine] = []
+
+    // MARK: Sticky Lines state
+
+    var stickyLinesEnabled: Bool = true {
+        didSet {
+            guard stickyLinesEnabled != oldValue else { return }
+            if stickyLinesEnabled {
+                if !stickyScopesLoaded {
+                    rebuildStickyBufferScopes()
+                }
+            } else {
+                stickyReextractTimer?.invalidate()
+                stickyReextractTimer = nil
+                hoveredSticky = nil
+                pressedSticky = nil
+                contextStickyLine = nil
+                stickyHits.removeAll(keepingCapacity: true)
+                stickyLayoutByPane = [.empty, .empty]
+            }
+            invalidate(.scroll)
+        }
+    }
+    var stickyLinesMaxCount: Int = StickyLinesEngine.defaultMaxLines {
+        didSet {
+            let clamped = min(Settings.stickyLinesRange.upperBound, max(Settings.stickyLinesRange.lowerBound, stickyLinesMaxCount))
+            if stickyLinesMaxCount != clamped {
+                stickyLinesMaxCount = clamped
+                return
+            }
+            guard stickyLinesMaxCount != oldValue else { return }
+            invalidate(.scroll)
+        }
+    }
+    private let stickyOverlays = [StickyPaneOverlay(side: .left), StickyPaneOverlay(side: .right)]
+    private var leftStickyScopes: [StickyScope] = []
+    private var rightStickyScopes: [StickyScope] = []
+    private var stickyScopesLoaded = false
+    private var leftStickyDisplayScopes: [StickyDisplayScope] = []
+    private var rightStickyDisplayScopes: [StickyDisplayScope] = []
+    private var stickyLayoutByPane: [StickyLayoutResult] = [.empty, .empty]
+    private var stickyHits: [(rect: CGRect, pane: Side, slotIndex: Int, scope: StickyDisplayScope)] = []
+    private var hoveredSticky: (pane: Side, slotIndex: Int)? {
+        didSet {
+            if hoveredSticky?.pane != oldValue?.pane || hoveredSticky?.slotIndex != oldValue?.slotIndex {
+                invalidate(.scroll)
+            }
+        }
+    }
+    private var pressedSticky: (pane: Side, slotIndex: Int, scope: StickyDisplayScope)?
+    private(set) var contextStickyLine: (side: Side, line: Int)?
+    private var stickyRenderEpoch: UInt64 = 0
+    private var stickyReextractTimer: Timer?
     /// Virtual row at which each hunk starts, in the current mode.
     private var hunkRows: [Int] = []
     private var draggingRuler = false
@@ -600,6 +761,12 @@ final class CodeCanvasView: NSView {
             lastRelativeCursorLine = -1
             panes[1].dropGutterTiles()
             invalidate(.scroll)
+        }
+    }
+    var vimCursorColor: CGColor? = nil {
+        didSet {
+            guard vimCursorColor != oldValue else { return }
+            invalidate(.selection)
         }
     }
     var vimCursor = TextPosition(row: 0, column: 0)
@@ -704,6 +871,12 @@ final class CodeCanvasView: NSView {
         panes[1].text.addSublayer(caretLayer)
         compositionUnderline = RectGroup(host: panes[1].text, z: 7)
         lspHoverUnderline = RectGroup(host: panes[1].text, z: 7)
+
+        for overlay in stickyOverlays {
+            root.addSublayer(overlay.container)
+            root.addSublayer(overlay.shadow)
+            root.addSublayer(overlay.border)
+        }
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
@@ -807,9 +980,26 @@ final class CodeCanvasView: NSView {
         currentMatch = -1
         clearLSPHover()
         contextLSPSymbol = nil
+        stickyReextractTimer?.invalidate()
+        stickyReextractTimer = nil
+        hoveredSticky = nil
+        pressedSticky = nil
+        contextStickyLine = nil
+        stickyHits.removeAll(keepingCapacity: true)
+        stickyLayoutByPane = [.empty, .empty]
         invalidateTextCaches()
         rebuildFoldLayout()
         rebuildHunkRows()
+        if stickyLinesEnabled {
+            rebuildStickyBufferScopes()
+        } else {
+            leftStickyScopes.removeAll(keepingCapacity: true)
+            rightStickyScopes.removeAll(keepingCapacity: true)
+            leftStickyDisplayScopes.removeAll(keepingCapacity: true)
+            rightStickyDisplayScopes.removeAll(keepingCapacity: true)
+            stickyScopesLoaded = false
+            stickyRenderEpoch &+= 1
+        }
         invalidate(.everything)
         reportVimStateIfNeeded(force: true)
         if doc != nil {
@@ -826,6 +1016,7 @@ final class CodeCanvasView: NSView {
         clearLSPHover()
         rebuildFoldLayout()
         rebuildHunkRows()
+        if stickyLinesEnabled { rebuildStickyDisplayScopes() }
         if let caret { selection = TextSelection(pane: .right, anchor: rowPosition(caret.anchor), head: rowPosition(caret.head)) }
         invalidate(.everything)
     }
@@ -852,6 +1043,7 @@ final class CodeCanvasView: NSView {
         clearLSPHover()
         rebuildFoldLayout()
         rebuildHunkRows()
+        if stickyLinesEnabled { rebuildStickyDisplayScopes() }
         if let caret {
             selection = TextSelection(pane: .right, anchor: rowPosition(caret.anchor), head: rowPosition(caret.head))
         } else if selection != nil {
@@ -929,6 +1121,7 @@ final class CodeCanvasView: NSView {
             }
             for index in tiles { pane.contentWidths.removeValue(forKey: index) }
         }
+        stickyRenderEpoch &+= 1
         invalidate(.scroll)
         notifyActiveLineFromCurrentState(force: true)
     }
@@ -951,9 +1144,11 @@ final class CodeCanvasView: NSView {
         lineCacheOld.removeAll()
         lineCacheCost = 0
         numberCache.removeAll()
+        strongNumberCache.removeAll()
         signLines.removeAll()
         annotationLabels.removeAll()
         cachedParagraphStyle = nil
+        stickyRenderEpoch &+= 1
     }
 
     private func rebuildFoldLayout() {
@@ -1252,6 +1447,7 @@ final class CodeCanvasView: NSView {
 
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
+        stickyRenderEpoch &+= 1
         invalidate(.everything)
     }
 
@@ -1387,14 +1583,18 @@ final class CodeCanvasView: NSView {
     /// the anchor's virtual position sit at the anchor, which keeps unchanged code level across
     /// the divider while each pane still starts and ends flush.
     private func resolveScroll() -> Scroll {
+        resolveScroll(forOrigin: scrollOrigin)
+    }
+
+    private func resolveScroll(forOrigin origin: CGPoint) -> Scroll {
         let h = bounds.height
         let lh = codeFont.lineHeight
         let pad = bottomPadding
         let maxScroll = max(0, CGFloat(rowCount) * lh + pad - h)
-        let y = min(max(scrollOrigin.y, 0), maxScroll)
-        let overscroll = pixelRound(scrollOrigin.y - y)
+        let y = min(max(origin.y, 0), maxScroll)
+        let overscroll = pixelRound(origin.y - y)
         let maxX = max(0, (container?.documentWidth ?? bounds.width) - bounds.width)
-        let x = pixelRound(min(max(scrollOrigin.x, 0), maxX))
+        let x = pixelRound(min(max(origin.x, 0), maxX))
 
         guard mode == .sideBySide, let doc = document else {
             let top = pixelRound(y) + overscroll
@@ -1575,7 +1775,16 @@ final class CodeCanvasView: NSView {
         return CTLineCreateWithAttributedString(attributed)
     }
 
-    private func numberLine(_ number: Int) -> CTLine {
+    private func numberLine(_ number: Int, strong: Bool = false) -> CTLine {
+        if strong {
+            if let line = strongNumberCache[number] { return line }
+            if strongNumberCache.count > 256 { strongNumberCache.removeAll(keepingCapacity: true) }
+            let line = CTLineCreateWithAttributedString(NSAttributedString(string: String(number), attributes: [
+                .font: codeFont.font, Self.colorKey: theme.gutterTextStrong,
+            ]))
+            strongNumberCache[number] = line
+            return line
+        }
         if let line = numberCache[number] { return line }
         if numberCache.count > 1500 { numberCache.removeAll(keepingCapacity: true) }
         let line = CTLineCreateWithAttributedString(NSAttributedString(string: String(number), attributes: [
@@ -1599,8 +1808,8 @@ final class CodeCanvasView: NSView {
 
     // MARK: Tiles
 
-    private func drawNumber(_ ctx: CGContext, _ number: Int, rightEdge: CGFloat, y: CGFloat) {
-        let line = numberLine(number)
+    private func drawNumber(_ ctx: CGContext, _ number: Int, rightEdge: CGFloat, y: CGFloat, strong: Bool = false) {
+        let line = numberLine(number, strong: strong)
         let width = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
         ctx.textPosition = CGPoint(x: rightEdge - width, y: y + codeFont.baseline)
         CTLineDraw(line, ctx)
@@ -1880,6 +2089,7 @@ final class CodeCanvasView: NSView {
             moveBadgeLayers.forEach { $0.isHidden = true }
             moveConnectorHits.removeAll()
             moveConnectorLayers.forEach { $0.setHidden(true) }
+            hideStickyOverlays()
             updateCaret()
             return
         }
@@ -1945,6 +2155,7 @@ final class CodeCanvasView: NSView {
         updateRuler(doc, scroll, marks: redecorate)
         updateFoldBars(doc, scroll)
         updateRevertButtons(doc, scroll)
+        updateStickyLines(doc, scroll)
         updateMoveBadges(doc, scroll)
         updateConflictButtons(doc, scroll)
         updateCaret()
@@ -2012,41 +2223,45 @@ final class CodeCanvasView: NSView {
             let x1 = nextCol > headPos.column
                 ? textInset + CTLineGetOffsetForStringIndex(lineLayout, nextCol, nil)
                 : x0 + codeFont.charWidth
-            let charWidth = max(codeFont.charWidth, x1 - x0)
+            let isTab = headPos.column < lineNS.length && lineNS.character(at: headPos.column) == 0x09
+            // On tabs, place block/underline carets in the trailing single-character cell (like GoLand IdeaVim).
+            let blockX = isTab ? max(x0, x1 - codeFont.charWidth) : x0
+            let charWidth = isTab ? codeFont.charWidth : max(codeFont.charWidth, x1 - x0)
+            let baseColor = vimCursorColor ?? theme.text
 
             switch vimEngine.mode {
             case .insert:
                 // guicursor=i:ver1 -> crisp 1.5pt vertical bar
                 frame = CGRect(x: pixelRound(x0 - 0.75), y: CGFloat(headPos.row) * lh, width: 1.5, height: lh)
-                color = theme.text
+                color = baseColor
                 cornerRadius = 0
                 shouldBlink = true
             case .normal where vimEngine.isReplaceCharPending:
                 // guicursor=r:hor50 -> half-height underline block
-                frame = CGRect(x: pixelRound(x0), y: pixelRound(CGFloat(headPos.row) * lh + lh * 0.5),
+                frame = CGRect(x: pixelRound(blockX), y: pixelRound(CGFloat(headPos.row) * lh + lh * 0.5),
                                width: pixelRound(charWidth), height: pixelRound(lh * 0.5))
-                color = theme.text.copy(alpha: 0.65) ?? theme.text
+                color = baseColor.copy(alpha: baseColor.alpha * 0.65) ?? baseColor
                 cornerRadius = 1
                 shouldBlink = false
             case .normal:
                 // Normal mode: translucent block cursor
-                frame = CGRect(x: pixelRound(x0), y: CGFloat(headPos.row) * lh,
+                frame = CGRect(x: pixelRound(blockX), y: CGFloat(headPos.row) * lh,
                                width: pixelRound(charWidth), height: lh)
-                color = theme.text.copy(alpha: 0.42) ?? theme.text
+                color = baseColor.copy(alpha: baseColor.alpha * 0.42) ?? baseColor
                 cornerRadius = 1
                 shouldBlink = false
             case .visual, .visualLine:
                 // guicursor=v:hor10 -> underline caret indicator alongside selection highlight
                 let h = max(2, (lh * 0.14).rounded())
-                frame = CGRect(x: pixelRound(x0), y: CGFloat(headPos.row) * lh + lh - h,
+                frame = CGRect(x: pixelRound(blockX), y: CGFloat(headPos.row) * lh + lh - h,
                                width: pixelRound(charWidth), height: h)
-                color = theme.text
+                color = baseColor
                 cornerRadius = 0
                 shouldBlink = false
             case .commandLine:
-                frame = CGRect(x: pixelRound(x0), y: CGFloat(headPos.row) * lh,
+                frame = CGRect(x: pixelRound(blockX), y: CGFloat(headPos.row) * lh,
                                width: pixelRound(charWidth), height: lh)
-                color = theme.text.copy(alpha: 0.25) ?? theme.text
+                color = baseColor.copy(alpha: baseColor.alpha * 0.25) ?? baseColor
                 cornerRadius = 1
                 shouldBlink = false
             }
@@ -2098,6 +2313,7 @@ final class CodeCanvasView: NSView {
     /// Whether the caret is showing (it blinks; this says nothing of the phase). For the debug hooks.
     var isCaretShown: Bool { !caretLayer.isHidden }
     var caretRect: CGRect { caretFrame }
+    var caretColor: CGColor? { caretLayer.backgroundColor }
 
     // MARK: Editing support
 
@@ -2273,8 +2489,16 @@ final class CodeCanvasView: NSView {
             annotations = mapped
         }
         editCount += 1
+        stickyRenderEpoch &+= 1
         rebuildFoldLayout()
         rebuildHunkRows()
+        if stickyLinesEnabled {
+            for outcome in outcomes {
+                rightStickyScopes = StickyLinesEngine.shiftScopes(rightStickyScopes, by: outcome.raw)
+            }
+            rebuildStickyDisplayScopes()
+            scheduleStickyReextract()
+        }
         invalidate([.decor, .selection, .scroll])
         container?.updateDocumentSize()
         notifyActiveLineFromCurrentState(force: true)
@@ -2292,8 +2516,10 @@ final class CodeCanvasView: NSView {
         let wasFolded = isFoldingActive
         change()
         if let focused = focusedHunk, focused >= doc.hunks.count { focusedHunk = nil }
+        stickyRenderEpoch &+= 1
         rebuildFoldLayout()
         rebuildHunkRows()
+        if stickyLinesEnabled { rebuildStickyDisplayScopes() }
         if mode == .unified || wasFolded || isFoldingActive {
             panes[1].dropTiles()
             if wasFolded || isFoldingActive { panes[0].dropTiles() }
@@ -2329,10 +2555,12 @@ final class CodeCanvasView: NSView {
         let width = textRect(.right).width
         for _ in 0..<4 {
             let scroll = resolveScroll()
+            let stickyH = stickyHeight(for: .right, at: scroll)
+            let topClearance = min(stickyH + lh * 0.5, max(lh * 0.5, bounds.height - lh * 2))
             let y = CGFloat(headRow) * lh - scroll.right
             var dy: CGFloat = 0
-            if y < lh * 0.5 {
-                dy = y - lh * 0.5
+            if y < topClearance {
+                dy = y - topClearance
             } else if y + lh * 1.5 > bounds.height {
                 dy = y + lh * 1.5 - bounds.height
             }
@@ -3474,8 +3702,9 @@ final class CodeCanvasView: NSView {
                     rightEdge = bounds.width - rulerWidth - 10
                 }
                 guard topY <= h, bottomY >= 0 else { index += 1; continue }
+                let topPad = stickyHeight(for: isSource ? .left : .right) + 3
                 let rest = topY + (lh - size.height) / 2
-                let y = pixelRound(max(rest, min(3, bottomY - size.height - 3)))
+                let y = pixelRound(max(rest, min(topPad, bottomY - size.height - 3)))
                 let minX = isSource ? 8 : (textRect(.right).minX + 8)
                 rect = CGRect(x: pixelRound(max(minX, rightEdge - size.width)), y: y, width: size.width, height: size.height)
             } else {
@@ -3485,8 +3714,9 @@ final class CodeCanvasView: NSView {
                 var rightEdge = bounds.width - rulerWidth - 10
                 if showsRevertButtons { rightEdge -= revertSize + 8 }
                 if commitTicks != nil { rightEdge -= tickSize + 8 }
+                let topPad = stickyHeight(for: .right) + 3
                 let rest = topY + (lh - size.height) / 2
-                let y = pixelRound(max(rest, min(3, bottomY - size.height - 3)))
+                let y = pixelRound(max(rest, min(topPad, bottomY - size.height - 3)))
                 rect = CGRect(x: pixelRound(max(textRect(.right).minX + 8, rightEdge - size.width)), y: y, width: size.width, height: size.height)
             }
 
@@ -3565,6 +3795,545 @@ final class CodeCanvasView: NSView {
 
     private func moveBadgeHit(at point: CGPoint) -> Int? {
         moveBadgeHits.first { $0.rect.insetBy(dx: -2, dy: -2).contains(point) }?.hunk
+    }
+
+    // MARK: Sticky Lines
+
+    var visibleStickyLines: (left: [StickyLineSlot], right: [StickyLineSlot]) {
+        (stickyLayoutByPane[0].slots, stickyLayoutByPane[1].slots)
+    }
+
+    func stickyHeight(for pane: Side) -> CGFloat {
+        stickyLayoutByPane[pane.rawValue].height
+    }
+
+    private func stickyHeight(for pane: Side, at scroll: Scroll) -> CGFloat {
+        guard stickyLinesEnabled, document != nil else { return 0 }
+        let currentMode = mode
+        guard currentMode == .sideBySide || pane == .right else { return 0 }
+        let scopes = pane == .left ? leftStickyDisplayScopes : rightStickyDisplayScopes
+        let top = pane == .left ? scroll.left : scroll.right
+        return StickyLinesEngine.resolve(
+            scopes: scopes,
+            scrollTop: top,
+            lineHeight: codeFont.lineHeight,
+            viewportHeight: bounds.height,
+            maxLines: stickyLinesMaxCount
+        ).height
+    }
+
+    private func hideStickyOverlays() {
+        stickyHits.removeAll(keepingCapacity: true)
+        stickyLayoutByPane = [.empty, .empty]
+        hoveredSticky = nil
+        pressedSticky = nil
+        for overlay in stickyOverlays {
+            overlay.container.isHidden = true
+            overlay.border.isHidden = true
+            overlay.shadow.isHidden = true
+            for slot in overlay.slots { slot.rowLayer.isHidden = true }
+        }
+    }
+
+    private func scheduleStickyReextract() {
+        stickyReextractTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.15, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.stickyLinesEnabled,
+                      let doc = self.document, case .text = doc.content else { return }
+                self.rightStickyScopes = StickyLinesEngine.extractScopes(lines: doc.right.lines, language: doc.language)
+                self.rebuildStickyDisplayScopes()
+                self.invalidate(.scroll)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        stickyReextractTimer = timer
+    }
+
+    private func rebuildStickyBufferScopes() {
+        stickyReextractTimer?.invalidate()
+        stickyReextractTimer = nil
+        guard let doc = document, case .text = doc.content else {
+            leftStickyScopes.removeAll(keepingCapacity: true)
+            rightStickyScopes.removeAll(keepingCapacity: true)
+            leftStickyDisplayScopes.removeAll(keepingCapacity: true)
+            rightStickyDisplayScopes.removeAll(keepingCapacity: true)
+            stickyScopesLoaded = false
+            stickyRenderEpoch &+= 1
+            return
+        }
+        rightStickyScopes = StickyLinesEngine.extractScopes(lines: doc.right.lines, language: doc.language)
+        leftStickyScopes = (!doc.isPlainFile && !doc.left.lines.isEmpty)
+            ? StickyLinesEngine.extractScopes(lines: doc.left.lines, language: doc.language)
+            : []
+        stickyScopesLoaded = true
+        rebuildStickyDisplayScopes()
+    }
+
+    private func rebuildStickyDisplayScopes() {
+        stickyRenderEpoch &+= 1
+        guard let doc = document, case .text = doc.content else {
+            leftStickyDisplayScopes.removeAll(keepingCapacity: true)
+            rightStickyDisplayScopes.removeAll(keepingCapacity: true)
+            return
+        }
+
+        switch mode {
+        case .single:
+            leftStickyDisplayScopes.removeAll(keepingCapacity: true)
+            rightStickyDisplayScopes = rightStickyScopes.map {
+                StickyDisplayScope(headerRow: $0.startLine, endRow: $0.endLine, sourceSide: .right, sourceLine: $0.startLine)
+            }
+
+        case .sideBySide:
+            if !isFoldingActive {
+                leftStickyDisplayScopes = leftStickyScopes.map {
+                    StickyDisplayScope(headerRow: $0.startLine, endRow: $0.endLine, sourceSide: .left, sourceLine: $0.startLine)
+                }
+                rightStickyDisplayScopes = rightStickyScopes.map {
+                    StickyDisplayScope(headerRow: $0.startLine, endRow: $0.endLine, sourceSide: .right, sourceLine: $0.startLine)
+                }
+            } else {
+                leftStickyDisplayScopes = mapFoldedSideScopes(leftStickyScopes, side: .left)
+                rightStickyDisplayScopes = mapFoldedSideScopes(rightStickyScopes, side: .right)
+            }
+
+        case .unified:
+            leftStickyDisplayScopes.removeAll(keepingCapacity: true)
+            var leftLineToRow = [Int](repeating: -1, count: doc.left.lines.count)
+            var rightLineToRow = [Int](repeating: -1, count: doc.right.lines.count)
+            var isRemovedRow: [Bool]
+
+            if isFoldingActive {
+                isRemovedRow = [Bool](repeating: false, count: unifiedDisplayRows.count)
+                for (rowIdx, item) in unifiedDisplayRows.enumerated() {
+                    switch item {
+                    case .unified(let r):
+                        if r.left >= 0, Int(r.left) < leftLineToRow.count {
+                            leftLineToRow[Int(r.left)] = rowIdx
+                        }
+                        if r.right >= 0, Int(r.right) < rightLineToRow.count {
+                            rightLineToRow[Int(r.right)] = rowIdx
+                        }
+                        isRemovedRow[rowIdx] = (r.kind == .removed)
+                    case .foldBar(let region):
+                        for l in region.leftRange where l >= 0 && l < leftLineToRow.count {
+                            leftLineToRow[l] = rowIdx
+                        }
+                        for r in region.rightRange where r >= 0 && r < rightLineToRow.count {
+                            rightLineToRow[r] = rowIdx
+                        }
+                    }
+                }
+            } else {
+                let rawRows = doc.unifiedRows
+                isRemovedRow = [Bool](repeating: false, count: rawRows.count)
+                for (rowIdx, r) in rawRows.enumerated() {
+                    if r.left >= 0, Int(r.left) < leftLineToRow.count {
+                        leftLineToRow[Int(r.left)] = rowIdx
+                    }
+                    if r.right >= 0, Int(r.right) < rightLineToRow.count {
+                        rightLineToRow[Int(r.right)] = rowIdx
+                    }
+                    isRemovedRow[rowIdx] = (r.kind == .removed)
+                }
+            }
+
+            func mapScopes(_ scopes: [StickyScope], side: Side, table: [Int]) -> [StickyDisplayScope] {
+                var out: [StickyDisplayScope] = []
+                out.reserveCapacity(scopes.count)
+                for s in scopes where s.startLine < table.count && s.endLine < table.count {
+                    let h = table[s.startLine]
+                    let e = table[s.endLine]
+                    if h >= 0 && e >= h + 2 {
+                        out.append(StickyDisplayScope(headerRow: h, endRow: e, sourceSide: side, sourceLine: s.startLine))
+                    }
+                }
+                return out
+            }
+
+            let rightMapped = mapScopes(rightStickyScopes, side: .right, table: rightLineToRow)
+            if doc.right.lines.isEmpty && !doc.left.lines.isEmpty {
+                rightStickyDisplayScopes = mapScopes(leftStickyScopes, side: .left, table: leftLineToRow)
+            } else if !leftStickyScopes.isEmpty {
+                let leftMapped = mapScopes(leftStickyScopes, side: .left, table: leftLineToRow)
+                var combined = rightMapped
+                for lScope in leftMapped {
+                    guard lScope.headerRow < isRemovedRow.count, isRemovedRow[lScope.headerRow] else { continue }
+                    let overlapsNewScope = rightMapped.contains { rScope in
+                        rScope.headerRow >= lScope.headerRow && rScope.headerRow <= lScope.endRow
+                    }
+                    if !overlapsNewScope {
+                        combined.append(lScope)
+                    }
+                }
+                combined.sort { lhs, rhs in
+                    if lhs.headerRow != rhs.headerRow { return lhs.headerRow < rhs.headerRow }
+                    if lhs.endRow != rhs.endRow { return lhs.endRow > rhs.endRow }
+                    return lhs.sourceSide == .right && rhs.sourceSide != .right
+                }
+                var normalized: [StickyDisplayScope] = []
+                normalized.reserveCapacity(combined.count)
+                var stack: [StickyDisplayScope] = []
+                for item in combined {
+                    if let last = normalized.last, last.headerRow == item.headerRow { continue }
+                    while let top = stack.last, item.headerRow >= top.endRow { stack.removeLast() }
+                    let clampedEnd = stack.last.map { min(item.endRow, $0.endRow) } ?? item.endRow
+                    guard clampedEnd >= item.headerRow + 2 else { continue }
+                    let scope = StickyDisplayScope(headerRow: item.headerRow, endRow: clampedEnd, sourceSide: item.sourceSide, sourceLine: item.sourceLine)
+                    normalized.append(scope)
+                    stack.append(scope)
+                }
+                rightStickyDisplayScopes = normalized
+            } else {
+                rightStickyDisplayScopes = rightMapped
+            }
+        }
+    }
+
+    private func mapFoldedSideScopes(_ scopes: [StickyScope], side: Side) -> [StickyDisplayScope] {
+        var out: [StickyDisplayScope] = []
+        out.reserveCapacity(scopes.count)
+        for s in scopes {
+            let h = displayRow(forLine: s.startLine, side: side)
+            let e = displayRow(forLine: s.endLine, side: side)
+            if e >= h + 2 {
+                out.append(StickyDisplayScope(headerRow: h, endRow: e, sourceSide: side, sourceLine: s.startLine))
+            }
+        }
+        var normalized: [StickyDisplayScope] = []
+        normalized.reserveCapacity(out.count)
+        var stack: [StickyDisplayScope] = []
+        for item in out {
+            if let last = normalized.last, last.headerRow == item.headerRow { continue }
+            while let top = stack.last, item.headerRow >= top.endRow { stack.removeLast() }
+            let clampedEnd = stack.last.map { min(item.endRow, $0.endRow) } ?? item.endRow
+            guard clampedEnd >= item.headerRow + 2 else { continue }
+            let scope = StickyDisplayScope(headerRow: item.headerRow, endRow: clampedEnd, sourceSide: item.sourceSide, sourceLine: item.sourceLine)
+            normalized.append(scope)
+            stack.append(scope)
+        }
+        return normalized
+    }
+
+    private func unifiedRowForDisplayIndex(_ rowIndex: Int) -> UnifiedRow? {
+        guard let doc = document, rowIndex >= 0 else { return nil }
+        if isFoldingActive {
+            guard rowIndex < unifiedDisplayRows.count, case .unified(let uRow) = unifiedDisplayRows[rowIndex] else { return nil }
+            return uRow
+        }
+        guard rowIndex < doc.unifiedRows.count else { return nil }
+        return doc.unifiedRows[rowIndex]
+    }
+
+    private func stickyDiffColor(for scope: StickyDisplayScope, in doc: DiffDocument) -> CGColor? {
+        guard !doc.isPlainFile else { return nil }
+        switch mode {
+        case .single:
+            return nil
+        case .sideBySide:
+            var idx = firstHunk(doc, side: scope.sourceSide, endingAtOrAfter: scope.headerRow)
+            while idx < doc.hunks.count {
+                let hunk = doc.hunks[idx]
+                let start = hunkDisplayStart(idx, side: scope.sourceSide)
+                if start > scope.headerRow { break }
+                let count = scope.sourceSide == .left ? hunk.leftCount : hunk.rightCount
+                if count > 0, scope.headerRow >= start, scope.headerRow < start + count {
+                    return theme.line(for: hunk)
+                }
+                idx += 1
+            }
+            return nil
+        case .unified:
+            guard let uRow = unifiedRowForDisplayIndex(scope.headerRow), uRow.kind != .context else { return nil }
+            let hunkIdx = Int(uRow.hunk)
+            if hunkIdx >= 0, hunkIdx < doc.hunks.count, doc.hunks[hunkIdx].moveInfo != nil {
+                return theme.moved
+            }
+            return uRow.kind == .added ? theme.added : theme.removedLine
+        }
+    }
+
+    private func updateStickyLines(_ doc: DiffDocument, _ scroll: Scroll) {
+        stickyHits.removeAll(keepingCapacity: true)
+        guard stickyLinesEnabled else {
+            hideStickyOverlays()
+            return
+        }
+        if !stickyScopesLoaded {
+            rebuildStickyBufferScopes()
+        }
+
+        let lh = codeFont.lineHeight
+        let scale = backingScale
+        let currentMode = mode
+        let shadowClear = theme.stickyShadow.copy(alpha: 0) ?? theme.stickyShadow
+
+        for paneIndex in 0..<2 {
+            let overlay = stickyOverlays[paneIndex]
+            let side = overlay.side
+            let active = currentMode == .sideBySide || side == .right
+            guard active else {
+                stickyLayoutByPane[paneIndex] = .empty
+                overlay.container.isHidden = true
+                overlay.border.isHidden = true
+                overlay.shadow.isHidden = true
+                continue
+            }
+
+            let scopes = side == .left ? leftStickyDisplayScopes : rightStickyDisplayScopes
+            let top = side == .left ? scroll.left : scroll.right
+            let layout = StickyLinesEngine.resolve(
+                scopes: scopes,
+                scrollTop: top,
+                lineHeight: lh,
+                viewportHeight: bounds.height,
+                maxLines: stickyLinesMaxCount
+            )
+            stickyLayoutByPane[paneIndex] = layout
+
+            guard !layout.slots.isEmpty, layout.height >= 0.5 else {
+                overlay.container.isHidden = true
+                overlay.border.isHidden = true
+                overlay.shadow.isHidden = true
+                for slot in overlay.slots { slot.rowLayer.isHidden = true }
+                continue
+            }
+
+            let band = bandRect(side)
+            let textR = textRect(side)
+            let gutter = gutterSpan(side)
+            let overlayHeight = pixelRound(layout.height)
+            let textClipX = textR.minX - band.minX
+            let textClipW = textR.width
+
+            place(overlay.container, CGRect(x: band.minX, y: 0, width: band.width, height: overlayHeight))
+            overlay.container.isHidden = false
+
+            place(overlay.border, CGRect(x: band.minX, y: max(0, overlayHeight - 1), width: band.width, height: 1))
+            overlay.border.backgroundColor = theme.stickyBorder
+            overlay.border.isHidden = false
+
+            place(overlay.shadow, CGRect(x: band.minX, y: overlayHeight, width: band.width, height: 6))
+            overlay.shadow.colors = [theme.stickyShadow, shadowClear]
+            overlay.shadow.isHidden = false
+
+            for slot in layout.slots {
+                let sIdx = slot.slotIndex
+                while overlay.slots.count <= sIdx {
+                    let row = StickySlotRow(slotIndex: overlay.slots.count, paneSide: side)
+                    row.textLayer.canvas = self
+                    row.gutterLayer.canvas = self
+                    overlay.container.addSublayer(row.rowLayer)
+                    overlay.slots.append(row)
+                }
+                let row = overlay.slots[sIdx]
+                let rowY = pixelRound(slot.y)
+                let isHovered = hoveredSticky?.pane == side && hoveredSticky?.slotIndex == sIdx
+                let scope = slot.scope
+
+                place(row.rowLayer, CGRect(x: 0, y: rowY, width: band.width, height: lh))
+                row.rowLayer.backgroundColor = isHovered ? theme.stickyHoverBg : theme.stickyBg
+                row.rowLayer.isHidden = false
+
+                if !isHovered, let diffColor = stickyDiffColor(for: scope, in: doc) {
+                    place(row.diffTintLayer, CGRect(x: 0, y: 0, width: band.width, height: lh))
+                    row.diffTintLayer.backgroundColor = diffColor
+                    row.diffTintLayer.isHidden = false
+                } else {
+                    row.diffTintLayer.isHidden = true
+                }
+
+                place(row.gutterLayer, CGRect(x: gutter.x, y: 0, width: gutter.width, height: lh))
+                place(row.textClipLayer, CGRect(x: textClipX, y: 0, width: textClipW, height: lh))
+
+                let lineLayout = ctLine(scope.sourceSide, scope.sourceLine)
+                let lineWidth = ceil(CGFloat(CTLineGetTypographicBounds(lineLayout, nil, nil, nil))) + textInset + 4
+                let drawOffsetX: CGFloat
+                if lineWidth <= 4096 {
+                    let tileW = max(textClipW, lineWidth)
+                    drawOffsetX = 0
+                    place(row.textLayer, CGRect(x: -scroll.x, y: 0, width: tileW, height: lh))
+                } else {
+                    drawOffsetX = -scroll.x
+                    place(row.textLayer, CGRect(x: 0, y: 0, width: textClipW, height: lh))
+                }
+
+                let unifiedIdx: Int? = currentMode == .unified ? scope.headerRow : nil
+                let key = "\(stickyRenderEpoch)|\(scope.sourceSide.rawValue)|\(scope.sourceLine)|\(unifiedIdx ?? -1)|\(isHovered ? 1 : 0)|\(Int(gutter.width))|\(Int(row.textLayer.bounds.width))|\(Int(drawOffsetX))"
+                if row.renderKey != key {
+                    row.renderKey = key
+                    row.gutterLayer.paneSide = side
+                    row.gutterLayer.sourceSide = scope.sourceSide
+                    row.gutterLayer.sourceLine = scope.sourceLine
+                    row.gutterLayer.unifiedRowIndex = unifiedIdx
+                    row.gutterLayer.isHovered = isHovered
+                    row.gutterLayer.contentsScale = scale
+                    row.gutterLayer.setNeedsDisplay()
+                    row.gutterLayer.displayIfNeeded()
+
+                    row.textLayer.paneSide = side
+                    row.textLayer.sourceSide = scope.sourceSide
+                    row.textLayer.sourceLine = scope.sourceLine
+                    row.textLayer.unifiedRowIndex = unifiedIdx
+                    row.textLayer.isHovered = isHovered
+                    row.textLayer.drawOffsetX = drawOffsetX
+                    row.textLayer.contentsScale = scale
+                    row.textLayer.setNeedsDisplay()
+                    row.textLayer.displayIfNeeded()
+                }
+
+                let visMinY = max(0, rowY)
+                let visMaxY = min(overlayHeight, rowY + lh)
+                if visMaxY > visMinY {
+                    stickyHits.append((
+                        rect: CGRect(x: band.minX, y: visMinY, width: band.width, height: visMaxY - visMinY),
+                        pane: side,
+                        slotIndex: sIdx,
+                        scope: scope
+                    ))
+                }
+            }
+
+            for extra in overlay.slots[layout.slots.count...] {
+                extra.rowLayer.isHidden = true
+            }
+        }
+
+        if let hovered = hoveredSticky,
+           !stickyHits.contains(where: { $0.pane == hovered.pane && $0.slotIndex == hovered.slotIndex }) {
+            hoveredSticky = nil
+        }
+    }
+
+    fileprivate func drawStickyTile(_ tile: StickyTileLayer, in ctx: CGContext) {
+        guard document != nil else { return }
+        if !tile.contentsAreFlipped() {
+            ctx.translateBy(x: 0, y: tile.bounds.height)
+            ctx.scaleBy(x: 1, y: -1)
+        }
+        ctx.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+
+        switch tile.kind {
+        case .text:
+            ctx.textPosition = CGPoint(x: textInset + tile.drawOffsetX, y: codeFont.baseline)
+            CTLineDraw(ctLine(tile.sourceSide, tile.sourceLine), ctx)
+
+        case .gutter:
+            let shift = tile.paneSide == .right ? annotationWidth : 0
+            if shift > 0, tile.sourceSide == .right, let annotations,
+               let index = annotations.index(atLine: tile.sourceLine) {
+                let entry = annotations.entries[Int(index)]
+                let first = annotations.isRunStart(tile.sourceLine)
+                ctx.setFillColor(theme.accent.copy(alpha: 0.18 + 0.72 * CGFloat(entry.recency)) ?? theme.accent)
+                ctx.fill(CGRect(x: 4, y: first ? 1 : 0, width: 3, height: codeFont.lineHeight - (first ? 1 : 0)))
+                if first {
+                    ctx.textPosition = CGPoint(x: 12, y: codeFont.baseline)
+                    CTLineDraw(annotationLabel(index, entry), ctx)
+                }
+            }
+            let useStrong = tile.isHovered
+            if mode == .unified {
+                let numberWidth = unifiedNumberWidth
+                if let rowIdx = tile.unifiedRowIndex, let r = unifiedRowForDisplayIndex(rowIdx) {
+                    if r.left >= 0 {
+                        drawNumber(ctx, Int(r.left) + 1, rightEdge: shift + numberWidth - 4, y: 0, strong: useStrong)
+                    }
+                    if r.right >= 0 {
+                        drawNumber(ctx, Int(r.right) + 1, rightEdge: shift + numberWidth * 2 - 4, y: 0, strong: useStrong)
+                    }
+                    if r.kind != .context {
+                        ctx.textPosition = CGPoint(x: shift + numberWidth * 2 + 4, y: codeFont.baseline)
+                        CTLineDraw(signLine(added: r.kind == .added), ctx)
+                    }
+                } else if tile.sourceSide == .left {
+                    drawNumber(ctx, tile.sourceLine + 1, rightEdge: shift + numberWidth - 4, y: 0, strong: useStrong)
+                } else {
+                    drawNumber(ctx, tile.sourceLine + 1, rightEdge: shift + numberWidth * 2 - 4, y: 0, strong: useStrong)
+                }
+            } else {
+                let rightEdge = shift + gutterWidth - 10
+                drawNumber(ctx, tile.sourceLine + 1, rightEdge: rightEdge, y: 0, strong: useStrong)
+            }
+        }
+    }
+
+    private func stickyHit(at point: CGPoint) -> (pane: Side, slotIndex: Int, scope: StickyDisplayScope)? {
+        // Iterate reversed so higher-z shallower slots match first if overlapping during push-out.
+        for hit in stickyHits.reversed() where hit.rect.contains(point) {
+            return (hit.pane, hit.slotIndex, hit.scope)
+        }
+        return nil
+    }
+
+    /// Computes the virtual scroll offset `y` that reveals `line` (0-based) on `side` directly below
+    /// `slotIndex` shallower ancestor sticky headers so `line` itself is not pinned or covered.
+    func stickyScrollTargetY(for line: Int, side: Side, slotIndex: Int) -> CGFloat {
+        let lh = codeFont.lineHeight
+        guard lh > 0, document != nil else { return 0 }
+        let targetRow: Int
+        switch mode {
+        case .single:
+            targetRow = max(0, line)
+        case .sideBySide:
+            targetRow = displayRow(forLine: line, side: side)
+        case .unified:
+            targetRow = unifiedDisplayRow(forLine: line, side: side)
+        }
+        let desiredPaneTop = max(0, CGFloat(targetRow - max(0, slotIndex)) * lh)
+        guard desiredPaneTop > 0 else { return 0 }
+
+        let maxScroll = max(0, CGFloat(rowCount) * lh + bottomPadding - bounds.height)
+        guard mode == .sideBySide, maxScroll > 0 else {
+            return min(desiredPaneTop, maxScroll)
+        }
+
+        // Binary-search `y` in `[0, maxScroll]` so `paneTop` lands at or just below `desiredPaneTop`,
+        // ensuring the target declaration line is un-pinned and sits cleanly at `slotIndex * lh`.
+        var lo: CGFloat = 0
+        var hi: CGFloat = maxScroll
+        var bestY: CGFloat = 0
+        var bestPaneTop: CGFloat = -1
+        for _ in 0..<24 {
+            let mid = (lo + hi) * 0.5
+            let s = resolveScroll(forOrigin: CGPoint(x: scrollOrigin.x, y: mid))
+            let paneTop = side == .left ? s.left : s.right
+            if paneTop <= desiredPaneTop {
+                if paneTop > bestPaneTop {
+                    bestPaneTop = paneTop
+                    bestY = mid
+                }
+                lo = mid
+            } else {
+                hi = mid
+            }
+        }
+        return bestY
+    }
+
+    /// Computes the virtual scroll offset `y` for Vim `zt` so `line` sits right below any enclosing sticky lines.
+    func scrollYBelowSticky(forLine line: Int, side: Side) -> CGFloat {
+        guard stickyLinesEnabled else {
+            return CGFloat(row(forLine: line, side: side)) * codeFont.lineHeight
+        }
+        let lh = codeFont.lineHeight
+        let targetRow: Int
+        switch mode {
+        case .single:
+            targetRow = max(0, line)
+        case .sideBySide:
+            targetRow = displayRow(forLine: line, side: side)
+        case .unified:
+            targetRow = unifiedDisplayRow(forLine: line, side: side)
+        }
+        let limit = min(stickyLinesMaxCount, Int(floor(bounds.height / max(1, lh))) / 3)
+        let scopes = (mode == .sideBySide && side == .left) ? leftStickyDisplayScopes : rightStickyDisplayScopes
+        var ancestorCount = 0
+        for scope in scopes where scope.headerRow < targetRow && scope.endRow > targetRow {
+            ancestorCount += 1
+        }
+        let effectiveSlots = min(ancestorCount, max(0, limit))
+        return stickyScrollTargetY(for: line, side: side, slotIndex: effectiveSlots)
     }
 
     // MARK: Fold bars
@@ -3704,8 +4473,15 @@ final class CodeCanvasView: NSView {
     /// Remembers what the pointer is over, for the context menu that is about to be built.
     func noteContextMenu(_ event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        contextHunk = hunkIndex(at: point)
-        contextLSPSymbol = lspSymbolTarget(at: point)
+        if let sticky = stickyHit(at: point) {
+            contextStickyLine = (sticky.scope.sourceSide, sticky.scope.sourceLine)
+            contextHunk = nil
+            contextLSPSymbol = nil
+        } else {
+            contextStickyLine = nil
+            contextHunk = hunkIndex(at: point)
+            contextLSPSymbol = lspSymbolTarget(at: point)
+        }
     }
 
     /// The change a context menu is for, set directly (the debug hooks build menus without a click).
@@ -3713,6 +4489,9 @@ final class CodeCanvasView: NSView {
 
     /// The LSP symbol a context menu is for, set directly (for tests and debug hooks).
     func noteContextLSPSymbol(_ target: LSPHoverTarget?) { contextLSPSymbol = target }
+
+    /// The sticky line a context menu is for, set directly (for tests and debug hooks).
+    func noteContextStickyLine(_ target: (side: Side, line: Int)?) { contextStickyLine = target }
 
     /// What each visible commit tick shows, top to bottom, for the debug hooks: "0:on 1:mixed".
     var visibleTickStates: String {
@@ -3724,6 +4503,20 @@ final class CodeCanvasView: NSView {
     func handleMouseMoved(_ event: NSEvent?) {
         let point = event.map { convert($0.locationInWindow, from: nil) }
         lastMousePoint = point
+        if let point, let sticky = stickyHit(at: point) {
+            hoveredSticky = (sticky.pane, sticky.slotIndex)
+            if hoveredAnnotationLine != nil { setHoveredAnnotation(nil) }
+            if hoveredRevert != nil { hoveredRevert = nil }
+            if hoveredTick != nil { hoveredTick = nil }
+            if hoveredConflict != nil { hoveredConflict = nil }
+            if hoveredMoveBadge != nil { hoveredMoveBadge = nil }
+            if hoveredFoldSegment != nil { hoveredFoldSegment = nil }
+            if hoveredMoveConnector != nil { hoveredMoveConnector = nil }
+            clearLSPHover()
+            NSCursor.pointingHand.set()
+            return
+        }
+        if hoveredSticky != nil { hoveredSticky = nil }
         let line = point.flatMap(annotatedLine(at:))
         if line != hoveredAnnotationLine { setHoveredAnnotation(line) }
         let hit = point.flatMap(revertHit(at:))
@@ -3780,6 +4573,11 @@ final class CodeCanvasView: NSView {
         }
         guard let point else {
             clearLSPHover()
+            return
+        }
+        if stickyHit(at: point) != nil {
+            clearLSPHover()
+            NSCursor.pointingHand.set()
             return
         }
         let commandOnly = Self.isCommandOnly(event.modifierFlags)
@@ -4010,6 +4808,10 @@ final class CodeCanvasView: NSView {
             scrollRuler(to: point)
             return
         }
+        if let hit = stickyHit(at: point) {
+            pressedSticky = hit
+            return
+        }
         if let hunk = tickHit(at: point) {
             pressedTick = hunk
             return
@@ -4094,9 +4896,10 @@ final class CodeCanvasView: NSView {
             scrollRuler(to: point)
             return
         }
-        guard pressedRevert == nil, pressedTick == nil, pressedConflict == nil, pressedMoveBadge == nil, pressedMoveConnector == nil, pressedFoldSegment == nil, dragSelecting, let current = selection else { return }
-        if point.y < 0 {
-            container?.scrollBy(dx: 0, dy: max(-60, point.y))
+        guard pressedRevert == nil, pressedTick == nil, pressedConflict == nil, pressedMoveBadge == nil, pressedMoveConnector == nil, pressedFoldSegment == nil, pressedSticky == nil, dragSelecting, let current = selection else { return }
+        let topEdge = stickyHeight(for: current.pane)
+        if point.y < topEdge {
+            container?.scrollBy(dx: 0, dy: max(-60, point.y - topEdge))
         } else if point.y > bounds.height {
             container?.scrollBy(dx: 0, dy: min(60, point.y - bounds.height))
         }
@@ -4108,6 +4911,14 @@ final class CodeCanvasView: NSView {
     func handleMouseUp(_ event: NSEvent) {
         draggingRuler = false
         dragSelecting = false
+        if let pressed = pressedSticky {
+            pressedSticky = nil
+            if let hit = stickyHit(at: convert(event.locationInWindow, from: nil)),
+               hit.pane == pressed.pane, hit.slotIndex == pressed.slotIndex {
+                delegate?.canvas(self, didClickStickyLine: pressed.scope.sourceLine, side: pressed.scope.sourceSide, slotIndex: pressed.slotIndex)
+            }
+            return
+        }
         if let pressed = pressedTick {
             pressedTick = nil
             if tickHit(at: convert(event.locationInWindow, from: nil)) == pressed {

@@ -73,6 +73,106 @@ enum SymbolOccurrenceNavigator {
             $0.line < line || ($0.line == line && $0.range.upperBound <= column)
         }) ?? (matches.count - 1)
     }
+
+    /// Maps `documentHighlight` ranges resolved on `diskLines` onto `snapshotLines` (e.g. left pane or historical commit)
+    /// without expanding beyond the highlights returned by the language server.
+    static func mapHighlightsToSnapshot(
+        _ highlights: [LSPDocumentHighlight],
+        diskLines: [String],
+        snapshotLines: [String],
+        symbolName: String,
+        side: Side = .right
+    ) -> [SearchMatch] {
+        if diskLines == snapshotLines {
+            return matches(from: highlights, in: snapshotLines, side: side)
+        }
+        guard let aligned = Myers.matches(diskLines, snapshotLines, maxEdits: 4000) else {
+            return []
+        }
+
+        var diskToSnap: [Int: Int] = [:]
+        var hunks: [(disk: Range<Int>, snap: Range<Int>)] = []
+        var i = 0
+        var j = 0
+        let m = diskLines.count
+        let n = snapshotLines.count
+        while i < m || j < n {
+            if i < m, j < n, aligned.a[i], aligned.b[j] {
+                diskToSnap[i] = j
+                i += 1
+                j += 1
+            } else {
+                let dStart = i
+                let sStart = j
+                while i < m, !aligned.a[i] { i += 1 }
+                while j < n, !aligned.b[j] { j += 1 }
+                hunks.append((dStart..<i, sStart..<j))
+            }
+        }
+
+        var result: [SearchMatch] = []
+        result.reserveCapacity(highlights.count)
+        for item in highlights {
+            let diskLine = item.range.start.line
+            guard item.range.end.line == diskLine, diskLines.indices.contains(diskLine) else { continue }
+            if let snapLine = diskToSnap[diskLine] {
+                let length = (snapshotLines[snapLine] as NSString).length
+                let start = max(0, min(item.range.start.character, length))
+                let end = max(0, min(item.range.end.character, length))
+                if end > start {
+                    result.append(SearchMatch(side: side, line: snapLine, range: start..<end))
+                }
+            } else if let hunk = hunks.first(where: { $0.disk.contains(diskLine) }),
+                      !hunk.snap.isEmpty,
+                      !symbolName.isEmpty {
+                let trimmedDisk = diskLines[diskLine].trimmingCharacters(in: .whitespacesAndNewlines)
+                let expectedSnapOffset = diskLine - hunk.disk.lowerBound
+                var bestSnapLine: Int?
+                var bestRanges: [Range<Int>] = []
+                var bestDistance = Int.max
+
+                for snapLine in hunk.snap {
+                    guard snapshotLines[snapLine].trimmingCharacters(in: .whitespacesAndNewlines) == trimmedDisk else { continue }
+                    let ranges = LSPNavigationHelper.identifierRanges(of: symbolName, in: snapshotLines[snapLine])
+                    guard !ranges.isEmpty else { continue }
+                    let dist = abs((snapLine - hunk.snap.lowerBound) - expectedSnapOffset)
+                    if dist < bestDistance {
+                        bestDistance = dist
+                        bestSnapLine = snapLine
+                        bestRanges = ranges
+                    }
+                }
+
+                if bestSnapLine == nil, hunk.disk.count == hunk.snap.count {
+                    let candidate = hunk.snap.lowerBound + expectedSnapOffset
+                    let ranges = LSPNavigationHelper.identifierRanges(of: symbolName, in: snapshotLines[candidate])
+                    if !ranges.isEmpty {
+                        bestSnapLine = candidate
+                        bestRanges = ranges
+                    }
+                }
+
+                if let snapLine = bestSnapLine,
+                   let chosen = bestRanges.min(by: {
+                       abs($0.lowerBound - item.range.start.character) < abs($1.lowerBound - item.range.start.character)
+                   }) {
+                    result.append(SearchMatch(side: side, line: snapLine, range: chosen))
+                }
+            }
+        }
+
+        result.sort { lhs, rhs in
+            if lhs.line != rhs.line { return lhs.line < rhs.line }
+            if lhs.range.lowerBound != rhs.range.lowerBound { return lhs.range.lowerBound < rhs.range.lowerBound }
+            return lhs.range.upperBound < rhs.range.upperBound
+        }
+        var deduped: [SearchMatch] = []
+        deduped.reserveCapacity(result.count)
+        for match in result where deduped.last != match {
+            deduped.append(match)
+        }
+        return deduped
+    }
 }
 
 /// Drives the diff/file viewer: loading documents, change navigation, in-file find.
@@ -132,6 +232,12 @@ final class ViewerModel: CodeCanvasDelegate {
             container?.canvas.vimRelativeLineNumbers = vimRelativeLineNumbers
         }
     }
+    var vimCursorColorHex: String? = nil {
+        didSet {
+            guard vimCursorColorHex != oldValue else { return }
+            container?.canvas.vimCursorColor = vimCursorColorHex.flatMap(NSColor.fromHex)?.cgColor
+        }
+    }
     var vimMode: VimMode = .normal
     var vimPendingKeys = ""
     var vimCursorLine = 1
@@ -139,7 +245,10 @@ final class ViewerModel: CodeCanvasDelegate {
 
     @ObservationIgnored weak var container: CodeScrollContainer?
     @ObservationIgnored var settings: Settings! {
-        didSet { syncVimSettings() }
+        didSet {
+            syncVimSettings()
+            syncStickyLinesSettings()
+        }
     }
     @ObservationIgnored var onExit: (() -> Void)?
     @ObservationIgnored var onStepFile: ((Int) -> Bool)?
@@ -210,9 +319,9 @@ final class ViewerModel: CodeCanvasDelegate {
     @ObservationIgnored var lspDebounceTimer: Timer?
     /// ⌘+Click on a symbol in an LSP-enabled pane (`line` is 0-based, `character` is 0-based UTF-16).
     @ObservationIgnored var onGoToDefinition: ((Int, Int) -> Void)?
-    @ObservationIgnored private var symbolHighlightTask: Task<Void, Never>?
+    @ObservationIgnored var symbolHighlightTask: Task<Void, Never>?
     @ObservationIgnored private var symbolHighlightGeneration: UInt64 = 0
-    @ObservationIgnored private var symbolOccurrenceCache: (docID: ObjectIdentifier, diffRevision: Int, side: Side, symbolName: String, matches: [SearchMatch])?
+    @ObservationIgnored private var symbolOccurrenceCache: (docID: ObjectIdentifier, diffRevision: Int, side: Side, symbolName: String, isSemantic: Bool, matches: [SearchMatch])?
 
     // Spreadsheet viewer (see ExcelViewerView.swift).
     /// Target sheet name requested before (or while) an `.xlsx` workbook finishes loading.
@@ -321,8 +430,10 @@ final class ViewerModel: CodeCanvasDelegate {
         guard let settings else { return }
         vimModeEnabled = settings.vimMode
         vimRelativeLineNumbers = settings.vimRelativeLineNumbers
+        vimCursorColorHex = settings.vimCursorColorHex
         container?.canvas.vimModeEnabled = vimModeEnabled
         container?.canvas.vimRelativeLineNumbers = vimRelativeLineNumbers
+        container?.canvas.vimCursorColor = vimCursorColorHex.flatMap(NSColor.fromHex)?.cgColor
     }
 
     func setVimMode(_ enabled: Bool) {
@@ -341,6 +452,39 @@ final class ViewerModel: CodeCanvasDelegate {
         }
         vimRelativeLineNumbers = enabled
         container?.canvas.vimRelativeLineNumbers = enabled
+    }
+
+    func setVimCursorColorHex(_ hex: String?) {
+        let normalized = NSColor.normalizedHexColor(hex)
+        if let settings, settings.vimCursorColorHex != normalized {
+            settings.vimCursorColorHex = normalized
+            settings.save()
+        }
+        vimCursorColorHex = normalized
+        container?.canvas.vimCursorColor = normalized.flatMap(NSColor.fromHex)?.cgColor
+    }
+
+    func syncStickyLinesSettings() {
+        guard let settings else { return }
+        container?.canvas.stickyLinesEnabled = settings.stickyLines
+        container?.canvas.stickyLinesMaxCount = settings.stickyLinesMaxCount
+    }
+
+    func setStickyLines(_ enabled: Bool) {
+        if let settings, settings.stickyLines != enabled {
+            settings.stickyLines = enabled
+            settings.save()
+        }
+        container?.canvas.stickyLinesEnabled = enabled
+    }
+
+    func setStickyLinesMaxCount(_ count: Int) {
+        let clamped = min(Settings.stickyLinesRange.upperBound, max(Settings.stickyLinesRange.lowerBound, count))
+        if let settings, settings.stickyLinesMaxCount != clamped {
+            settings.stickyLinesMaxCount = clamped
+            settings.save()
+        }
+        container?.canvas.stickyLinesMaxCount = clamped
     }
 
     @discardableResult
@@ -377,6 +521,7 @@ final class ViewerModel: CodeCanvasDelegate {
         container.canvas.delegate = self
         container.canvas.codeFont = CodeFont.current(settings)
         syncVimSettings()
+        syncStickyLinesSettings()
         container.canvas.onActiveLineChange = { [weak self] side, line in
             self?.refreshLineDiff(side: side, line: line)
         }
@@ -1188,7 +1333,9 @@ final class ViewerModel: CodeCanvasDelegate {
             container.scroll(toRow: row, fraction: 0.5, animated: false)
         } else {
             let top = container.topRow
-            if row < top + 2 || row > top + container.visibleRowCount - 4 {
+            let lh = max(1, container.canvas.codeFont.lineHeight)
+            let stickyRows = Int(ceil(container.canvas.stickyHeight(for: match.side) / lh))
+            if row < top + stickyRows + 2 || row > top + container.visibleRowCount - 4 {
                 container.scroll(toRow: row, fraction: 0.4, animated: true)
             }
         }
@@ -1236,28 +1383,42 @@ final class ViewerModel: CodeCanvasDelegate {
     }
 
     /// Jumps to the next (`forward == true`) or previous (`forward == false`) occurrence of the symbol under the cursor.
-    /// Uses LSP `textDocument/documentHighlight` when available on live documents, with cached fast path and whole-word fallback.
+    /// Uses LSP `textDocument/documentHighlight` strictly within lexical scope for LSP-enabled files;
+    /// falls back to whole-word matching only when no LSP server/provider is available for the language.
     func stepSymbolOccurrence(forward: Bool) {
         guard let container, let doc = document, case .text = doc.content else { return }
         let ctx = container.canvas.symbolCursorContext() ?? (.right, currentCaretPosition().row, currentCaretPosition().column)
         let lines = doc.buffer(ctx.side).lines
-        guard lines.indices.contains(ctx.line),
-              let symbol = LSPNavigationHelper.extractSymbol(in: lines[ctx.line], at: ctx.column) else {
-            return
-        }
+        guard lines.indices.contains(ctx.line) else { return }
+        let symbol = LSPNavigationHelper.extractSymbol(in: lines[ctx.line], at: ctx.column)
 
         let docID = ObjectIdentifier(doc)
         if let cache = symbolOccurrenceCache,
            cache.docID == docID,
            cache.diffRevision == diffRevision,
-           cache.side == ctx.side,
-           cache.symbolName == symbol.name,
-           SymbolOccurrenceNavigator.contains(line: ctx.line, column: ctx.column, symbolRange: symbol.range, in: cache.matches) {
-            applySymbolOccurrenceJump(matches: cache.matches, originLine: ctx.line, originColumn: ctx.column, forward: forward)
-            return
+           cache.side == ctx.side {
+            let hit: Bool
+            if cache.isSemantic {
+                hit = cache.matches.contains { match in
+                    match.line == ctx.line && (
+                        (ctx.column >= match.range.lowerBound && ctx.column < match.range.upperBound)
+                        || (ctx.column == match.range.upperBound && symbol?.range == match.range)
+                    )
+                }
+            } else if let symbol, cache.symbolName == symbol.name {
+                hit = SymbolOccurrenceNavigator.contains(line: ctx.line, column: ctx.column, symbolRange: symbol.range, in: cache.matches)
+            } else {
+                hit = false
+            }
+            if hit {
+                applySymbolOccurrenceJump(matches: cache.matches, originLine: ctx.line, originColumn: ctx.column, forward: forward)
+                return
+            }
         }
 
-        if ctx.side == .right, isCurrentDocumentLSPSyncEnabled, AppEnvironment.hasLSP {
+        guard let symbol else { return }
+
+        if AppEnvironment.hasLSP, isCurrentDocumentLSPEnabled {
             symbolHighlightTask?.cancel()
             symbolHighlightGeneration &+= 1
             let gen = symbolHighlightGeneration
@@ -1266,51 +1427,160 @@ final class ViewerModel: CodeCanvasDelegate {
             let symbolRange = symbol.range
             let originLine = ctx.line
             let originColumn = ctx.column
+            let originSide = ctx.side
+            let queryColumn = max(symbolRange.lowerBound, min(originColumn, max(symbolRange.lowerBound, symbolRange.upperBound - 1)))
+            let isSyncEnabled = isCurrentDocumentLSPSyncEnabled
+            let req = request
 
             symbolHighlightTask = Task { @MainActor [weak self, weak doc] in
                 guard let self, let doc else { return }
-                var resolvedMatches: [SearchMatch] = []
-                if let active = await self.ensureLSPDocumentSynced() {
+                let outcome: LSPDocumentHighlightResult
+                var lspMatches: [SearchMatch] = []
+
+                if originSide == .right, isSyncEnabled {
+                    if let active = await self.ensureLSPDocumentSynced() {
+                        guard !Task.isCancelled,
+                              self.symbolHighlightGeneration == gen,
+                              self.document === doc,
+                              self.diffRevision == startRevision else { return }
+                        let text = doc.right.lines.joined(separator: "\n")
+                        outcome = await self.lspManager.documentHighlightResult(
+                            fileURL: active.fileURL,
+                            line: originLine,
+                            character: queryColumn,
+                            text: text,
+                            language: active.language,
+                            repoRoot: active.repoRoot
+                        )
+                        if case .highlights(let highlights) = outcome {
+                            lspMatches = SymbolOccurrenceNavigator.matches(from: highlights, in: doc.right.lines, side: .right)
+                        }
+                    } else {
+                        let available = await self.lspManager.isServerAvailable(for: doc.language)
+                        outcome = available ? .failed : .unavailable
+                    }
+                } else {
+                    let snapshotLines = doc.buffer(originSide).lines
+                    let clickedLineText = snapshotLines.indices.contains(originLine) ? snapshotLines[originLine] : ""
+                    let offsetInSymbol = max(0, min(queryColumn - symbolRange.lowerBound, max(0, symbolRange.count - 1)))
+                    let refLines: [String]?
+                    let queryFileURL: URL
+                    let queryRepoRoot: URL?
+                    let queryText: String?
+
+                    if originSide == .left, isSyncEnabled {
+                        if let active = await self.ensureLSPDocumentSynced() {
+                            refLines = doc.right.lines
+                            queryFileURL = active.fileURL
+                            queryRepoRoot = active.repoRoot
+                            queryText = doc.right.lines.joined(separator: "\n")
+                        } else {
+                            let available = await self.lspManager.isServerAvailable(for: doc.language)
+                            guard !Task.isCancelled,
+                                  self.symbolHighlightGeneration == gen,
+                                  self.document === doc,
+                                  self.diffRevision == startRevision else { return }
+                            if available {
+                                self.onToast?(L("Language server is busy — try again", "语言服务正在索引，请稍后重试"))
+                            } else {
+                                let fallback = SymbolOccurrenceNavigator.wholeWordOccurrences(of: symbolName, in: snapshotLines, side: originSide)
+                                guard !fallback.isEmpty else { return }
+                                self.symbolOccurrenceCache = (ObjectIdentifier(doc), startRevision, originSide, symbolName, false, fallback)
+                                self.applySymbolOccurrenceJump(matches: fallback, originLine: originLine, originColumn: originColumn, forward: forward)
+                            }
+                            return
+                        }
+                    } else {
+                        guard let req else { return }
+                        let canonicalFileURL = LSPURI.canonicalFileURL(req.fileURL)
+                        let canonicalRepoRoot = LSPURI.canonicalFileURL(req.lspRepoRoot ?? req.root)
+                        refLines = await Task.detached(priority: .userInitiated) {
+                            guard let data = try? Data(contentsOf: canonicalFileURL, options: .mappedIfSafe),
+                                  !TextCodec.looksBinary(data) else {
+                                return nil
+                            }
+                            return TextCodec.splitLines(TextCodec.decode(data))
+                        }.value
+                        queryFileURL = canonicalFileURL
+                        queryRepoRoot = canonicalRepoRoot
+                        queryText = nil
+                    }
+
                     guard !Task.isCancelled,
                           self.symbolHighlightGeneration == gen,
                           self.document === doc,
                           self.diffRevision == startRevision else { return }
-                    let text = doc.right.lines.joined(separator: "\n")
-                    let highlights = await self.lspManager.documentHighlight(
-                        fileURL: active.fileURL,
-                        line: originLine,
-                        character: originColumn,
-                        text: text,
-                        language: active.language,
-                        repoRoot: active.repoRoot
+
+                    guard let refLines,
+                          let mapped = LSPNavigationHelper.mapSymbolToWorkingTree(
+                              symbolName: symbolName,
+                              clickedLineText: clickedLineText,
+                              clickedLine: originLine,
+                              clickedStartColumn: symbolRange.lowerBound,
+                              offsetInSymbol: offsetInSymbol,
+                              diskLines: refLines
+                          ) else {
+                        let available = await self.lspManager.isServerAvailable(for: doc.language)
+                        guard !Task.isCancelled,
+                              self.symbolHighlightGeneration == gen,
+                              self.document === doc,
+                              self.diffRevision == startRevision else { return }
+                        if !available {
+                            let fallback = SymbolOccurrenceNavigator.wholeWordOccurrences(of: symbolName, in: snapshotLines, side: originSide)
+                            guard !fallback.isEmpty else { return }
+                            self.symbolOccurrenceCache = (ObjectIdentifier(doc), startRevision, originSide, symbolName, false, fallback)
+                            self.applySymbolOccurrenceJump(matches: fallback, originLine: originLine, originColumn: originColumn, forward: forward)
+                        }
+                        return
+                    }
+
+                    outcome = await self.lspManager.documentHighlightResult(
+                        fileURL: queryFileURL,
+                        line: mapped.line,
+                        character: mapped.character,
+                        text: queryText,
+                        language: doc.language,
+                        repoRoot: queryRepoRoot
                     )
-                    guard !Task.isCancelled,
-                          self.symbolHighlightGeneration == gen,
-                          self.document === doc,
-                          self.diffRevision == startRevision else { return }
-                    let lspMatches = SymbolOccurrenceNavigator.matches(from: highlights, in: doc.right.lines, side: .right)
-                    if !lspMatches.isEmpty,
-                       SymbolOccurrenceNavigator.contains(line: originLine, column: originColumn, symbolRange: symbolRange, in: lspMatches) {
-                        resolvedMatches = lspMatches
+                    if case .highlights(let highlights) = outcome {
+                        lspMatches = SymbolOccurrenceNavigator.mapHighlightsToSnapshot(
+                            highlights,
+                            diskLines: refLines,
+                            snapshotLines: snapshotLines,
+                            symbolName: symbolName,
+                            side: originSide
+                        )
                     }
                 }
+
                 guard !Task.isCancelled,
                       self.symbolHighlightGeneration == gen,
                       self.document === doc,
                       self.diffRevision == startRevision else { return }
-                if resolvedMatches.isEmpty {
-                    resolvedMatches = SymbolOccurrenceNavigator.wholeWordOccurrences(of: symbolName, in: doc.right.lines, side: .right)
+
+                switch outcome {
+                case .highlights:
+                    guard !lspMatches.isEmpty,
+                          SymbolOccurrenceNavigator.contains(line: originLine, column: originColumn, symbolRange: symbolRange, in: lspMatches) else {
+                        return
+                    }
+                    self.symbolOccurrenceCache = (ObjectIdentifier(doc), startRevision, originSide, symbolName, true, lspMatches)
+                    self.applySymbolOccurrenceJump(matches: lspMatches, originLine: originLine, originColumn: originColumn, forward: forward)
+                case .failed:
+                    self.onToast?(L("Language server is busy — try again", "语言服务正在索引，请稍后重试"))
+                case .unavailable:
+                    let fallback = SymbolOccurrenceNavigator.wholeWordOccurrences(of: symbolName, in: doc.buffer(originSide).lines, side: originSide)
+                    guard !fallback.isEmpty else { return }
+                    self.symbolOccurrenceCache = (ObjectIdentifier(doc), startRevision, originSide, symbolName, false, fallback)
+                    self.applySymbolOccurrenceJump(matches: fallback, originLine: originLine, originColumn: originColumn, forward: forward)
                 }
-                guard !resolvedMatches.isEmpty else { return }
-                self.symbolOccurrenceCache = (ObjectIdentifier(doc), startRevision, .right, symbolName, resolvedMatches)
-                self.applySymbolOccurrenceJump(matches: resolvedMatches, originLine: originLine, originColumn: originColumn, forward: forward)
             }
             return
         }
 
         let matches = SymbolOccurrenceNavigator.wholeWordOccurrences(of: symbol.name, in: lines, side: ctx.side)
         guard !matches.isEmpty else { return }
-        symbolOccurrenceCache = (docID, diffRevision, ctx.side, symbol.name, matches)
+        symbolOccurrenceCache = (docID, diffRevision, ctx.side, symbol.name, false, matches)
         applySymbolOccurrenceJump(matches: matches, originLine: ctx.line, originColumn: ctx.column, forward: forward)
     }
 
@@ -1420,6 +1690,25 @@ final class ViewerModel: CodeCanvasDelegate {
         canvas.focusedHunk = index
     }
 
+    func canvas(_ canvas: CodeCanvasView, didClickStickyLine line: Int, side: Side, slotIndex: Int) {
+        ensureLineVisible(line, side: side)
+        if side == .right {
+            let current = currentCaretPosition()
+            if line != current.row {
+                onRecordJump?(current.row, current.column)
+            }
+            canvas.placeCaret(line: line, column: 0)
+            if canvas.vimModeEnabled {
+                canvas.reportVimStateIfNeeded(force: true)
+            }
+        }
+        canvas.focusLine = (side, line)
+        refreshLineDiff(side: side, line: line)
+        let targetY = canvas.stickyScrollTargetY(for: line, side: side, slotIndex: slotIndex)
+        container?.scroll(toY: targetY, animated: true)
+        detachedFromFocus = true
+    }
+
     func canvas(_ canvas: CodeCanvasView, performVimAction action: VimAction, line: Int, column: Int) {
         switch action {
         case .openFind:
@@ -1438,7 +1727,7 @@ final class ViewerModel: CodeCanvasDelegate {
         case .scrollCenter:
             container?.scroll(toRow: canvas.row(forLine: line, side: .right), fraction: 0.5, animated: false)
         case .scrollTop:
-            container?.scroll(toRow: canvas.row(forLine: line, side: .right), fraction: 0.0, animated: false)
+            container?.scroll(toY: canvas.scrollYBelowSticky(forLine: line, side: .right), animated: false)
         case .scrollBottom:
             container?.scroll(toRow: canvas.row(forLine: line, side: .right), fraction: 0.92, animated: false)
         case .scrollHalfPage(let down):

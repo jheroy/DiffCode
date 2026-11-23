@@ -115,7 +115,7 @@ struct ChangedFileSymbol: Identifiable, Equatable, Sendable {
 
 /// Fast, zero-I/O, comment- and string-aware static symbol extractor.
 enum FileSymbolExtractor {
-    private struct Token {
+    struct Token {
         let text: String
         /// 0-based UTF-16 start offset in the original line.
         let start: Int
@@ -124,7 +124,7 @@ enum FileSymbolExtractor {
         let isIdentifier: Bool
     }
 
-    private struct ScannedLine {
+    struct ScannedLine {
         let lineNumber: Int
         let original: String
         let units: [UInt16]
@@ -143,7 +143,7 @@ enum FileSymbolExtractor {
         let tokens: [Token]
     }
 
-    private struct ScannerConfig {
+    struct ScannerConfig {
         var slashComments: Bool = true
         var hashComments: Bool = false
         var nestedBlockComments: Bool = false
@@ -1115,7 +1115,7 @@ enum FileSymbolExtractor {
 
     // MARK: - Shared Scanner (Comment & String Masking with Exact UTF-16 Offsets)
 
-    private static func scan(lines: [String], config: ScannerConfig) -> [ScannedLine] {
+    static func scan(lines: [String], config: ScannerConfig) -> [ScannedLine] {
         var result: [ScannedLine] = []
         result.reserveCapacity(lines.count)
 
@@ -1433,7 +1433,7 @@ enum FileSymbolExtractor {
         )
     }
 
-    private static func matchingClose(tokens: [Token], openIndex: Int, open: String, close: String) -> Int? {
+    static func matchingClose(tokens: [Token], openIndex: Int, open: String, close: String) -> Int? {
         var depth = 0
         for i in openIndex..<tokens.count {
             if tokens[i].text == open {
@@ -1525,7 +1525,7 @@ enum FileSymbolExtractor {
     ]
 
     /// Infers 1-based inclusive `endLine` for brace-delimited languages using `ScannedLine` brace depths.
-    private static func attachBraceEndLines(_ items: [FileSymbolItem], scanned: [ScannedLine]) -> [FileSymbolItem] {
+    static func attachBraceEndLines(_ items: [FileSymbolItem], scanned: [ScannedLine]) -> [FileSymbolItem] {
         guard !items.isEmpty, !scanned.isEmpty else { return items }
         let lastFileLine = scanned.last?.lineNumber ?? scanned.count
         var out = items
@@ -1564,10 +1564,14 @@ enum FileSymbolExtractor {
                 if cur.tokens.contains(where: { $0.text == "{" }) {
                     if cur.endBraceDepth > baseDepth {
                         inferredEnd = findClosingBraceLine(in: scanned, after: k, targetDepth: baseDepth, fallback: lastFileLine)
-                    } else {
-                        inferredEnd = cur.lineNumber
+                        break
                     }
-                    break
+                    // Inline `interface{}` / `struct{}` inside a multi-line parameter list still has open parens;
+                    // keep scanning until the parameter list closes and the body `{` appears.
+                    if cur.endParenDepth <= startLine.startParenDepth {
+                        inferredEnd = cur.lineNumber
+                        break
+                    }
                 }
                 if cur.tokens.contains(where: { $0.text == ";" }) && cur.endBraceDepth == baseDepth {
                     inferredEnd = cur.lineNumber

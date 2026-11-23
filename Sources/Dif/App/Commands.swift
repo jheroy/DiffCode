@@ -137,6 +137,10 @@ extension AppStore {
                 guard let self else { return }
                 self.viewer.setVimMode(!self.settings.vimMode)
             },
+            AppCommand(id: "view.stickyLines", title: L("Toggle Sticky Lines", "显示/隐藏 粘性行 (Sticky Lines)"), symbol: "pin", group: .view) { [weak self] in
+                guard let self else { return }
+                self.viewer.setStickyLines(!self.settings.stickyLines)
+            },
             AppCommand(id: "view.lineDiffBar", title: L("Toggle Inline Line Diff Bar", "显示/隐藏 底部行内对比栏"), symbol: "rectangle.split.1x2", group: .view) { [weak self] in
                 guard let self else { return }
                 self.settings.showLineDiffBar.toggle()
