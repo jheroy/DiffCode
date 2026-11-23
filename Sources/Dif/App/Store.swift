@@ -14,6 +14,8 @@ enum Popup: Equatable {
     case references
     /// Current file structure / symbols outline with fuzzy filtering and code preview.
     case fileSymbols
+    /// Selected lines' commit history with restricted excerpt diff preview (`⌘B`).
+    case selectionHistory
     /// A question or notice (`AppStore.dialog`).
     case dialog
 }
@@ -37,6 +39,7 @@ final class AppStore {
     let gitGraph = GitGraphModel()
     let references = ReferencesPickerModel()
     let fileSymbols = FileSymbolsModel()
+    let selectionHistory = SelectionHistoryModel()
     /// Where each project's branch sits in the sidebar, in window coordinates: ⌥⌘B opens the graph under it.
     @ObservationIgnored var branchLabelFrames: [UUID: CGRect] = [:]
 
@@ -152,6 +155,7 @@ final class AppStore {
         gitGraph.store = self
         references.store = self
         fileSymbols.store = self
+        selectionHistory.store = self
         restoreCachedAgentModels()
     }
 
@@ -1357,6 +1361,7 @@ final class AppStore {
         viewer.applyCodeFont()
         finder.applyCodeFont()
         references.applyCodeFont()
+        selectionHistory.applyCodeFont()
         mergeSession?.applyCodeFont()
     }
 
@@ -1367,6 +1372,7 @@ final class AppStore {
         viewer.applyCodeFont()
         finder.applyCodeFont()
         references.applyCodeFont()
+        selectionHistory.applyCodeFont()
         mergeSession?.applyCodeFont()
     }
 
@@ -1377,6 +1383,7 @@ final class AppStore {
         viewer.applyCodeFont()
         finder.applyCodeFont()
         references.applyCodeFont()
+        selectionHistory.applyCodeFont()
         mergeSession?.applyCodeFont()
     }
 
@@ -1387,6 +1394,7 @@ final class AppStore {
         viewer.applyCodeFont()
         finder.applyCodeFont()
         references.applyCodeFont()
+        selectionHistory.applyCodeFont()
         mergeSession?.applyCodeFont()
     }
 
@@ -1553,6 +1561,7 @@ final class AppStore {
         if popup == .gitGraph, kind != .gitGraph { gitGraph.release() }
         if popup == .references, kind != .references { references.release() }
         if popup == .fileSymbols, kind != .fileSymbols { fileSymbols.release() }
+        if popup == .selectionHistory, kind != .selectionHistory { selectionHistory.release() }
         popup = kind
     }
 
@@ -1562,6 +1571,7 @@ final class AppStore {
         if popup == .gitGraph { gitGraph.release() }
         if popup == .references { references.release() }
         if popup == .fileSymbols { fileSymbols.release() }
+        if popup == .selectionHistory { selectionHistory.release() }
         dialog = nil
         popup = nil
         if restoreFocus {

@@ -177,6 +177,337 @@ extension Git {
         return parseLog(try await run(args, in: dir, okStatuses: [0, 128]))
     }
 
+    private static let lineHistoryStartMarker = Data([0x1E]) + Data("DIF_LH_START\u{1F}".utf8)
+    private static let lineHistoryPatchMarker = Data("\u{1E}DIF_LH_PATCH\u{1E}".utf8)
+    private static let lineHistoryFormat = "%x1eDIF_LH_START%x1f" + logFields + "%x1f%B%x1eDIF_LH_PATCH%x1e"
+
+    /// Commits that changed some lines of a file (`git log -L`), newest first, including each commit's
+    /// tracked-line patch restricted strictly to those lines.
+    static func lineHistoryEntries(_ path: String, lines: ClosedRange<Int>, rev: String, in dir: URL,
+                                   skip: Int, limit: Int, query: String = "",
+                                   authors: [AuthorFilter] = []) async throws -> [LineHistoryEntry] {
+        guard !rev.hasPrefix("-") else { return [] }
+        var args = ["log", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/",
+                    "--format=\(lineHistoryFormat)", "--decorate=full", "--skip=\(skip)", "--max-count=\(limit)",
+                    "-L\(lines.lowerBound),\(lines.upperBound):\(path)"]
+        args += authorFilterArguments(authors, query: query)
+        args.append(rev)
+        return parseLineHistoryEntries(try await run(args, in: dir, okStatuses: [0, 128]))
+    }
+
+    /// Parses output produced by `git log --format=<lineHistoryFormat> -L...`.
+    static func parseLineHistoryEntries(_ data: Data) -> [LineHistoryEntry] {
+        var entries: [LineHistoryEntry] = []
+        for record in splitData(data, by: lineHistoryStartMarker) {
+            guard let patchMarkerRange = record.range(of: lineHistoryPatchMarker) else { continue }
+            let headerData = record[record.startIndex..<patchMarkerRange.lowerBound]
+            let patchData = record[patchMarkerRange.upperBound..<record.endIndex]
+            let fields = headerData.split(separator: 0x1F, maxSplits: 7, omittingEmptySubsequences: false)
+            guard fields.count >= 7 else { continue }
+
+            let hash = String(decoding: fields[0], as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard hash.count >= 7 else { continue }
+            let parents = String(decoding: fields[1], as: UTF8.self).split(separator: " ").map(String.init)
+            let author = String(decoding: fields[2], as: UTF8.self)
+            let email = String(decoding: fields[3], as: UTF8.self)
+            let date = Date(timeIntervalSince1970: TimeInterval(String(decoding: fields[4], as: UTF8.self)) ?? 0)
+            let refs = String(decoding: fields[5], as: UTF8.self)
+                .split(separator: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            let subject = String(decoding: fields[6], as: UTF8.self)
+            let body = fields.count >= 8
+                ? String(decoding: fields[7], as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                : ""
+
+            let commit = Commit(
+                hash: hash,
+                parents: parents,
+                author: author,
+                email: email,
+                date: date,
+                refs: refs,
+                subject: subject,
+                body: body
+            )
+            let patchText = patchData.isEmpty ? "" : TextCodec.decode(Data(patchData))
+            entries.append(parseLineHistoryPatch(patchText, commit: commit))
+        }
+        return entries
+    }
+
+    private static func splitData(_ data: Data, by separator: Data) -> [Data] {
+        guard !data.isEmpty, !separator.isEmpty else { return [] }
+        var slices: [Data] = []
+        var cursor = data.startIndex
+        while cursor < data.endIndex {
+            guard let range = data.range(of: separator, in: cursor..<data.endIndex) else {
+                slices.append(Data(data[cursor..<data.endIndex]))
+                break
+            }
+            if range.lowerBound > cursor {
+                slices.append(Data(data[cursor..<range.lowerBound]))
+            }
+            cursor = range.upperBound
+        }
+        return slices
+    }
+
+    private struct ParsedHunkHeader {
+        var oldStart: Int
+        var oldCount: Int
+        var newStart: Int
+        var newCount: Int
+        var prefixWidth: Int
+        var section: String
+    }
+
+    private static func parseHunkHeader(_ line: Substring) -> ParsedHunkHeader? {
+        let atCount = line.prefix(while: { $0 == "@" }).count
+        guard atCount >= 2 else { return nil }
+        let markers = String(repeating: "@", count: atCount)
+        guard line.hasPrefix(markers + " ") else { return nil }
+        let afterPrefix = line.dropFirst(atCount + 1)
+        guard let closeRange = afterPrefix.range(of: " " + markers) else { return nil }
+        let rangesPart = afterPrefix[..<closeRange.lowerBound]
+        let section = afterPrefix[closeRange.upperBound...].trimmingCharacters(in: .whitespaces)
+        let tokens = rangesPart.split(separator: " ", omittingEmptySubsequences: true)
+        guard let oldToken = tokens.first(where: { $0.hasPrefix("-") }),
+              let newToken = tokens.last(where: { $0.hasPrefix("+") }),
+              let oldRange = parseHunkRangeToken(oldToken, prefix: "-"),
+              let newRange = parseHunkRangeToken(newToken, prefix: "+") else {
+            return nil
+        }
+        return ParsedHunkHeader(
+            oldStart: oldRange.start,
+            oldCount: oldRange.count,
+            newStart: newRange.start,
+            newCount: newRange.count,
+            prefixWidth: max(1, atCount - 1),
+            section: section
+        )
+    }
+
+    private static func parseHunkRangeToken(_ token: Substring, prefix: Character) -> (start: Int, count: Int)? {
+        guard token.first == prefix else { return nil }
+        let body = token.dropFirst()
+        let parts = body.split(separator: ",", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let start = Int(parts[0]) else { return nil }
+        let count: Int
+        if parts.count == 2 {
+            guard let parsedCount = Int(parts[1]) else { return nil }
+            count = parsedCount
+        } else {
+            count = 1
+        }
+        return (start, count)
+    }
+
+    private static func parsePatchHeaderPath(_ raw: String, prefix: String) -> String? {
+        let cleaned = raw.hasSuffix("\t") ? String(raw.dropLast()) : raw
+        if cleaned == "/dev/null" { return nil }
+        if cleaned.hasPrefix(prefix) { return String(cleaned.dropFirst(prefix.count)) }
+        return cleaned
+    }
+
+    private static func parseLineHistoryPatch(_ patchText: String, commit: Commit) -> LineHistoryEntry {
+        var oldPath: String?
+        var newPath: String?
+        var sawOldHeader = false
+        var sawNewHeader = false
+        var fallbackOldPath: String?
+        var fallbackNewPath: String?
+
+        var leftLines: [String] = []
+        var rightLines: [String] = []
+        var leftLineNumbers: [Int] = []
+        var rightLineNumbers: [Int] = []
+        var hunks: [Hunk] = []
+        var sectionHeader = ""
+        var firstLeftStart: Int?
+        var firstRightStart: Int?
+
+        var inHunk = false
+        var prefixWidth = 1
+        var remainingOld = 0
+        var remainingNew = 0
+        var curOldLine = 1
+        var curNewLine = 1
+
+        var pendingLeftStart: Int?
+        var pendingLeftCount = 0
+        var pendingRightStart: Int?
+        var pendingRightCount = 0
+
+        func flushPendingHunk() {
+            guard pendingLeftCount > 0 || pendingRightCount > 0 else { return }
+            let ls = pendingLeftStart ?? leftLines.count
+            let rs = pendingRightStart ?? rightLines.count
+            hunks.append(Hunk(leftStart: ls, leftCount: pendingLeftCount, rightStart: rs, rightCount: pendingRightCount))
+            pendingLeftStart = nil
+            pendingLeftCount = 0
+            pendingRightStart = nil
+            pendingRightCount = 0
+        }
+
+        func appendContext(_ text: String) {
+            flushPendingHunk()
+            leftLines.append(text)
+            leftLineNumbers.append(curOldLine)
+            curOldLine += 1
+            rightLines.append(text)
+            rightLineNumbers.append(curNewLine)
+            curNewLine += 1
+        }
+
+        func appendRemoved(_ text: String) {
+            if pendingLeftStart == nil { pendingLeftStart = leftLines.count }
+            if pendingRightStart == nil { pendingRightStart = rightLines.count }
+            leftLines.append(text)
+            leftLineNumbers.append(curOldLine)
+            curOldLine += 1
+            pendingLeftCount += 1
+        }
+
+        func appendAdded(_ text: String) {
+            if pendingLeftStart == nil { pendingLeftStart = leftLines.count }
+            if pendingRightStart == nil { pendingRightStart = rightLines.count }
+            rightLines.append(text)
+            rightLineNumbers.append(curNewLine)
+            curNewLine += 1
+            pendingRightCount += 1
+        }
+
+        let lines = TextCodec.splitLines(patchText)
+        for lineStr in lines {
+            let line = Substring(lineStr)
+
+            if inHunk {
+                if line.hasPrefix("\\ No newline at end of file") {
+                    continue
+                }
+                var stillInHunk = remainingOld > 0 || remainingNew > 0
+                if !stillInHunk && prefixWidth >= 2 && line.count >= prefixWidth
+                    && !line.hasPrefix("diff --git ") && !line.hasPrefix("@@")
+                    && !line.hasPrefix("--- ") && !line.hasPrefix("+++ ")
+                    && line.prefix(prefixWidth).allSatisfy({ $0 == " " || $0 == "-" || $0 == "+" }) {
+                    stillInHunk = true
+                }
+
+                if stillInHunk {
+                    if prefixWidth == 1 {
+                        if line.isEmpty {
+                            if remainingOld > 0 && remainingNew > 0 {
+                                appendContext("")
+                                remainingOld -= 1
+                                remainingNew -= 1
+                                continue
+                            }
+                        } else if let marker = line.first {
+                            let content = String(line.dropFirst())
+                            switch marker {
+                            case " ":
+                                appendContext(content)
+                                remainingOld = max(0, remainingOld - 1)
+                                remainingNew = max(0, remainingNew - 1)
+                                continue
+                            case "-":
+                                appendRemoved(content)
+                                remainingOld = max(0, remainingOld - 1)
+                                continue
+                            case "+":
+                                appendAdded(content)
+                                remainingNew = max(0, remainingNew - 1)
+                                continue
+                            default:
+                                break
+                            }
+                        }
+                    } else if line.count >= prefixWidth {
+                        let prefix = Array(line.prefix(prefixWidth))
+                        if prefix.allSatisfy({ $0 == " " || $0 == "-" || $0 == "+" }) {
+                            let content = String(line.dropFirst(prefixWidth))
+                            if prefix.contains("-") {
+                                if prefix[0] == "-" {
+                                    appendRemoved(content)
+                                    remainingOld = max(0, remainingOld - 1)
+                                }
+                            } else if prefix[0] == "+" {
+                                appendAdded(content)
+                                remainingNew = max(0, remainingNew - 1)
+                            } else {
+                                appendContext(content)
+                                remainingOld = max(0, remainingOld - 1)
+                                remainingNew = max(0, remainingNew - 1)
+                            }
+                            continue
+                        }
+                    } else if line.isEmpty && remainingOld > 0 && remainingNew > 0 {
+                        appendContext("")
+                        remainingOld -= 1
+                        remainingNew -= 1
+                        continue
+                    }
+                }
+
+                flushPendingHunk()
+                inHunk = false
+            }
+
+            if let header = parseHunkHeader(line) {
+                flushPendingHunk()
+                if firstLeftStart == nil { firstLeftStart = header.oldStart }
+                if firstRightStart == nil { firstRightStart = header.newStart }
+                if sectionHeader.isEmpty && !header.section.isEmpty {
+                    sectionHeader = header.section
+                }
+                inHunk = true
+                prefixWidth = header.prefixWidth
+                remainingOld = header.oldCount
+                remainingNew = header.newCount
+                curOldLine = max(1, header.oldStart)
+                curNewLine = max(1, header.newStart)
+                continue
+            }
+
+            if line.hasPrefix("diff --git ") {
+                let rest = line.dropFirst(11)
+                if let bRange = rest.range(of: " b/") {
+                    let aPart = rest[..<bRange.lowerBound]
+                    let bPart = rest[bRange.upperBound...]
+                    if fallbackOldPath == nil {
+                        fallbackOldPath = aPart.hasPrefix("a/") ? String(aPart.dropFirst(2)) : String(aPart)
+                    }
+                    if fallbackNewPath == nil {
+                        fallbackNewPath = String(bPart)
+                    }
+                }
+            } else if line.hasPrefix("--- ") {
+                sawOldHeader = true
+                oldPath = parsePatchHeaderPath(String(line.dropFirst(4)), prefix: "a/")
+            } else if line.hasPrefix("+++ ") {
+                sawNewHeader = true
+                newPath = parsePatchHeaderPath(String(line.dropFirst(4)), prefix: "b/")
+            }
+        }
+
+        flushPendingHunk()
+
+        return LineHistoryEntry(
+            commit: commit,
+            oldPath: sawOldHeader ? oldPath : fallbackOldPath,
+            newPath: sawNewHeader ? newPath : fallbackNewPath,
+            leftStartLine: firstLeftStart ?? (leftLineNumbers.first ?? 0),
+            rightStartLine: firstRightStart ?? (rightLineNumbers.first ?? 0),
+            leftLines: leftLines,
+            rightLines: rightLines,
+            leftLineNumbers: leftLineNumbers,
+            rightLineNumbers: rightLineNumbers,
+            hunks: hunks,
+            sectionHeader: sectionHeader
+        )
+    }
+
     /// The history of some lines of a file in the working tree, counted in HEAD (`git log -L` needs lines of a
     /// commit). Nil when HEAD does not have the file or none of the lines.
     /// - Parameters:
@@ -194,6 +525,76 @@ extension Git {
         guard !rev.hasPrefix("-"),
               let data = try? await run(["log", "-1", "--format=\(logFormat)", "--decorate=full", rev, "--"], in: dir) else { return nil }
         return parseLog(data).first
+    }
+}
+
+/// One commit returned by `git log -L`, carrying both commit metadata and the patch restricted to the tracked lines.
+struct LineHistoryEntry: Identifiable, Equatable, Sendable {
+    var commit: Commit
+    var oldPath: String?
+    var newPath: String?
+    var leftStartLine: Int
+    var rightStartLine: Int
+    var leftLines: [String]
+    var rightLines: [String]
+    var leftLineNumbers: [Int]
+    var rightLineNumbers: [Int]
+    var hunks: [Hunk]
+    var sectionHeader: String
+
+    var id: String { commit.hash }
+
+    var displayPath: String { newPath ?? oldPath ?? "" }
+
+    var isRename: Bool {
+        guard let oldPath, let newPath else { return false }
+        return oldPath != newPath
+    }
+
+    var additions: Int { hunks.reduce(0) { $0 + $1.rightCount } }
+    var deletions: Int { hunks.reduce(0) { $0 + $1.leftCount } }
+
+    var leftLineRange: ClosedRange<Int>? {
+        guard let first = leftLineNumbers.first, let last = leftLineNumbers.last else { return nil }
+        return min(first, last)...max(first, last)
+    }
+
+    var rightLineRange: ClosedRange<Int>? {
+        guard let first = rightLineNumbers.first, let last = rightLineNumbers.last else { return nil }
+        return min(first, last)...max(first, last)
+    }
+
+    /// Builds a read-only `DiffDocument` showing only the excerpt diff for the tracked lines, with original line numbers.
+    func makeDiffDocument(fallbackPath: String) -> DiffDocument {
+        if leftLines.isEmpty && rightLines.isEmpty {
+            let doc = DiffDocument.message(
+                L("No line changes in first-parent diff", "相对第一父提交无行变更"),
+                detail: commit.subject
+            )
+            doc.leftTitle = commit.parents.first.map { String($0.prefix(7)) } ?? L("Empty", "空")
+            doc.rightTitle = commit.shortHash
+            return doc
+        }
+        let path = displayPath.isEmpty ? fallbackPath : displayPath
+        let language = LanguageSpec.detect(path: path)
+        let leftBuffer = TextBuffer(lines: leftLines)
+        leftBuffer.spans = Highlighter.highlight(leftLines, language: language)
+        let rightBuffer = TextBuffer(lines: rightLines)
+        rightBuffer.spans = Highlighter.highlight(rightLines, language: language)
+        var resolvedHunks = hunks
+        DiffLoader.addInlineHighlights(&resolvedHunks, left: leftLines, right: rightLines)
+
+        let doc = DiffDocument(left: leftBuffer, right: rightBuffer, hunks: resolvedHunks, language: language)
+        doc.editing = nil
+        doc.leftLineNumbers = leftLineNumbers
+        doc.rightLineNumbers = rightLineNumbers
+        doc.leftTitle = (oldPath == nil && leftLines.isEmpty)
+            ? L("Empty", "空")
+            : (commit.parents.first.map { String($0.prefix(7)) } ?? L("Empty", "空"))
+        doc.rightTitle = (newPath == nil && rightLines.isEmpty)
+            ? L("Deleted", "已删除")
+            : commit.shortHash
+        return doc
     }
 }
 

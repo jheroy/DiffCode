@@ -16,6 +16,10 @@ final class PopupResizeTests: XCTestCase {
         XCTAssertEqual(PopupSizeSpec.quickOpen.defaultSize, CGSize(width: 660, height: 460))
         XCTAssertEqual(PopupSizeSpec.quickOpen.minSize, CGSize(width: 480, height: 280))
         XCTAssertEqual(PopupSizeSpec.quickOpen.userDefaultsKey, "popupSize.quickOpen")
+
+        XCTAssertEqual(PopupSizeSpec.selectionHistory.defaultSize, CGSize(width: 960, height: 640))
+        XCTAssertEqual(PopupSizeSpec.selectionHistory.minSize, CGSize(width: 640, height: 400))
+        XCTAssertEqual(PopupSizeSpec.selectionHistory.userDefaultsKey, "popupSize.selectionHistory")
     }
 
     func testBottomEdgeHeightDrag() {
@@ -145,7 +149,7 @@ final class PopupResizeTests: XCTestCase {
         }
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
-        for spec in [PopupSizeSpec.references, .findInPath, .quickOpen] {
+        for spec in [PopupSizeSpec.references, .findInPath, .quickOpen, .selectionHistory] {
             // Unset returns default size.
             XCTAssertEqual(PopupSizeStore.load(spec: spec, defaults: defaults), spec.defaultSize)
 

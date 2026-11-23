@@ -35,6 +35,8 @@ struct PopupLayer: View {
                     ResizablePopup(spec: .references) { ReferencesPopupView() }
                 case .fileSymbols:
                     ResizablePopup(spec: .fileSymbols) { FileSymbolsPopupView() }
+                case .selectionHistory:
+                    ResizablePopup(spec: .selectionHistory) { SelectionHistoryPopupView() }
                 case .goToLine, .keymap, .settings:
                     Group {
                         switch popup {
@@ -1372,6 +1374,526 @@ private struct FileSymbolRow: View {
                 .padding(.horizontal, 6)
         )
         .help("\(item.kind.label) \(item.name)\(item.detail.isEmpty ? "" : " \(item.detail)") (:\(item.lineNumber))")
+    }
+}
+
+// MARK: - Selection History Preview (⌘B)
+
+struct SelectionHistoryPopupView: View {
+    @Environment(AppStore.self) private var store
+    @AppStorage("popupSplit.selectionHistory") private var splitRatio: Double = 0.38
+    @State private var showCommitBody = false
+
+    var body: some View {
+        @Bindable var model = store.selectionHistory
+        VStack(spacing: 0) {
+            headerBar(model: model)
+            Rectangle().fill(Color.difHairline).frame(height: 1)
+            splitBody(model: model)
+            Rectangle().fill(Color.difHairline).frame(height: 1)
+            footerBar(model: model)
+        }
+        .onChange(of: model.selectedIndex) { _, _ in
+            showCommitBody = false
+        }
+    }
+
+    private func headerBar(model: SelectionHistoryModel) -> some View {
+        @Bindable var model = model
+        return HStack(spacing: 10) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.ui(size: 13.5, weight: .medium))
+                .foregroundStyle(Color.difAccent)
+
+            Text(L("History for Selection", "选中行历史"))
+                .font(.ui(size: 13.5, weight: .semibold))
+                .foregroundStyle(Color.difText)
+                .lineLimit(1)
+                .layoutPriority(1)
+
+            if !model.fileName.isEmpty {
+                HStack(spacing: 5) {
+                    FileIcon(path: model.displayPath, size: 11)
+                    Text(model.lineRangeLabel.isEmpty ? model.fileName : "\(model.fileName) : \(model.lineRangeLabel)")
+                        .font(.ui(size: 11.5, design: .monospaced))
+                        .foregroundStyle(Color.difText2)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2.5)
+                .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.difChip))
+                .help(model.displayPath)
+            }
+
+            if !model.entries.isEmpty {
+                Text(countLabel(model))
+                    .font(.ui(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(Color.difText2)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(Color.difChip))
+            }
+
+            Spacer(minLength: 8)
+
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.ui(size: 11))
+                    .foregroundStyle(Color.difText3)
+                SearchField(
+                    text: $model.filterQuery,
+                    placeholder: L("Filter commits, author, hash…", "搜索提交信息、作者、哈希…"),
+                    font: .systemFont(ofSize: 12.5 * UI.scale),
+                    focusToken: model.focusToken,
+                    onMove: { model.move($0) },
+                    onSubmit: { model.activate() },
+                    onCancel: { store.dismissPopup() },
+                    onTab: { _ in model.toggleUnified() }
+                )
+                .frame(width: UI.s(210), height: UI.s(20))
+                if !model.filterQuery.isEmpty {
+                    Button {
+                        model.filterQuery = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.ui(size: 11))
+                            .foregroundStyle(Color.difText3)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 8)
+            .frame(height: UI.s(26))
+            .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.difChip))
+
+            Button {
+                store.dismissPopup()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.ui(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.difText2)
+                    .frame(width: UI.s(24), height: UI.s(24))
+                    .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.difChip))
+            }
+            .buttonStyle(.plain)
+            .help(L("Close (Esc)", "关闭 (Esc)"))
+        }
+        .padding(.horizontal, 14)
+        .frame(height: UI.s(46))
+    }
+
+    private func splitBody(model: SelectionHistoryModel) -> some View {
+        GeometryReader { geo in
+            let entry = model.selectedEntry
+            let hasBody = entry.map { !$0.commit.body.isEmpty && $0.commit.body != $0.commit.subject } ?? false
+            let previewHeaderHeight = UI.s(30)
+            let bodyStripHeight: CGFloat = hasBody && showCommitBody ? UI.s(54) : 0
+            let showsPaneTitles: Bool = {
+                if let doc = model.previewDocument, case .text = doc.content { return true }
+                return false
+            }()
+            let paneTitlesHeight: CGFloat = showsPaneTitles ? UI.s(22) : 0
+            let availableHeight = max(144, geo.size.height - previewHeaderHeight - bodyStripHeight - paneTitlesHeight - 1)
+            let listHeight = PopupResizeGeometry.splitListHeight(
+                availableHeight: availableHeight,
+                ratio: splitRatio
+            )
+
+            VStack(spacing: 0) {
+                commitListPane(model: model, height: listHeight)
+
+                PopupSplitDivider(availableHeight: availableHeight, ratio: $splitRatio, defaultRatio: 0.38)
+
+                previewSubHeader(model: model, entry: entry, hasBody: hasBody, height: previewHeaderHeight)
+
+                if hasBody && showCommitBody, let entry {
+                    ScrollView {
+                        Text(entry.commit.body)
+                            .font(.ui(size: 11.5))
+                            .foregroundStyle(Color.difText2)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .frame(height: bodyStripHeight)
+                    .background(Color.difPanel.opacity(0.45))
+                    .overlay(alignment: .bottom) {
+                        Rectangle().fill(Color.difHairline.opacity(0.6)).frame(height: 1)
+                    }
+                }
+
+                if let doc = model.previewDocument, case .text = doc.content {
+                    SelectionHistoryPaneTitles(left: doc.leftTitle, right: doc.rightTitle, unified: model.unified)
+                        .frame(height: paneTitlesHeight)
+                }
+
+                ZStack {
+                    PreviewHost { model.attachPreview($0) }
+                    if let doc = model.previewDocument {
+                        if case .message(let title, let detail) = doc.content {
+                            EmptyListState(symbol: "doc.questionmark", title: title, detail: detail)
+                                .background(Color.difWindow)
+                        }
+                    } else {
+                        Color.difWindow
+                        Text(previewEmptyMessage(model))
+                            .font(.ui(size: 12.5))
+                            .foregroundStyle(Color.difText3)
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func commitListPane(model: SelectionHistoryModel, height: CGFloat) -> some View {
+        if model.isLoading && model.entries.isEmpty {
+            VStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text(L("Loading selection history…", "正在加载选中行历史…"))
+                    .font(.ui(size: 12.5))
+                    .foregroundStyle(Color.difText3)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: height)
+        } else if let error = model.errorMessage, model.entries.isEmpty {
+            VStack(spacing: 6) {
+                Text(error)
+                    .font(.ui(size: 12.5))
+                    .foregroundStyle(Color.difRemoved)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 24)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: height)
+        } else if model.filteredEntries.isEmpty {
+            VStack(spacing: 6) {
+                Text(model.entries.isEmpty
+                     ? L("No commits found for these lines", "这些行没有找到提交记录")
+                     : L("No matching commits", "没有匹配的提交"))
+                    .font(.ui(size: 12.5))
+                    .foregroundStyle(Color.difText3)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: height)
+        } else {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(Array(model.filteredEntries.enumerated()), id: \.element.id) { index, entry in
+                            SelectionHistoryCommitRow(entry: entry, isSelected: index == model.selectedIndex)
+                                .id(entry.id)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    model.select(index)
+                                    if (NSApp.currentEvent?.clickCount ?? 1) >= 2 {
+                                        model.activate(index)
+                                    }
+                                }
+                                .contextMenu {
+                                    Button(L("Open in Log", "在日志中打开")) { model.activate(index) }
+                                    Divider()
+                                    Button(L("Copy Hash", "复制哈希")) { model.copyHash(index) }
+                                    Button(L("Copy Message", "复制提交信息")) { model.copyMessage(index) }
+                                }
+                        }
+
+                        if model.hasMore && model.filterQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            HStack {
+                                Spacer()
+                                if model.isLoadingMore {
+                                    ProgressView().controlSize(.small).scaleEffect(0.7)
+                                } else {
+                                    Button(L("Load more commits…", "加载更多提交…")) {
+                                        model.loadMore()
+                                    }
+                                    .buttonStyle(.plain)
+                                    .font(.ui(size: 11.5, weight: .medium))
+                                    .foregroundStyle(Color.difAccent)
+                                }
+                                Spacer()
+                            }
+                            .padding(.vertical, 8)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+                .frame(height: height)
+                .onChange(of: model.selectedIndex) { _, _ in
+                    if let id = model.selectedEntry?.id {
+                        proxy.scrollTo(id)
+                    }
+                }
+                .onChange(of: model.filteredEntries.first?.id) { _, _ in
+                    if let id = model.selectedEntry?.id {
+                        proxy.scrollTo(id, anchor: .top)
+                    }
+                }
+            }
+        }
+    }
+
+    private func previewSubHeader(
+        model: SelectionHistoryModel,
+        entry: LineHistoryEntry?,
+        hasBody: Bool,
+        height: CGFloat
+    ) -> some View {
+        HStack(spacing: 8) {
+            if let entry {
+                let path = entry.displayPath.isEmpty ? model.displayPath : entry.displayPath
+                FileIcon(path: path, size: 11.5)
+                Text(entry.isRename ? "\(entry.oldPath ?? "") → \(entry.newPath ?? "")" : path)
+                    .font(.ui(size: 11.5, design: .monospaced))
+                    .foregroundStyle(Color.difText2)
+                    .lineLimit(1)
+                    .truncationMode(.head)
+
+                if let rangeText = trackedRangeLabel(for: entry) {
+                    Text(rangeText)
+                        .font(.ui(size: 10.5, weight: .medium, design: .monospaced))
+                        .foregroundStyle(Color.difText2)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1.5)
+                        .background(Capsule().fill(Color.difChip))
+                        .fixedSize()
+                }
+
+                if !entry.sectionHeader.isEmpty {
+                    Text(entry.sectionHeader)
+                        .font(.code(11))
+                        .foregroundStyle(Color.difText3)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+
+            Spacer(minLength: 8)
+
+            if hasBody {
+                Button {
+                    showCommitBody.toggle()
+                } label: {
+                    Image(systemName: showCommitBody ? "text.bubble.fill" : "text.bubble")
+                        .font(.ui(size: 11))
+                        .foregroundStyle(showCommitBody ? Color.difAccent : Color.difText2)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(
+                            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                .fill(showCommitBody ? Color.difAccent.opacity(0.14) : Color.difChip)
+                        )
+                }
+                .buttonStyle(.plain)
+                .help(L("Show full commit message", "显示完整提交说明"))
+            }
+
+            HStack(spacing: 2) {
+                ScopeTab(title: L("Side-by-Side", "双栏"), isSelected: !model.unified) {
+                    model.setUnified(false)
+                }
+                ScopeTab(title: L("Unified", "单栏"), isSelected: model.unified) {
+                    model.setUnified(true)
+                }
+            }
+
+            if let entry {
+                Button {
+                    model.copyHash()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "doc.on.doc")
+                            .font(.ui(size: 10))
+                        Text(entry.commit.shortHash)
+                            .font(.ui(size: 10.5, design: .monospaced))
+                    }
+                    .foregroundStyle(Color.difText2)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.difChip))
+                }
+                .buttonStyle(.plain)
+                .help(L("Copy commit hash", "复制提交哈希"))
+
+                Button {
+                    model.activate()
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(L("Open in Log", "在日志中打开"))
+                            .font(.ui(size: 11, weight: .semibold))
+                        Text("⏎")
+                            .font(.ui(size: 10.5, weight: .medium))
+                    }
+                    .foregroundStyle(Color.difAccent)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.difAccent.opacity(0.14)))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: height)
+        .background(Color.difPanel.opacity(0.65))
+    }
+
+    private func footerBar(model: SelectionHistoryModel) -> some View {
+        HStack(spacing: 14) {
+            Hint(keys: "↑↓", text: L("Switch Commit", "切换提交"))
+            Hint(keys: "⏎", text: L("Open in Log", "在日志中打开"))
+            Hint(keys: "⇥", text: L("Side-by-Side / Unified", "切换双栏 / 单栏"))
+            Hint(keys: "Esc", text: L("Close", "关闭"))
+            Spacer()
+            if model.isLoading || model.isLoadingMore {
+                ProgressView().controlSize(.small).scaleEffect(0.6)
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(height: UI.s(30))
+    }
+
+    private func countLabel(_ model: SelectionHistoryModel) -> String {
+        let suffix = model.hasMore ? "+" : ""
+        let isFiltered = !model.filterQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if !isFiltered {
+            return "\(model.entries.count)\(suffix)"
+        }
+        return "\(model.filteredEntries.count) / \(model.entries.count)\(suffix)"
+    }
+
+    private func previewEmptyMessage(_ model: SelectionHistoryModel) -> String {
+        if model.isLoading { return L("Loading preview…", "正在加载预览…") }
+        if let error = model.errorMessage, model.entries.isEmpty { return error }
+        return model.entries.isEmpty
+            ? L("No commits found for these lines", "这些行没有找到提交记录")
+            : L("No matching commits", "没有匹配的提交")
+    }
+
+    private func trackedRangeLabel(for entry: LineHistoryEntry) -> String? {
+        func format(_ range: ClosedRange<Int>) -> String {
+            range.count > 1 ? "L\(range.lowerBound)–\(range.upperBound)" : "L\(range.lowerBound)"
+        }
+        switch (entry.leftLineRange, entry.rightLineRange) {
+        case (let left?, let right?):
+            return left == right ? format(right) : "\(format(left)) → \(format(right))"
+        case (nil, let right?):
+            return "+ \(format(right))"
+        case (let left?, nil):
+            return "− \(format(left))"
+        case (nil, nil):
+            return nil
+        }
+    }
+}
+
+private struct SelectionHistoryCommitRow: View {
+    var entry: LineHistoryEntry
+    var isSelected: Bool
+
+    @MainActor
+    private static let relativeDate: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter
+    }()
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(entry.commit.refs.prefix(2), id: \.self) { ref in
+                RefChip(ref: ref)
+            }
+
+            Text(entry.commit.subject)
+                .font(.ui(size: 12.5, weight: isSelected ? .medium : .regular))
+                .foregroundStyle(Color.difText)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .layoutPriority(1)
+
+            Spacer(minLength: 8)
+
+            if entry.additions > 0 || entry.deletions > 0 {
+                HStack(spacing: 4) {
+                    if entry.additions > 0 {
+                        Text("+\(entry.additions)")
+                            .foregroundStyle(Color.difAdded)
+                    }
+                    if entry.deletions > 0 {
+                        Text("-\(entry.deletions)")
+                            .foregroundStyle(Color.difRemoved)
+                    }
+                }
+                .font(.code(11))
+                .monospacedDigit()
+                .fixedSize()
+            }
+
+            Text(entry.commit.author)
+                .font(.ui(size: 11))
+                .foregroundStyle(Color.difText2)
+                .lineLimit(1)
+                .frame(maxWidth: 120, alignment: .trailing)
+
+            Text(Self.relativeDate.localizedString(for: entry.commit.date, relativeTo: Date()))
+                .font(.ui(size: 11))
+                .foregroundStyle(Color.difText3)
+                .fixedSize()
+
+            if entry.commit.isMerge {
+                Image(systemName: "arrow.triangle.merge")
+                    .font(.ui(size: 9))
+                    .foregroundStyle(Color.difText3)
+            }
+
+            Text(entry.commit.shortHash)
+                .font(.code(11))
+                .foregroundStyle(Color.difText3)
+                .fixedSize()
+        }
+        .padding(.horizontal, 12)
+        .frame(height: UI.s(28))
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(isSelected ? Color.difSelection : Color.clear)
+                .padding(.horizontal, 6)
+        )
+        .help("\(entry.commit.shortHash) · \(entry.commit.subject)\n\(entry.commit.author)")
+    }
+}
+
+private struct SelectionHistoryPaneTitles: View {
+    var left: String
+    var right: String
+    var unified: Bool
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if unified {
+                label("\(left) → \(right)")
+                Spacer()
+            } else {
+                label(left).frame(maxWidth: .infinity, alignment: .leading)
+                Spacer().frame(width: 44)
+                label(right).frame(maxWidth: .infinity, alignment: .leading)
+                Spacer().frame(width: 12)
+            }
+        }
+        .frame(height: UI.s(22))
+        .background(Color.difWindow)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(Color.difHairline.opacity(0.6)).frame(height: 1)
+        }
+    }
+
+    private func label(_ text: String) -> some View {
+        Text(text)
+            .font(.ui(size: 10.5, weight: .medium))
+            .foregroundStyle(Color.difText3)
+            .padding(.horizontal, 12)
+            .lineLimit(1)
     }
 }
 

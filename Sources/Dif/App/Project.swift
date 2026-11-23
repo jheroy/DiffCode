@@ -5,7 +5,7 @@ import Observation
 enum ProjectTab: String { case changes, groups, log }
 
 /// The Log narrowed to one file's commits, or to the commits that changed some of its lines.
-struct HistoryFilter: Equatable {
+struct HistoryFilter: Equatable, Sendable {
     /// The file's path in `rev`.
     var path: String
     /// 1-based lines of the file as `rev` has it; nil for the whole file.

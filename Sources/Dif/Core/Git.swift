@@ -689,7 +689,7 @@ enum AuthorSearch {
     }
 }
 
-struct Commit: Identifiable, Hashable {
+struct Commit: Identifiable, Hashable, Sendable {
     var hash: String
     var parents: [String]
     var author: String

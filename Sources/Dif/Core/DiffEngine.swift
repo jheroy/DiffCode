@@ -258,6 +258,10 @@ final class DiffDocument {
     let isPlainFile: Bool
     var leftTitle = ""
     var rightTitle = ""
+    /// Optional 1-based line numbers per buffer line for excerpt/snippet diffs (e.g. `git log -L`).
+    /// When nil, buffer index `i` displays as `i + 1`.
+    var leftLineNumbers: [Int]?
+    var rightLineNumbers: [Int]?
     var note: String?
     var loadMilliseconds: Double = 0
     /// Set when the right side is a file in the working tree: how to write it back, or why it cannot be.
@@ -292,6 +296,20 @@ final class DiffDocument {
 
     var additions: Int { hunks.reduce(0) { $0 + $1.rightCount } }
     var deletions: Int { hunks.reduce(0) { $0 + $1.leftCount } }
+
+    /// 1-based line number displayed in the gutter for 0-based buffer `line` on `side`.
+    func displayLineNumber(side: Side, line: Int) -> Int {
+        let table = side == .left ? leftLineNumbers : rightLineNumbers
+        if let table, line >= 0, line < table.count { return table[line] }
+        return line + 1
+    }
+
+    /// Largest 1-based line number shown on either side, used to size the gutter.
+    var maxDisplayLineNumber: Int {
+        let leftMax = leftLineNumbers?.max() ?? left.lines.count
+        let rightMax = rightLineNumbers?.max() ?? right.lines.count
+        return max(leftMax, rightMax)
+    }
 
     /// True when this is a newly added / untracked file whose left side has no lines and all hunks are additions.
     var isAddedOnly: Bool {

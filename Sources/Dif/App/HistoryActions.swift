@@ -66,14 +66,20 @@ extension AppStore {
         showHistory(filter, in: project)
     }
 
-    /// The history of the selected lines of the file on screen, or of the line with the caret.
+    /// Opens the GoLand-style Selection History preview popup for the selected lines (or current caret line).
     func showHistoryForSelection() {
+        if popup == .selectionHistory {
+            dismissPopup()
+            return
+        }
         guard let project = currentProject, let request = viewer.request, request.root == project.url,
               let canvas = viewer.container?.canvas else { return }
-        guard let selected = canvas.selectedLines() else {
+        guard let selected = selectedLinesForHistory(in: canvas) else {
             showHistoryForCurrentFile()
             return
         }
+        let displayPath = selected.side == .left ? (request.oldPath ?? request.path) : request.path
+        let displayLines = (selected.range.lowerBound + 1)...(selected.range.upperBound + 1)
         let notCommitted = L("These lines are not committed yet · no history", "这些行还没有提交过 · 没有历史")
         guard !countsInHead(request, side: selected.side) else {
             // The screen does not show these lines next to HEAD's, so git matches them up from the file on disk.
@@ -88,7 +94,8 @@ extension AppStore {
                     self.showToast(notCommitted)
                     return
                 }
-                self.showHistory(HistoryFilter(path: headPath, lines: (lines.lowerBound + 1)...(lines.upperBound + 1)), in: project)
+                let filter = HistoryFilter(path: headPath, lines: (lines.lowerBound + 1)...(lines.upperBound + 1))
+                self.presentSelectionHistory(project: project, filter: filter, displayPath: displayPath, displayLines: displayLines)
             }
             return
         }
@@ -96,7 +103,27 @@ extension AppStore {
             showToast(notCommitted)
             return
         }
-        showHistory(filter, in: project)
+        presentSelectionHistory(project: project, filter: filter, displayPath: displayPath, displayLines: displayLines)
+    }
+
+    func presentSelectionHistory(project: Project, filter: HistoryFilter, displayPath: String, displayLines: ClosedRange<Int>) {
+        selectionHistory.prepare(project: project, filter: filter, displayPath: displayPath, displayLines: displayLines)
+        present(.selectionHistory)
+    }
+
+    /// Resolves the 0-based line range for Selection History from either an active selection/caret or Vim cursor.
+    private func selectedLinesForHistory(in canvas: CodeCanvasView) -> (side: Side, range: ClosedRange<Int>)? {
+        if let selected = canvas.selectedLines() {
+            return selected
+        }
+        if canvas.vimModeEnabled,
+           let doc = canvas.document,
+           case .text = doc.content,
+           !doc.right.lines.isEmpty {
+            let line = max(0, min(canvas.vimCursor.row, doc.right.lines.count - 1))
+            return (.right, line...line)
+        }
+        return nil
     }
 
     /// Lines of the working tree that the screen does not show next to HEAD's: in a plain file, or in the working
@@ -386,7 +413,7 @@ extension AppStore {
         let file = ClosureMenuItem(L("Show History", "查看历史")) { [weak self] in self?.showHistoryForCurrentFile() }
         file.isEnabled = historyFilter(for: request, lines: nil, in: project) != nil
         menu.addItem(file)
-        if let canvas = viewer.container?.canvas, let lines = canvas.selectedLines(), canvas.selectedText() != nil {
+        if let canvas = viewer.container?.canvas, let lines = selectedLinesForHistory(in: canvas) {
             let selection = ClosureMenuItem(L("Show History for Selection", "查看所选内容的历史")) { [weak self] in
                 self?.showHistoryForSelection()
             }

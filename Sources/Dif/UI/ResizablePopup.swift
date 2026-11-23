@@ -54,6 +54,15 @@ struct PopupSizeSpec: Equatable, Sendable {
         bottomMargin: 32,
         userDefaultsKey: "popupSize.quickOpen"
     )
+
+    static let selectionHistory = PopupSizeSpec(
+        defaultSize: CGSize(width: 960, height: 640),
+        minSize: CGSize(width: 640, height: 400),
+        topPadding: 56,
+        horizontalMargin: 48,
+        bottomMargin: 32,
+        userDefaultsKey: "popupSize.selectionHistory"
+    )
 }
 
 /// Pure geometry math for clamping and symmetrically resizing centered popups.

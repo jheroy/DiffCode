@@ -1490,7 +1490,7 @@ final class CodeCanvasView: NSView {
     /// Whole points, so every layer below it lands on a pixel boundary.
     private var gutterWidth: CGFloat {
         guard let doc = document else { return 40 }
-        return (CGFloat(digits(max(doc.left.lines.count, doc.right.lines.count))) * codeFont.charWidth).rounded(.up) + 20
+        return (CGFloat(digits(doc.maxDisplayLineNumber)) * codeFont.charWidth).rounded(.up) + 20
     }
 
     private var paneWidth: CGFloat { floor((bounds.width - rulerWidth - connectorWidth) / 2) }
@@ -1854,10 +1854,13 @@ final class CodeCanvasView: NSView {
                         r = doc.unifiedRows[row]
                     }
                     let y = CGFloat(row - firstRow) * lh
-                    if r.left >= 0 { drawNumber(ctx, Int(r.left) + 1, rightEdge: shift + numberWidth - 4, y: y) }
+                    if r.left >= 0 {
+                        drawNumber(ctx, doc.displayLineNumber(side: .left, line: Int(r.left)), rightEdge: shift + numberWidth - 4, y: y)
+                    }
                     if r.right >= 0 {
                         let lineIdx = Int(r.right)
-                        let shown = useRelative ? (lineIdx == activeLine ? lineIdx + 1 : abs(lineIdx - activeLine)) : (lineIdx + 1)
+                        let absNum = doc.displayLineNumber(side: .right, line: lineIdx)
+                        let shown = useRelative ? (lineIdx == activeLine ? absNum : abs(lineIdx - activeLine)) : absNum
                         drawNumber(ctx, shown, rightEdge: shift + numberWidth * 2 - 4, y: y)
                     }
                     if r.kind != .context {
@@ -1873,7 +1876,8 @@ final class CodeCanvasView: NSView {
                 for row in firstRow...lastRow {
                     guard let src = source(pane: tile.pane, row: row) else { continue }
                     let lineIdx = src.line
-                    let shown = useRelative ? (lineIdx == activeLine ? lineIdx + 1 : abs(lineIdx - activeLine)) : (lineIdx + 1)
+                    let absNum = doc.displayLineNumber(side: src.side, line: lineIdx)
+                    let shown = useRelative ? (lineIdx == activeLine ? absNum : abs(lineIdx - activeLine)) : absNum
                     drawNumber(ctx, shown, rightEdge: rightEdge, y: CGFloat(row - firstRow) * lh)
                 }
             }
@@ -2413,7 +2417,7 @@ final class CodeCanvasView: NSView {
 
     var visibleLineCount: Int { max(1, Int(bounds.height / codeFont.lineHeight)) }
 
-    var gutterDigits: Int { document.map { digits(max($0.left.lines.count, $0.right.lines.count)) } ?? 3 }
+    var gutterDigits: Int { document.map { digits($0.maxDisplayLineNumber) } ?? 3 }
 
     /// Runs an edit of the right side and redraws what it touched. `anchorLine` (a line above the edit, or
     /// its first line) stays where it is on screen: in the side-by-side view the panes are lined up through
@@ -4207,7 +4211,7 @@ final class CodeCanvasView: NSView {
     }
 
     fileprivate func drawStickyTile(_ tile: StickyTileLayer, in ctx: CGContext) {
-        guard document != nil else { return }
+        guard let doc = document else { return }
         if !tile.contentsAreFlipped() {
             ctx.translateBy(x: 0, y: tile.bounds.height)
             ctx.scaleBy(x: 1, y: -1)
@@ -4237,23 +4241,23 @@ final class CodeCanvasView: NSView {
                 let numberWidth = unifiedNumberWidth
                 if let rowIdx = tile.unifiedRowIndex, let r = unifiedRowForDisplayIndex(rowIdx) {
                     if r.left >= 0 {
-                        drawNumber(ctx, Int(r.left) + 1, rightEdge: shift + numberWidth - 4, y: 0, strong: useStrong)
+                        drawNumber(ctx, doc.displayLineNumber(side: .left, line: Int(r.left)), rightEdge: shift + numberWidth - 4, y: 0, strong: useStrong)
                     }
                     if r.right >= 0 {
-                        drawNumber(ctx, Int(r.right) + 1, rightEdge: shift + numberWidth * 2 - 4, y: 0, strong: useStrong)
+                        drawNumber(ctx, doc.displayLineNumber(side: .right, line: Int(r.right)), rightEdge: shift + numberWidth * 2 - 4, y: 0, strong: useStrong)
                     }
                     if r.kind != .context {
                         ctx.textPosition = CGPoint(x: shift + numberWidth * 2 + 4, y: codeFont.baseline)
                         CTLineDraw(signLine(added: r.kind == .added), ctx)
                     }
                 } else if tile.sourceSide == .left {
-                    drawNumber(ctx, tile.sourceLine + 1, rightEdge: shift + numberWidth - 4, y: 0, strong: useStrong)
+                    drawNumber(ctx, doc.displayLineNumber(side: .left, line: tile.sourceLine), rightEdge: shift + numberWidth - 4, y: 0, strong: useStrong)
                 } else {
-                    drawNumber(ctx, tile.sourceLine + 1, rightEdge: shift + numberWidth * 2 - 4, y: 0, strong: useStrong)
+                    drawNumber(ctx, doc.displayLineNumber(side: .right, line: tile.sourceLine), rightEdge: shift + numberWidth * 2 - 4, y: 0, strong: useStrong)
                 }
             } else {
                 let rightEdge = shift + gutterWidth - 10
-                drawNumber(ctx, tile.sourceLine + 1, rightEdge: rightEdge, y: 0, strong: useStrong)
+                drawNumber(ctx, doc.displayLineNumber(side: tile.sourceSide, line: tile.sourceLine), rightEdge: rightEdge, y: 0, strong: useStrong)
             }
         }
     }
