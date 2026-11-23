@@ -1356,6 +1356,7 @@ final class AppStore {
         settings.save()
         viewer.applyCodeFont()
         finder.applyCodeFont()
+        references.applyCodeFont()
         mergeSession?.applyCodeFont()
     }
 
@@ -1365,6 +1366,7 @@ final class AppStore {
         settings.save()
         viewer.applyCodeFont()
         finder.applyCodeFont()
+        references.applyCodeFont()
         mergeSession?.applyCodeFont()
     }
 
@@ -1374,6 +1376,7 @@ final class AppStore {
         settings.save()
         viewer.applyCodeFont()
         finder.applyCodeFont()
+        references.applyCodeFont()
         mergeSession?.applyCodeFont()
     }
 
@@ -1383,6 +1386,7 @@ final class AppStore {
         settings.save()
         viewer.applyCodeFont()
         finder.applyCodeFont()
+        references.applyCodeFont()
         mergeSession?.applyCodeFont()
     }
 

@@ -254,6 +254,7 @@ final class ReferencesPickerModel {
     var focusToken: Int = 0
     var isLoadingPreviews: Bool = false
     private(set) var previewContext: ReferencePreviewContext?
+    private(set) var previewDocument: DiffDocument?
 
     var fileFilter: PopupFileFilter {
         PopupFileFilter(excludeTestGo: excludeTestGo, onlyGoFiles: onlyGoFiles)
@@ -263,8 +264,11 @@ final class ReferencesPickerModel {
     @ObservationIgnored var originFileURL: URL?
     @ObservationIgnored var originRepoRoot: URL?
     @ObservationIgnored weak var store: AppStore?
+    @ObservationIgnored weak var previewContainer: CodeScrollContainer?
     @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private var fileCache: [URL: CachedPreviewFile] = [:]
+    @ObservationIgnored private var previewDocuments: [URL: DiffDocument] = [:]
+    @ObservationIgnored private var previewKey: URL?
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var generation: UInt64 = 0
 
@@ -301,6 +305,10 @@ final class ReferencesPickerModel {
         self.originFileURL = originFileURL
         self.originRepoRoot = originRepoRoot
         self.fileCache.removeAll()
+        self.previewDocuments.removeAll()
+        self.previewKey = nil
+        self.previewDocument = nil
+        self.previewContainer?.show(nil, mode: .single, preserveScroll: false)
         self.filterQuery = ""
         self.selectedIndex = 0
         self.previewContext = nil
@@ -457,6 +465,9 @@ final class ReferencesPickerModel {
         self.symbolName = symbolName
         self.title = title
         self.fileCache = cachedFiles
+        self.previewDocuments.removeAll()
+        self.previewKey = nil
+        self.previewDocument = nil
         self.filterQuery = ""
         self.items = items
         self.selectedIndex = 0
@@ -493,6 +504,17 @@ final class ReferencesPickerModel {
         )
     }
 
+    func attachPreview(_ container: CodeScrollContainer) {
+        previewContainer = container
+        container.canvas.codeFont = CodeFont.current(store?.settings ?? .shared)
+        container.show(previewDocument, mode: .single, preserveScroll: false)
+        positionPreview()
+    }
+
+    func applyCodeFont() {
+        previewContainer?.canvas.codeFont = CodeFont.current(store?.settings ?? .shared)
+    }
+
     /// Frees cached file contents when the popup closes.
     func release() {
         loadTask?.cancel()
@@ -500,6 +522,11 @@ final class ReferencesPickerModel {
         generation &+= 1
         isLoadingPreviews = false
         fileCache.removeAll()
+        previewDocuments.removeAll()
+        previewKey = nil
+        previewDocument = nil
+        previewContainer?.show(nil, mode: .single, preserveScroll: false)
+        previewContainer = nil
         previewContext = nil
     }
 
@@ -543,12 +570,12 @@ final class ReferencesPickerModel {
     }
 
     func updatePreviewForSelection() {
-        guard let item = selectedItem else {
+        guard let item = selectedItem,
+              let cached = fileCache[item.fileURL] else {
             previewContext = nil
-            return
-        }
-        guard let cached = fileCache[item.fileURL] else {
-            previewContext = nil
+            previewDocument = nil
+            previewKey = nil
+            previewContainer?.show(nil, mode: .single, preserveScroll: false)
             return
         }
         previewContext = Self.extractContext(
@@ -562,6 +589,72 @@ final class ReferencesPickerModel {
             endColumn: item.endColumn,
             symbolName: symbolName
         )
+
+        let doc: DiffDocument
+        if let existing = previewDocuments[item.fileURL] {
+            doc = existing
+        } else {
+            let buffer = TextBuffer(lines: cached.lines)
+            buffer.spans = cached.spans
+            let created = DiffDocument(
+                left: .empty,
+                right: buffer,
+                hunks: [],
+                language: cached.language,
+                isPlainFile: true
+            )
+            previewDocuments[item.fileURL] = created
+            doc = created
+        }
+
+        previewDocument = doc
+        if previewKey != item.fileURL || previewContainer?.canvas.document !== doc {
+            previewKey = item.fileURL
+            previewContainer?.show(doc, mode: .single, preserveScroll: false)
+        }
+        positionPreview()
+    }
+
+    private func positionPreview() {
+        guard let container = previewContainer,
+              let item = selectedItem,
+              let doc = previewDocument,
+              case .text = doc.content,
+              !doc.right.lines.isEmpty else {
+            previewContainer?.canvas.focusLine = nil
+            previewContainer?.canvas.setHighlightedRanges([[:], [:]], navigation: [], current: -1)
+            return
+        }
+
+        let targetID = item.id
+        let line = max(0, min(item.lineNumber - 1, doc.right.lines.count - 1))
+        container.whenLaidOut { [weak self, weak container] in
+            guard let self, let container, self.selectedItem?.id == targetID else { return }
+            container.canvas.focusLine = (.right, line)
+            container.scroll(toRow: line, fraction: 0.4, animated: false)
+        }
+
+        var ranges: [Int: [Range<Int>]] = [:]
+        for ref in filteredItems where ref.fileURL == item.fileURL {
+            let refLine = ref.lineNumber - 1
+            guard refLine >= 0, refLine < doc.right.lines.count else { continue }
+            if let range = Self.rawHighlightRange(
+                in: doc.right.lines[refLine],
+                column: ref.column,
+                endColumn: ref.endColumn,
+                symbolName: symbolName
+            ) {
+                ranges[refLine, default: []].append(range)
+            }
+        }
+        let currentRange = Self.rawHighlightRange(
+            in: doc.right.lines[line],
+            column: item.column,
+            endColumn: item.endColumn,
+            symbolName: symbolName
+        )
+        let nav: [SearchMatch] = currentRange.map { [SearchMatch(side: .right, line: line, range: $0)] } ?? []
+        container.canvas.setHighlightedRanges([[:], ranges], navigation: nav, current: nav.isEmpty ? -1 : 0)
     }
 
     // MARK: - Pure Filtering, Snippet & Context Helpers
@@ -612,21 +705,9 @@ final class ReferencesPickerModel {
             let rawLine = lines[idx]
             let rawSpans = idx < spans.count ? spans[idx] : []
             let isMatched = (idx == targetIdx)
-
-            var rawHighlight: Range<Int>? = nil
-            if isMatched {
-                let lineLen = (rawLine as NSString).length
-                let clampedStart = max(0, min(column, lineLen))
-                if endColumn > clampedStart {
-                    rawHighlight = clampedStart..<min(endColumn, lineLen)
-                } else if !symbolName.isEmpty {
-                    let symLen = (symbolName as NSString).length
-                    let candidateEnd = min(lineLen, clampedStart + symLen)
-                    if candidateEnd > clampedStart {
-                        rawHighlight = clampedStart..<candidateEnd
-                    }
-                }
-            }
+            let rawHighlight = isMatched
+                ? rawHighlightRange(in: rawLine, column: column, endColumn: endColumn, symbolName: symbolName)
+                : nil
 
             let expanded = expandTabs(rawLine, spans: rawSpans, highlight: rawHighlight)
             previewLines.append(ReferencePreviewLine(
@@ -646,6 +727,28 @@ final class ReferencesPickerModel {
             matchedLineNumber: targetIdx + 1,
             lines: previewLines
         )
+    }
+
+    /// Computes the UTF-16 highlight range for a symbol reference on a raw line.
+    nonisolated static func rawHighlightRange(
+        in rawLine: String,
+        column: Int,
+        endColumn: Int,
+        symbolName: String
+    ) -> Range<Int>? {
+        let lineLen = (rawLine as NSString).length
+        let clampedStart = max(0, min(column, lineLen))
+        if endColumn > clampedStart {
+            return clampedStart..<min(endColumn, lineLen)
+        }
+        if !symbolName.isEmpty {
+            let symLen = (symbolName as NSString).length
+            let candidateEnd = min(lineLen, clampedStart + symLen)
+            if candidateEnd > clampedStart {
+                return clampedStart..<candidateEnd
+            }
+        }
+        return nil
     }
 
     /// Expands `\t` to 4-column tab stops while accurately remapping UTF-16 `SyntaxSpan`s and highlight range.

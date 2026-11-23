@@ -862,12 +862,20 @@ struct ReferencesPopupView: View {
                     .frame(height: previewHeaderHeight)
                     .background(Color.difPanel.opacity(0.65))
 
-                    // Bottom section: syntax-highlighted code context preview
-                    ReferenceCodePreviewView(
-                        context: model.previewContext,
-                        isLoading: model.isLoadingPreviews,
-                        settings: store.settings
-                    )
+                    // Bottom section: full-file syntax-highlighted code preview
+                    ZStack {
+                        PreviewHost { model.attachPreview($0) }
+                        if model.previewDocument == nil {
+                            Color.difWindow
+                            Text(model.isLoadingPreviews
+                                 ? L("Loading preview…", "正在加载预览…")
+                                 : (model.filteredItems.isEmpty
+                                    ? L("No matching references", "没有匹配的引用")
+                                    : L("Preview unavailable", "无法预览该文件")))
+                                .font(.ui(size: 12.5))
+                                .foregroundStyle(Color.difText3)
+                        }
+                    }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }

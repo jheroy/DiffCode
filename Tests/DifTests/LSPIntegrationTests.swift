@@ -951,6 +951,49 @@ final class LSPIntegrationTests: XCTestCase {
         XCTAssertEqual(model.filteredItems.map(\.id), [0])
         XCTAssertEqual(model.selectedIndex, 0)
         XCTAssertEqual(model.previewContext?.matchedLineNumber, 4)
+        XCTAssertEqual(model.previewDocument?.right.lines, linesB)
+        XCTAssertEqual(model.previewDocument?.isPlainFile, true)
+
+        // Full-file canvas preview & same-file navigation
+        model.filterQuery = ""
+        let item2 = ReferenceItem(
+            id: 2,
+            location: LSPLocation(
+                uri: LSPURI.uri(from: fileA),
+                range: LSPRange(start: LSPPosition(line: 22, character: 14), end: LSPPosition(line: 22, character: 19))
+            ),
+            fileURL: fileA,
+            displayPath: "repoA/main.go",
+            lineNumber: 23,
+            column: 14,
+            endColumn: 19,
+            linePreview: "msg := repob.Greet(\"world\")",
+            matchRangeInPreview: 13..<18,
+            isDeclaration: false
+        )
+        model.setItemsForTesting(symbolName: "Greet", title: "References to Greet", items: [item0, item1, item2], cachedFiles: cache)
+        let container = CodeScrollContainer(frame: NSRect(x: 0, y: 0, width: 600, height: 240))
+        container.layoutSubtreeIfNeeded()
+        model.attachPreview(container)
+        XCTAssertTrue(container.canvas.document === model.previewDocument)
+        XCTAssertEqual(model.previewDocument?.right.lines, linesB)
+        XCTAssertEqual(container.canvas.focusLine?.side, .right)
+        XCTAssertEqual(container.canvas.focusLine?.line, 3)
+
+        model.move(1)
+        let docFileA = try XCTUnwrap(model.previewDocument)
+        XCTAssertEqual(docFileA.right.lines, linesA)
+        XCTAssertTrue(container.canvas.document === docFileA)
+        XCTAssertEqual(container.canvas.focusLine?.line, 11)
+
+        // Same-file move reuses the cached DiffDocument and updates focusLine
+        model.move(1)
+        XCTAssertTrue(model.previewDocument === docFileA)
+        XCTAssertEqual(container.canvas.focusLine?.line, 22)
+
+        model.release()
+        XCTAssertNil(model.previewDocument)
+        XCTAssertNil(container.canvas.document)
     }
 
     @MainActor
