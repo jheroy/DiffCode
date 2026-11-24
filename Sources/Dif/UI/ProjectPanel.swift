@@ -314,6 +314,7 @@ struct ChangesList: View {
             menu.addItem(ClosureMenuItem(L("Keep HEAD’s Version", "保留 HEAD 的版本")) { store.takeSide(.ours, path: file.path, in: project) })
             menu.addItem(ClosureMenuItem(L("Take Incoming Version", "采用传入的版本")) { store.takeSide(.theirs, path: file.path, in: project) })
             menu.addItem(.separator())
+            store.addAIGroupingBlacklistMenuItem(for: file.path, in: project, to: menu)
             menu.addItem(ClosureMenuItem(L("Reveal in Finder", "在 Finder 中显示")) {
                 NSWorkspace.shared.activateFileViewerSelecting([project.url.appendingPathComponent(file.path)])
             })
@@ -331,6 +332,7 @@ struct ChangesList: View {
             }
             menu.addItem(.separator())
             addEditItems(row, to: menu)
+            store.addAIGroupingBlacklistMenuItem(for: file.path, in: project, to: menu)
             menu.addItem(ClosureMenuItem(L("Reveal in Finder", "在 Finder 中显示")) {
                 NSWorkspace.shared.activateFileViewerSelecting([project.url.appendingPathComponent(file.path)])
             })
@@ -580,6 +582,7 @@ struct ComparisonList: View {
             menu.addItem(ClosureMenuItem(L("Show History", "查看历史")) { store.showHistory(path: file.path, in: project) })
         }
         menu.addItem(.separator())
+        store.addAIGroupingBlacklistMenuItem(for: file.path, in: project, to: menu)
         menu.addItem(ClosureMenuItem(L("Reveal in Finder", "在 Finder 中显示")) {
             NSWorkspace.shared.activateFileViewerSelecting([project.url.appendingPathComponent(file.path)])
         })

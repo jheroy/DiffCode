@@ -657,12 +657,12 @@ private struct FindHitRow: View {
             if let projectName {
                 Text(projectName).font(.ui(size: 10.5)).foregroundStyle(Color.difText3).lineLimit(1)
             }
-            Text((hit.path as NSString).lastPathComponent)
+            Text(hit.path)
                 .font(.ui(size: 11.5))
                 .foregroundStyle(Color.difText2)
                 .lineLimit(1)
-                .truncationMode(.middle)
-                .frame(maxWidth: 240, alignment: .trailing)
+                .truncationMode(.head)
+                .frame(maxWidth: UI.s(280), alignment: .trailing)
             Text("\(hit.line)")
                 .font(.ui(size: 11, design: .monospaced))
                 .foregroundStyle(Color.difText3)
@@ -2237,6 +2237,12 @@ struct SettingsView: View {
                 store.loadAgentModels(for: provider, forceRefresh: false)
             }
         }
+        .onChange(of: settings.aiGroupingIncludePatterns) { _, _ in
+            settings.save()
+        }
+        .onChange(of: settings.aiGroupingExcludeTestFiles) { _, _ in
+            settings.save()
+        }
         .onChange(of: settings.commitMessageFormat) { _, _ in
             settings.save()
         }
@@ -2599,6 +2605,23 @@ struct SettingsView: View {
                     task: .grouping,
                     settings: settings
                 )
+                row(L("Grouping file filter", "分组文件过滤")) {
+                    TextField(L("e.g. *.go *.sql", "如 *.go *.sql"), text: $settings.aiGroupingIncludePatterns)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.ui(size: 11.5, design: .monospaced))
+                        .frame(width: UI.s(240))
+                }
+                row(L("Exclude test files", "分组排除测试文件")) {
+                    Toggle("", isOn: $settings.aiGroupingExcludeTestFiles)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .labelsHidden()
+                }
+                Text(L("Supports glob patterns (*, **, ?) separated by spaces or commas, !pattern to exclude, and per-project blacklists via right-click.",
+                       "支持空格或逗号分隔的通配符（如 *.go *.sql、db/**/*.sql、!*.pb.go），并支持右键文件加入项目黑名单。"))
+                    .font(.ui(size: 11))
+                    .foregroundStyle(Color.difText3)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             VStack(alignment: .leading, spacing: 6) {

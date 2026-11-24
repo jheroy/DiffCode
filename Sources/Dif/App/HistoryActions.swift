@@ -636,6 +636,10 @@ extension AppStore {
             menu.addItem(history)
             menu.addItem(.separator())
         }
+        if !AppEnvironment.isAppStore {
+            addAIGroupingBlacklistMenuItem(for: change.path, in: project, to: menu)
+            menu.addItem(.separator())
+        }
         menu.addItem(ClosureMenuItem(L("Copy Path", "复制路径")) { [weak self] in self?.copyText(change.path) })
         return menu
     }

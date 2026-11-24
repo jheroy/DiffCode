@@ -21,7 +21,7 @@ struct ViewerPanel: View {
 
     var body: some View {
         let viewer = store.viewer
-        let highlightedGroupHunks: Set<Int>? = viewer.request.flatMap {
+        let highlightedGroupHunks: GroupHunkFilter? = viewer.request.flatMap {
             $0.root == project.url && $0.source != .file ? project.highlightedGroupHunks(for: $0.path) : nil
         }
         VStack(spacing: 0) {

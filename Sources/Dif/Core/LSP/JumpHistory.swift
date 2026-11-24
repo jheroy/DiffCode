@@ -14,7 +14,7 @@ struct JumpLocation: Equatable, Hashable, Sendable {
     /// restores the same diff or file view the user navigated from.
     var request: DiffRequest? = nil
     /// Active AI group hunk filter when `request` was recorded.
-    var groupHunks: Set<Int>? = nil
+    var groupHunks: GroupHunkFilter? = nil
     /// Sidebar tab raw value (`ProjectTab.rawValue`) active when `request` was recorded.
     var projectTabRaw: String? = nil
 }

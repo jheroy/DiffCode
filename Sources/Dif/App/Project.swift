@@ -205,7 +205,7 @@ final class Project: Identifiable {
         didSet {
             if Self.groupSessionLayoutsChanged(from: oldValue, to: aiGroupSessions) {
                 aiGroupVersion &+= 1
-                cachedGroupHunkSets = [:]
+                cachedGroupHunkFilters = [:]
                 cachedGroupSnapshot = nil
             }
         }
@@ -247,7 +247,7 @@ final class Project: Identifiable {
     @ObservationIgnored private var changesVersion: UInt64 = 0
     @ObservationIgnored private var aiGroupVersion: UInt64 = 0
     @ObservationIgnored private var cachedChangesByPath: [String: FileChange]?
-    @ObservationIgnored private var cachedGroupHunkSets: [SessionGroupKey: [String: Set<Int>]] = [:]
+    @ObservationIgnored private var cachedGroupHunkFilters: [SessionGroupKey: [String: GroupHunkFilter]] = [:]
     @ObservationIgnored private var cachedGroupSnapshot: (key: GroupSnapshotKey, snapshot: GroupChangesSnapshot)?
 
     private struct GroupSnapshotKey: Equatable {
@@ -685,32 +685,33 @@ final class Project: Identifiable {
         activeAIGroupSession?.activeGroup
     }
 
-    /// Returns the 0-based hunk indices belonging to the currently selected AI group for `path`,
+    /// Returns the resolved group filter belonging to the currently selected AI group for `path`,
     /// or `nil` when not viewing the Groups tab, browsing a plain file, or when `path` is not part of the active group.
-    func highlightedGroupHunks(for path: String) -> Set<Int>? {
+    func highlightedGroupHunks(for path: String) -> GroupHunkFilter? {
         guard tab == .groups,
               browsedPath == nil,
               let session = activeAIGroupSession,
               let groupID = session.selectedGroupID ?? session.activeGroup?.id else {
             return nil
         }
-        return groupHunkSets(for: session.id, groupID: groupID)[path]
+        return groupHunkFilters(for: session.id, groupID: groupID)[path]
     }
 
-    private func groupHunkSets(for sessionID: UUID, groupID: UUID) -> [String: Set<Int>] {
+    private func groupHunkFilters(for sessionID: UUID, groupID: UUID) -> [String: GroupHunkFilter] {
         let key = SessionGroupKey(sessionID: sessionID, groupID: groupID)
-        if let cached = cachedGroupHunkSets[key] {
+        if let cached = cachedGroupHunkFilters[key] {
             return cached
         }
         guard let session = aiGroupSession(id: sessionID),
               let group = session.result.groups.first(where: { $0.id == groupID }) else {
             return [:]
         }
+        let allGroups = session.result.groups
         let built = Dictionary(
-            group.files.map { ($0.path, Set($0.hunkIndices)) },
-            uniquingKeysWith: { first, second in first.union(second) }
+            group.files.map { ($0.path, $0.hunkFilter(groupID: groupID, in: allGroups)) },
+            uniquingKeysWith: { first, second in first.merged(with: second) }
         )
-        cachedGroupHunkSets[key] = built
+        cachedGroupHunkFilters[key] = built
         return built
     }
 

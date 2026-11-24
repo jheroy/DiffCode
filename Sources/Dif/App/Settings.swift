@@ -211,6 +211,12 @@ final class Settings {
     var aiGroupingProvider: AgentProvider
     /// Preferred model ID per provider rawValue for AI Hunk Grouping (`nil`/absent means provider default).
     var aiGroupingModels: [String: String]
+    /// Space/comma-separated glob patterns restricting which files enter AI grouping (empty means all files).
+    var aiGroupingIncludePatterns: String
+    /// When enabled, test files (`*_test.go`, `*Tests.swift`, `tests/...`, etc.) are excluded from AI grouping.
+    var aiGroupingExcludeTestFiles: Bool
+    /// Per-repository blacklisted relative file paths excluded from AI grouping, keyed by `AIGroupStorage.repoKey(for:)`.
+    var aiGroupingBlacklists: [String: [String]]
     /// Customizable commit message format specification used for AI commit generation.
     var commitMessageFormat: String
 
@@ -283,6 +289,64 @@ final class Settings {
         save()
     }
 
+    // MARK: AI Grouping File Filter & Per-Repo Blacklist
+
+    /// Returns the sorted blacklisted repository-relative paths configured for `repoURL`.
+    func aiGroupingBlacklist(for repoURL: URL) -> [String] {
+        aiGroupingBlacklists[AIGroupStorage.repoKey(for: repoURL)] ?? []
+    }
+
+    func isAIGroupingBlacklisted(_ path: String, for repoURL: URL) -> Bool {
+        let normalized = AIHunkGroupingFilter.normalizePath(path)
+        guard !normalized.isEmpty else { return false }
+        return aiGroupingBlacklist(for: repoURL).contains(normalized)
+    }
+
+    @discardableResult
+    func addAIGroupingBlacklist(_ path: String, for repoURL: URL) -> Bool {
+        let normalized = AIHunkGroupingFilter.normalizePath(path)
+        guard !normalized.isEmpty else { return false }
+        let key = AIGroupStorage.repoKey(for: repoURL)
+        var list = aiGroupingBlacklists[key] ?? []
+        guard !list.contains(normalized) else { return false }
+        list.append(normalized)
+        list.sort()
+        aiGroupingBlacklists[key] = list
+        save()
+        return true
+    }
+
+    @discardableResult
+    func removeAIGroupingBlacklist(_ path: String, for repoURL: URL) -> Bool {
+        let normalized = AIHunkGroupingFilter.normalizePath(path)
+        guard !normalized.isEmpty else { return false }
+        let key = AIGroupStorage.repoKey(for: repoURL)
+        guard var list = aiGroupingBlacklists[key],
+              let idx = list.firstIndex(of: normalized) else { return false }
+        list.remove(at: idx)
+        if list.isEmpty {
+            aiGroupingBlacklists.removeValue(forKey: key)
+        } else {
+            aiGroupingBlacklists[key] = list
+        }
+        save()
+        return true
+    }
+
+    func clearAIGroupingBlacklist(for repoURL: URL) {
+        let key = AIGroupStorage.repoKey(for: repoURL)
+        guard aiGroupingBlacklists.removeValue(forKey: key) != nil else { return }
+        save()
+    }
+
+    func aiGroupingFilter(for repoURL: URL) -> AIHunkGroupingFilter {
+        AIHunkGroupingFilter(
+            includePatternsRaw: aiGroupingIncludePatterns,
+            excludeTestFiles: aiGroupingExcludeTestFiles,
+            excludedPaths: aiGroupingBlacklist(for: repoURL)
+        )
+    }
+
     private static let aiCachedModelsKey = "aiCachedAgentModels"
     @ObservationIgnored private var aiCachedModels: [String: [AgentModel]] = [:]
 
@@ -353,6 +417,17 @@ final class Settings {
         aiCommitModels = defaults.dictionary(forKey: "aiCommitModels") as? [String: String] ?? legacyModels
         aiGroupingProvider = AgentProvider(rawValue: defaults.string(forKey: "aiGroupingProvider") ?? "") ?? legacyProvider
         aiGroupingModels = defaults.dictionary(forKey: "aiGroupingModels") as? [String: String] ?? legacyModels
+        aiGroupingIncludePatterns = defaults.string(forKey: "aiGroupingIncludePatterns") ?? ""
+        aiGroupingExcludeTestFiles = defaults.bool(forKey: "aiGroupingExcludeTestFiles")
+        let rawBlacklists = defaults.dictionary(forKey: "aiGroupingBlacklists") as? [String: [String]] ?? [:]
+        var cleanedBlacklists: [String: [String]] = [:]
+        for (repoKey, paths) in rawBlacklists {
+            let normalized = Array(Set(paths.map(AIHunkGroupingFilter.normalizePath).filter { !$0.isEmpty })).sorted()
+            if !normalized.isEmpty {
+                cleanedBlacklists[repoKey] = normalized
+            }
+        }
+        aiGroupingBlacklists = cleanedBlacklists
         if let cachedData = defaults.data(forKey: Self.aiCachedModelsKey),
            let decoded = try? JSONDecoder().decode([String: [AgentModel]].self, from: cachedData) {
             aiCachedModels = decoded.filter { AgentProvider(rawValue: $0.key) != nil && !$0.value.isEmpty }
@@ -403,6 +478,9 @@ final class Settings {
         defaults.set(aiCommitModels, forKey: "aiCommitModels")
         defaults.set(aiGroupingProvider.rawValue, forKey: "aiGroupingProvider")
         defaults.set(aiGroupingModels, forKey: "aiGroupingModels")
+        defaults.set(aiGroupingIncludePatterns, forKey: "aiGroupingIncludePatterns")
+        defaults.set(aiGroupingExcludeTestFiles, forKey: "aiGroupingExcludeTestFiles")
+        defaults.set(aiGroupingBlacklists, forKey: "aiGroupingBlacklists")
         // Keep legacy key aligned with commit provider for downgrade compatibility.
         defaults.set(aiCommitProvider.rawValue, forKey: "aiAgentProvider")
         if commitMessageFormat.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

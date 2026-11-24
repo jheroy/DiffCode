@@ -801,7 +801,7 @@ final class AppStore {
     ///   document re-filters in place immediately.
     /// - Different file (`viewer.request != upcomingRequest`): assigns `viewer.highlightedGroupHunks` directly so
     ///   the immediately following `viewer.open(upcomingRequest)` loads with the target filter in a single pass.
-    func syncGroupHunkFilter(_ hunks: Set<Int>?, for upcomingRequest: DiffRequest) {
+    func syncGroupHunkFilter(_ hunks: GroupHunkFilter?, for upcomingRequest: DiffRequest) {
         if viewer.request == upcomingRequest {
             viewer.setHighlightedGroupHunks(hunks)
         } else {
@@ -963,7 +963,7 @@ final class AppStore {
         }
     }
 
-    private func show(_ change: FileChange, in project: Project, groupHunks: Set<Int>? = nil) {
+    private func show(_ change: FileChange, in project: Project, groupHunks: GroupHunkFilter? = nil) {
         let request = resolvedRequest(project.request(for: change, ignoreWhitespace: settings.ignoreWhitespace))
         syncGroupHunkFilter(groupHunks, for: request)
         if request == viewer.request {

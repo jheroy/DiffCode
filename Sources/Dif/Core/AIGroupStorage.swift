@@ -14,6 +14,8 @@ struct AIGroupSession: Identifiable, Equatable, Codable, Sendable {
     /// Per-group commit message drafts (stringified `UUID` keys for JSON stability); only used when `isCommittable`.
     var groupCommitMessages: [String: String]
     var headOID: String?
+    /// Active file filter snapshot used when generating this session (`nil` for unfiltered or legacy sessions).
+    var filter: AIHunkGroupingFilter?
 
     var isCommittable: Bool { source.isCommittable }
 
@@ -49,7 +51,8 @@ struct AIGroupSession: Identifiable, Equatable, Codable, Sendable {
         selectedGroupFilePath: String? = nil,
         selectedGroupHunkIndex: Int? = nil,
         groupCommitMessages: [String: String] = [:],
-        headOID: String? = nil
+        headOID: String? = nil,
+        filter: AIHunkGroupingFilter? = nil
     ) {
         self.id = id
         self.source = source
@@ -60,6 +63,7 @@ struct AIGroupSession: Identifiable, Equatable, Codable, Sendable {
         self.selectedGroupHunkIndex = selectedGroupHunkIndex
         self.groupCommitMessages = groupCommitMessages
         self.headOID = headOID
+        self.filter = filter
     }
 }
 

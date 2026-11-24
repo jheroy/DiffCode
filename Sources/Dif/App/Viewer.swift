@@ -202,10 +202,10 @@ final class ViewerModel: CodeCanvasDelegate {
     var conflictCount = 0
     /// Segments temporarily expanded while `collapseUnchanged` is enabled (cleared on file switch or reload).
     var expandedFoldSegments: Set<Int> = []
-    /// Hunk indices included by the active AI group filter, or `nil` when showing the full diff.
-    var highlightedGroupHunks: Set<Int>?
+    /// Active AI group filter applied to the document, or `nil` when showing the full diff.
+    var highlightedGroupHunks: GroupHunkFilter?
     /// Group filter that was applied to the currently loaded/loading document.
-    @ObservationIgnored private var loadedGroupHunks: Set<Int>?
+    @ObservationIgnored private var loadedGroupHunks: GroupHunkFilter?
     /// Raw hunk focus requested right before a group filter update arrives for the same file.
     @ObservationIgnored private var pendingRawHunkFocus: (path: String, rawIndex: Int, at: Date)?
     /// Symbols in the current file whose span overlaps at least one diff hunk.
@@ -1163,7 +1163,7 @@ final class ViewerModel: CodeCanvasDelegate {
         focusFilteredHunk(first, animated: true)
     }
 
-    func setHighlightedGroupHunks(_ hunks: Set<Int>?) {
+    func setHighlightedGroupHunks(_ hunks: GroupHunkFilter?) {
         guard highlightedGroupHunks != hunks || (request != nil && loadedGroupHunks != hunks) else { return }
         highlightedGroupHunks = hunks
         guard let req = request else { return }
@@ -1171,15 +1171,15 @@ final class ViewerModel: CodeCanvasDelegate {
 
         // Fast synchronous in-memory re-filtering when switching between AI groups on the same unmodified loaded text file.
         let hasInlineEdits = (editor?.hasEdits ?? false) || (editor?.isDirty ?? false) || (editor?.version ?? 0) > 0
-        if let newSet = hunks, !isLoading, !hasInlineEdits,
+        if let newFilter = hunks, !isLoading, !hasInlineEdits,
            let doc = document, case .text = doc.content, !doc.isPlainFile,
            let baseline = doc.groupFilterBaseline {
             saveEdits()
             loadTask?.cancel()
-            loadedGroupHunks = newSet
+            loadedGroupHunks = newFilter
             let filteredDoc = DiffLoader.buildGroupFiltered(
                 baseline: baseline,
-                includedGroupHunks: newSet,
+                includedGroupHunks: newFilter,
                 language: doc.language,
                 semanticOptions: settings?.semanticDiffOptions ?? req.semantic,
                 ignoreWhitespace: req.ignoreWhitespace,

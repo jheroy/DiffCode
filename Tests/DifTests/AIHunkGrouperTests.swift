@@ -219,14 +219,26 @@ final class AIHunkGrouperTests: XCTestCase {
         // Group 1 keeps Auth.swift#0; Group 2 becomes empty and is dropped; Fallback captures Auth.swift#1, UI.swift#0, AuthTests.swift#0.
         XCTAssertEqual(result.groups.count, 2)
         XCTAssertEqual(result.groups[0].name, "认证改动")
-        XCTAssertEqual(result.groups[0].files, [AIHunkGroupFile(path: "Sources/Auth.swift", hunkIndices: [0])])
+        XCTAssertEqual(result.groups[0].files, [
+            AIHunkGroupFile(
+                path: "Sources/Auth.swift",
+                hunkIndices: [0],
+                coversWholeFile: false,
+                hunkSpans: [AIHunkSpan(oldStart: 0, oldCount: 1, newStart: 0, newCount: 2)]
+            ),
+        ])
 
         let fallback = result.groups[1]
         XCTAssertEqual(fallback.name, AIHunkGrouper.fallbackGroupName)
         XCTAssertEqual(fallback.files, [
-            AIHunkGroupFile(path: "Sources/Auth.swift", hunkIndices: [1]),
-            AIHunkGroupFile(path: "Sources/UI.swift", hunkIndices: [0]),
-            AIHunkGroupFile(path: "Tests/AuthTests.swift", hunkIndices: [0]),
+            AIHunkGroupFile(
+                path: "Sources/Auth.swift",
+                hunkIndices: [1],
+                coversWholeFile: false,
+                hunkSpans: [AIHunkSpan(oldStart: 20, oldCount: 0, newStart: 21, newCount: 3)]
+            ),
+            AIHunkGroupFile(path: "Sources/UI.swift", hunkIndices: [0], coversWholeFile: true, hunkSpans: nil),
+            AIHunkGroupFile(path: "Tests/AuthTests.swift", hunkIndices: [0], coversWholeFile: true, hunkSpans: nil),
         ])
 
         // 100% coverage & zero duplicates
@@ -304,7 +316,9 @@ final class AIHunkGrouperTests: XCTestCase {
         XCTAssertEqual(result.groups.count, 2)
         XCTAssertEqual(result.groups[0].name, "模块 A 更新")
         XCTAssertEqual(result.groups[1].name, AIHunkGrouper.fallbackGroupName)
-        XCTAssertEqual(result.groups[1].files, [AIHunkGroupFile(path: "b.swift", hunkIndices: [0])])
+        XCTAssertEqual(result.groups[1].files, [
+            AIHunkGroupFile(path: "b.swift", hunkIndices: [0], coversWholeFile: true, hunkSpans: nil),
+        ])
     }
 
     func testGenerateGroupsRejectsCleanRepoAndAppStoreEdition() async throws {
@@ -1021,11 +1035,442 @@ final class AIHunkGrouperTests: XCTestCase {
             files: nonContigSummary.files
         )
         let req = try XCTUnwrap(project.diffRequest(for: "notes.swift", in: session, ignoreWhitespace: false))
-        let doc = await DiffLoader.load(req, includedGroupHunks: [1])
+        let doc = await DiffLoader.load(req, includedGroupHunks: .indices([1]))
         XCTAssertTrue(doc.isGroupFiltered)
         XCTAssertEqual(doc.hunks.count, 1)
         XCTAssertEqual(doc.groupHunkIndexMap[1], 0)
         XCTAssertTrue(doc.right.lines.contains("row14_c3"))
         XCTAssertFalse(doc.right.lines.contains("row7_c2"))
+    }
+
+    // MARK: - Legacy Whole-File Inference, Span Shifting & Re-anchoring
+
+    @MainActor
+    func testLegacyJSONDecodingAndWholeFileInference() throws {
+        // Legacy persisted JSON lacks `coversWholeFile` and `hunkSpans`.
+        let groupWholeID = UUID()
+        let groupSplitAID = UUID()
+        let groupSplitBID = UUID()
+        let legacyJSON = """
+        {
+          "activeSessionID": null,
+          "sessions": [
+            {
+              "id": "\(UUID().uuidString)",
+              "source": {"workingTree": {}},
+              "files": [],
+              "groupCommitMessages": {},
+              "result": {
+                "groups": [
+                  {
+                    "id": "\(groupWholeID.uuidString)",
+                    "name": "唯一归属分组",
+                    "summary": "整文件归属（含 >2MB fallback 与 split 漂移）",
+                    "files": [
+                      {"path": "common.go", "hunkIndices": [0, 1, 2, 3, 4, 5]},
+                      {"path": "MsgType.lua", "hunkIndices": [0]},
+                      {"path": "split.go", "hunkIndices": [0]}
+                    ]
+                  },
+                  {
+                    "id": "\(groupSplitAID.uuidString)",
+                    "name": "拆分分组 A",
+                    "summary": "split.go 其余 hunk",
+                    "files": [
+                      {"path": "split.go", "hunkIndices": [1, 2]}
+                    ]
+                  },
+                  {
+                    "id": "\(groupSplitBID.uuidString)",
+                    "name": "非零起始",
+                    "summary": "非 0 起始索引即使单组也不视为整文件",
+                    "files": [
+                      {"path": "partial_only.go", "hunkIndices": [1]}
+                    ]
+                  }
+                ],
+                "totalHunks": 11,
+                "totalFiles": 4,
+                "provider": "agy",
+                "generatedAt": "2026-11-22T04:49:03Z"
+              }
+            }
+          ]
+        }
+        """
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let state = try decoder.decode(PersistedAIGroupState.self, from: Data(legacyJSON.utf8))
+        let dir = try makeTempDir("legacy-infer")
+        let project = Project(url: dir)
+        project.tab = .groups
+        project.restoreAIGroupState(state)
+
+        // Group 1 (sole owner of common.go [0..5] and MsgType.lua [0], but shares split.go [0]).
+        project.selectedGroupID = groupWholeID
+        XCTAssertEqual(project.highlightedGroupHunks(for: "common.go"), .all)
+        XCTAssertEqual(project.highlightedGroupHunks(for: "MsgType.lua"), .all)
+        XCTAssertEqual(project.highlightedGroupHunks(for: "split.go"), .indices([0]))
+
+        // Group 2 (split.go [1, 2]).
+        project.selectedGroupID = groupSplitAID
+        XCTAssertEqual(project.highlightedGroupHunks(for: "split.go"), .indices([1, 2]))
+
+        // Group 3 (partial_only.go [1] does not start at 0).
+        project.selectedGroupID = groupSplitBID
+        XCTAssertEqual(project.highlightedGroupHunks(for: "partial_only.go"), .indices([1]))
+    }
+
+    func testResultAfterDeletingPinsLegacySharedFileToPartial() {
+        let groupA = AIHunkGroup(
+            name: "分组 A",
+            summary: "旧记录含 split.go #0",
+            files: [AIHunkGroupFile(path: "split.go", hunkIndices: [0])]
+        )
+        let groupB = AIHunkGroup(
+            name: "分组 B",
+            summary: "旧记录含 split.go #1",
+            files: [AIHunkGroupFile(path: "split.go", hunkIndices: [1])]
+        )
+        let result = AIHunkGroupingResult(
+            groups: [groupA, groupB],
+            totalHunks: 2,
+            totalFiles: 1,
+            provider: .agy,
+            model: nil,
+            generatedAt: Date()
+        )
+
+        let afterDeleteB = AIHunkGrouper.resultAfterDeleting(groupID: groupB.id, in: result)
+        XCTAssertEqual(afterDeleteB?.groups.count, 1)
+        let remainingFile = afterDeleteB?.groups[0].files.first
+        XCTAssertEqual(remainingFile?.coversWholeFile, false)
+        XCTAssertEqual(
+            remainingFile?.hunkFilter(groupID: groupA.id, in: afterDeleteB?.groups),
+            .indices([0]),
+            "Deleting sibling group must not promote legacy partial slice to .all"
+        )
+    }
+
+    func testResultAfterCommittingShiftsHunkSpans() {
+        let span0 = AIHunkSpan(oldStart: 10, oldCount: 2, newStart: 10, newCount: 5) // +3 lines delta
+        let span1 = AIHunkSpan(oldStart: 30, oldCount: 1, newStart: 33, newCount: 1)
+        let span2 = AIHunkSpan(oldStart: 50, oldCount: 4, newStart: 53, newCount: 2)
+
+        let groupA = AIHunkGroup(
+            name: "分组 A",
+            summary: "提交 hunk 0 和 hunk 2",
+            files: [
+                AIHunkGroupFile(
+                    path: "shared.go",
+                    hunkIndices: [0, 2],
+                    coversWholeFile: false,
+                    hunkSpans: [span0, span2]
+                ),
+            ]
+        )
+        let groupB = AIHunkGroup(
+            name: "分组 B",
+            summary: "保留 hunk 1",
+            files: [
+                AIHunkGroupFile(
+                    path: "shared.go",
+                    hunkIndices: [1],
+                    coversWholeFile: false,
+                    hunkSpans: [span1]
+                ),
+            ]
+        )
+        let result = AIHunkGroupingResult(
+            groups: [groupA, groupB],
+            totalHunks: 3,
+            totalFiles: 1,
+            provider: .agy,
+            model: nil,
+            generatedAt: Date()
+        )
+
+        let afterA = AIHunkGrouper.resultAfterCommitting(groupID: groupA.id, in: result)
+        let keptFile = afterA?.groups.first?.files.first
+        XCTAssertEqual(keptFile?.hunkIndices, [0])
+        XCTAssertEqual(keptFile?.coversWholeFile, false)
+        // Only span0 precedes span1, so span1.oldStart shifts by +(5 - 2) = +3 -> 33.
+        XCTAssertEqual(keptFile?.hunkSpans, [AIHunkSpan(oldStart: 33, oldCount: 1, newStart: 33, newCount: 1)])
+    }
+
+    func testBuildCommitSelectionWithWholeFileAndSplitSpanReanchoring() async throws {
+        let repo = try await makeRepo()
+        let baseLines = (0..<20).map { "line\($0)" }
+        try writeFile("whole.go", content: baseLines.joined(separator: "\n") + "\n", in: repo)
+        try writeFile("split.go", content: baseLines.joined(separator: "\n") + "\n", in: repo)
+        try await runGit(["add", "-A"], in: repo)
+        try await runGit(["commit", "-q", "-m", "Init"], in: repo)
+
+        // whole.go has 2 hunks now even though saved legacy entry claims only [0] (single-group sole owner -> .all).
+        var wholeEdited = baseLines
+        wholeEdited[1] = "whole_1"
+        wholeEdited[16] = "whole_16"
+        try writeFile("whole.go", content: wholeEdited.joined(separator: "\n") + "\n", in: repo)
+
+        // split.go originally had 2 hunks at lines 2 and 16, and later gained an extra hunk at line 8 (so old hunk 1 became live hunk 2).
+        var splitEdited = baseLines
+        splitEdited[2] = "split_2"
+        splitEdited[8] = "split_8_extra"
+        splitEdited[16] = "split_16"
+        try writeFile("split.go", content: splitEdited.joined(separator: "\n") + "\n", in: repo)
+
+        let status = try await Git.status(in: repo)
+        let groupWholeAndTail = AIHunkGroup(
+            name: "整文件与尾部",
+            summary: "whole.go 整文件 + split.go 尾部锚点",
+            files: [
+                AIHunkGroupFile(path: "whole.go", hunkIndices: [0]),
+                AIHunkGroupFile(
+                    path: "split.go",
+                    hunkIndices: [1],
+                    coversWholeFile: false,
+                    hunkSpans: [AIHunkSpan(oldStart: 16, oldCount: 1, newStart: 16, newCount: 1)]
+                ),
+            ]
+        )
+        let groupSplitHead = AIHunkGroup(
+            name: "split.go 头部",
+            summary: "split.go 头部 hunk",
+            files: [
+                AIHunkGroupFile(
+                    path: "split.go",
+                    hunkIndices: [0],
+                    coversWholeFile: false,
+                    hunkSpans: [AIHunkSpan(oldStart: 2, oldCount: 1, newStart: 2, newCount: 1)]
+                ),
+            ]
+        )
+        let allGroups = [groupWholeAndTail, groupSplitHead]
+
+        let selection = try await AIHunkGrouper.buildCommitSelection(
+            for: groupWholeAndTail,
+            allGroups: allGroups,
+            allChanges: status.changes,
+            repoRoot: repo,
+            isInitial: status.isInitial
+        )
+        XCTAssertEqual(selection.files.map(\.path), ["whole.go", "split.go"])
+        XCTAssertNil(selection.excludedLines["whole.go"], "Whole-file group must include all live hunks without exclusions")
+        let excludedSplit = try XCTUnwrap(selection.excludedLines["split.go"])
+        XCTAssertFalse(excludedSplit.contains(ChangeLine(removed: false, line: 16, text: "split_16")))
+        XCTAssertTrue(excludedSplit.contains(ChangeLine(removed: false, line: 2, text: "split_2")))
+        XCTAssertTrue(excludedSplit.contains(ChangeLine(removed: false, line: 8, text: "split_8_extra")))
+    }
+
+    // MARK: - AI Grouping File Filter, Test Exclusion & Blacklist
+
+    func testAIHunkGroupingFilterGlobPatternsAndNegation() {
+        let goAndSQL = AIHunkGroupingFilter(includePatternsRaw: "*.go *.sql", excludeTestFiles: false)
+        XCTAssertTrue(goAndSQL.isActive)
+        XCTAssertTrue(goAndSQL.matches(path: "gamecore/net/common.go"))
+        XCTAssertTrue(goAndSQL.matches(path: "db/gameserver/000124_add_player_transfer.up.sql"))
+        XCTAssertTrue(goAndSQL.matches(path: "PKG/UPPER.GO"))
+        XCTAssertFalse(goAndSQL.matches(path: "message/MsgType.lua"))
+        XCTAssertFalse(goAndSQL.matches(path: "go.mod"))
+
+        // Comma, semicolon, and Chinese punctuation separators + `!` negation.
+        let separatorsAndNeg = AIHunkGroupingFilter(includePatternsRaw: "*.go，*.sql; !*pb.go, !db/legacy/*.sql")
+        XCTAssertTrue(separatorsAndNeg.matches(path: "gamecore/net/common.go"))
+        XCTAssertFalse(separatorsAndNeg.matches(path: "message/proto.pb.go"))
+        XCTAssertTrue(separatorsAndNeg.matches(path: "db/gameserver/001.sql"))
+        XCTAssertFalse(separatorsAndNeg.matches(path: "db/legacy/old.sql"))
+
+        // Directory glob segment matching (`*` vs `**`, and rejecting `a/**/b` on `a/xb`).
+        let directChild = AIHunkGroupingFilter(includePatternsRaw: "db/*.sql")
+        XCTAssertTrue(directChild.matches(path: "db/init.sql"))
+        XCTAssertFalse(directChild.matches(path: "db/gameserver/001.sql"))
+
+        let recursive = AIHunkGroupingFilter(includePatternsRaw: "db/**/*.sql")
+        XCTAssertTrue(recursive.matches(path: "db/init.sql"))
+        XCTAssertTrue(recursive.matches(path: "db/gameserver/001.sql"))
+        XCTAssertFalse(recursive.matches(path: "db/x.sql/other.txt"))
+
+        let segmentAnchor = AIHunkGroupingFilter(includePatternsRaw: "a/**/b")
+        XCTAssertTrue(segmentAnchor.matches(path: "a/b"))
+        XCTAssertTrue(segmentAnchor.matches(path: "a/sub/b"))
+        XCTAssertFalse(segmentAnchor.matches(path: "a/xb"))
+
+        // `?` single character wildcard.
+        let singleChar = AIHunkGroupingFilter(includePatternsRaw: "file?.go")
+        XCTAssertTrue(singleChar.matches(path: "file1.go"))
+        XCTAssertFalse(singleChar.matches(path: "file12.go"))
+
+        // Negation only (no positive globs) matches everything except excluded pattern.
+        let negOnly = AIHunkGroupingFilter(includePatternsRaw: "!*.lua")
+        XCTAssertTrue(negOnly.matches(path: "gamecore/net/common.go"))
+        XCTAssertFalse(negOnly.matches(path: "message/MsgType.lua"))
+    }
+
+    func testAIHunkGroupingFilterExcludeTestFiles() {
+        let noTests = AIHunkGroupingFilter(excludeTestFiles: true)
+        XCTAssertTrue(noTests.isActive)
+
+        // Should exclude multi-language test files & test directories.
+        XCTAssertFalse(noTests.matches(path: "gamecore/playertransfer/audit_test.go"))
+        XCTAssertFalse(noTests.matches(path: "test.go"))
+        XCTAssertFalse(noTests.matches(path: "Tests/DifTests/AIHunkGrouperTests.swift"))
+        XCTAssertFalse(noTests.matches(path: "Sources/FooTests.swift"))
+        XCTAssertFalse(noTests.matches(path: "src/UserServiceTest.java"))
+        XCTAssertFalse(noTests.matches(path: "web/button.test.ts"))
+        XCTAssertFalse(noTests.matches(path: "web/card.spec.tsx"))
+        XCTAssertFalse(noTests.matches(path: "scripts/test_migration.py"))
+        XCTAssertFalse(noTests.matches(path: "src/__tests__/modal.js"))
+        XCTAssertFalse(noTests.matches(path: "testdata/fixture.json"))
+
+        // Should NOT falsely exclude production files containing "test" substrings.
+        XCTAssertTrue(noTests.matches(path: "gamecore/net/common.go"))
+        XCTAssertTrue(noTests.matches(path: "appprivate/testclient/msg.go"))
+        XCTAssertTrue(noTests.matches(path: "gamecore/player/contest.go"))
+        XCTAssertTrue(noTests.matches(path: "gamecore/player/latest.go"))
+        XCTAssertTrue(noTests.matches(path: "pkg/manifest.go"))
+        XCTAssertTrue(noTests.matches(path: "pkg/testing.go"))
+    }
+
+    func testAIHunkGroupingFilterBlacklistAndGenerateGroupsIntegration() async throws {
+        let repo = try await makeRepo()
+        try writeFile("keep.go", content: "package main\nfunc keep() int { return 1 }\n", in: repo)
+        try writeFile("keep_test.go", content: "package main\nfunc testKeep() {}\n", in: repo)
+        try writeFile("skip.go", content: "package main\nfunc skip() int { return 1 }\n", in: repo)
+        try writeFile("schema.sql", content: "CREATE TABLE t (id INT);\n", in: repo)
+        try writeFile("notes.md", content: "# Notes\n", in: repo)
+        try await runGit(["add", "-A"], in: repo)
+        try await runGit(["commit", "-q", "-m", "Init"], in: repo)
+
+        try writeFile("keep.go", content: "package main\nfunc keep() int { return 2 }\n", in: repo)
+        try writeFile("keep_test.go", content: "package main\nfunc testKeep() { _ = 1 }\n", in: repo)
+        try writeFile("skip.go", content: "package main\nfunc skip() int { return 2 }\n", in: repo)
+        try writeFile("schema.sql", content: "CREATE TABLE t (id BIGINT);\n", in: repo)
+        try writeFile("notes.md", content: "# Updated Notes\n", in: repo)
+
+        let binDir = try makeTempDir("mock-filter-bin")
+        let agyURL = binDir.appendingPathComponent("agy")
+        let mockScript = """
+        #!/usr/bin/env python3
+        import json, sys
+
+        def emit(obj):
+            sys.stdout.write(json.dumps(obj) + "\\n")
+            sys.stdout.flush()
+
+        for raw in sys.stdin:
+            msg = json.loads(raw)
+            m = msg.get("method")
+            i = msg.get("id")
+            if m == "initialize":
+                emit({"jsonrpc":"2.0","id":i,"result":{"protocolVersion":1}})
+            elif m == "session/new":
+                emit({"jsonrpc":"2.0","id":i,"result":{"sessionId":"s1"}})
+            elif m == "session/prompt":
+                payload = json.dumps({
+                    "groups": [
+                        {"name": "业务与数据库", "summary": "保留的 Go 与 SQL 文件", "files": [
+                            {"path": "keep.go", "hunkIndices": [0]},
+                            {"path": "schema.sql", "hunkIndices": [0]}
+                        ]}
+                    ]
+                }, ensure_ascii=False)
+                emit({"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":payload}}}})
+                emit({"jsonrpc":"2.0","id":i,"result":{"stopReason":"end_turn"}})
+            elif m == "session/close":
+                emit({"jsonrpc":"2.0","id":i,"result":{}})
+                break
+        """
+        try Data(mockScript.utf8).write(to: agyURL)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: agyURL.path)
+
+        let service = LocalAgentService(searchPaths: [binDir.path], environment: ProcessInfo.processInfo.environment)
+
+        // 1. Filter matching 0 files throws `noMatchingFilesAfterFilter`.
+        let impossibleFilter = AIHunkGroupingFilter(includePatternsRaw: "*.rs")
+        do {
+            _ = try await AIHunkGrouper.generateGroups(repoRoot: repo, filter: impossibleFilter, provider: .agy, service: service)
+            XCTFail("Expected noMatchingFilesAfterFilter")
+        } catch let error as AIHunkGroupingError {
+            guard case .noMatchingFilesAfterFilter(let detail) = error else {
+                XCTFail("Unexpected error: \(error)")
+                return
+            }
+            XCTAssertTrue(detail.contains("*.rs"))
+        }
+
+        // 2. Active filter (`*.go *.sql`, exclude tests, blacklist `./skip.go` and `skip.go`)
+        //    must pass ONLY `keep.go` and `schema.sql` to grouping.
+        let normFilter = AIHunkGroupingFilter(
+            includePatternsRaw: "*.go *.sql",
+            excludeTestFiles: true,
+            excludedPaths: ["./skip.go", "skip.go"]
+        )
+        let result = try await AIHunkGrouper.generateGroups(
+            repoRoot: repo,
+            filter: normFilter,
+            provider: .agy,
+            service: service
+        )
+        XCTAssertEqual(result.totalFiles, 2)
+        XCTAssertEqual(result.totalHunks, 2)
+        XCTAssertEqual(result.groups.count, 1)
+        XCTAssertEqual(result.groups[0].files.map(\.path), ["keep.go", "schema.sql"])
+    }
+
+    @MainActor
+    func testSettingsAIGroupingFilterAndPerRepoBlacklistPersistence() throws {
+        let suiteName = "AIHunkGrouperTests.Settings.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            XCTFail("Failed to create isolated UserDefaults suite")
+            return
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let dir = try makeTempDir("settings-blacklist")
+        let realRepo = dir.appendingPathComponent("real-repo")
+        try fm.createDirectory(at: realRepo, withIntermediateDirectories: true)
+        let linkRepo = dir.appendingPathComponent("link-repo")
+        try fm.createSymbolicLink(at: linkRepo, withDestinationURL: realRepo)
+        let otherRepo = dir.appendingPathComponent("other-repo")
+        try fm.createDirectory(at: otherRepo, withIntermediateDirectories: true)
+
+        let settings = Settings(defaults: defaults)
+        settings.aiGroupingIncludePatterns = "*.go *.sql"
+        settings.aiGroupingExcludeTestFiles = true
+        XCTAssertTrue(settings.addAIGroupingBlacklist("./gamecore/net/common.go", for: realRepo))
+        XCTAssertFalse(settings.addAIGroupingBlacklist("gamecore/net/common.go", for: linkRepo), "Duplicate via symlink must be ignored")
+        XCTAssertTrue(settings.addAIGroupingBlacklist("db\\001.sql", for: linkRepo))
+        XCTAssertTrue(settings.addAIGroupingBlacklist("only_other.go", for: otherRepo))
+        settings.save()
+
+        let reloaded = Settings(defaults: defaults)
+        XCTAssertEqual(reloaded.aiGroupingIncludePatterns, "*.go *.sql")
+        XCTAssertTrue(reloaded.aiGroupingExcludeTestFiles)
+        XCTAssertEqual(reloaded.aiGroupingBlacklist(for: realRepo), ["db/001.sql", "gamecore/net/common.go"])
+        XCTAssertTrue(reloaded.isAIGroupingBlacklisted("gamecore/net/common.go", for: linkRepo))
+        XCTAssertFalse(reloaded.isAIGroupingBlacklisted("only_other.go", for: realRepo))
+
+        let builtFilter = reloaded.aiGroupingFilter(for: linkRepo)
+        XCTAssertEqual(builtFilter.includePatternsRaw, "*.go *.sql")
+        XCTAssertTrue(builtFilter.excludeTestFiles)
+        XCTAssertEqual(builtFilter.excludedPaths, ["db/001.sql", "gamecore/net/common.go"])
+
+        XCTAssertTrue(reloaded.removeAIGroupingBlacklist("db/001.sql", for: realRepo))
+        XCTAssertEqual(reloaded.aiGroupingBlacklist(for: realRepo), ["gamecore/net/common.go"])
+        reloaded.clearAIGroupingBlacklist(for: linkRepo)
+        XCTAssertTrue(reloaded.aiGroupingBlacklist(for: realRepo).isEmpty)
+
+        // Verify AIGroupSession Codable round-trip both with and without `filter`.
+        let group = AIHunkGroup(name: "G", summary: "S", files: [AIHunkGroupFile(path: "a.go", hunkIndices: [0], coversWholeFile: true)])
+        let res = AIHunkGroupingResult(groups: [group], totalHunks: 1, totalFiles: 1, provider: .agy, model: nil, generatedAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let withFilter = AIGroupSession(source: .workingTree, result: res, filter: builtFilter)
+        let withoutFilter = AIGroupSession(source: .workingTree, result: res, filter: nil)
+        let enc = JSONEncoder()
+        enc.dateEncodingStrategy = .iso8601
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        XCTAssertEqual(try dec.decode(AIGroupSession.self, from: enc.encode(withFilter)), withFilter)
+        XCTAssertEqual(try dec.decode(AIGroupSession.self, from: enc.encode(withoutFilter)), withoutFilter)
     }
 }

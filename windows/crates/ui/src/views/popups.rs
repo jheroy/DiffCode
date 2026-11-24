@@ -550,10 +550,10 @@ fn find_in_path(app: &mut App, ui: &mut Ui, platform: &mut dyn Platform, room: R
             let lw = t.s(34.0).max(ui.text_width(&line, t.mono(11.0)).ceil());
             ui.label_with(Rect::new(right - lw, row.y, lw, row.h), &line, t.mono(11.0), t.text3, Align::Right, Overflow::Clip);
             right -= lw + t.s(10.0);
-            let name = file_name(&hit.path);
-            let nw = ui.text_width(name, t.font(11.5)).ceil().min(t.s(240.0));
-            ui.label_with(Rect::new(right - nw, row.y, nw + 1.0, row.h), name, t.font(11.5), t.text2, Align::Right, Overflow::EllipsisMiddle);
-            right -= nw + t.s(10.0);
+            let path = hit.path.as_str();
+            let path_w = ui.text_width(path, t.font(11.5)).ceil().min(t.s(280.0));
+            ui.label_with(Rect::new(right - path_w, row.y, path_w + 1.0, row.h), path, t.font(11.5), t.text2, Align::Right, Overflow::EllipsisMiddle);
+            right -= path_w + t.s(10.0);
             if all_projects {
                 if let Some(p) = app.project(hit.project) {
                     let pw = ui.text_width(&p.name, t.font(10.5)).ceil().min(t.s(120.0));

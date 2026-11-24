@@ -488,7 +488,7 @@ final class SemanticDiffTests: XCTestCase {
         semantic.detectMoves = true
         let filteredDoc = DiffLoader.buildGroupFiltered(
             baseline: baseline,
-            includedGroupHunks: [0, 1, 2],
+            includedGroupHunks: .indices([0, 1, 2]),
             language: .go,
             semanticOptions: semantic,
             ignoreWhitespace: false,
@@ -1240,7 +1240,7 @@ final class SemanticDiffTests: XCTestCase {
                               source: .worktree(base: "HEAD"), semantic: semantic)
 
         // Filter to group containing hunks {0, 2, 3} (excluding hunk 1 `alpha`).
-        let doc = await DiffLoader.load(req, includedGroupHunks: [0, 2, 3])
+        let doc = await DiffLoader.load(req, includedGroupHunks: .indices([0, 2, 3]))
         XCTAssertTrue(doc.isGroupFiltered)
         XCTAssertNotNil(doc.editing?.readOnlyReason)
         XCTAssertEqual(doc.hunks.count, 3)
@@ -1254,7 +1254,7 @@ final class SemanticDiffTests: XCTestCase {
         noComments.ignoreComments = true
         let reqNoComments = DiffRequest(root: repo, path: "Feature.swift", oldPath: nil, kind: .modified,
                                         source: .worktree(base: "HEAD"), semantic: noComments)
-        let docNoComments = await DiffLoader.load(reqNoComments, includedGroupHunks: [0, 2, 3])
+        let docNoComments = await DiffLoader.load(reqNoComments, includedGroupHunks: .indices([0, 2, 3]))
         XCTAssertTrue(docNoComments.isGroupFiltered)
         XCTAssertEqual(docNoComments.hiddenCommentHunkCount, 1)
         XCTAssertEqual(docNoComments.hunks.count, 2)
@@ -1264,7 +1264,7 @@ final class SemanticDiffTests: XCTestCase {
         let baseline = try XCTUnwrap(doc.groupFilterBaseline)
         let switched = DiffLoader.buildGroupFiltered(
             baseline: baseline,
-            includedGroupHunks: [1],
+            includedGroupHunks: .indices([1]),
             language: doc.language,
             semanticOptions: semantic,
             ignoreWhitespace: false,
@@ -1279,12 +1279,119 @@ final class SemanticDiffTests: XCTestCase {
         XCTAssertEqual(switched.left.lines[4], "    let beta = 20")
 
         // Empty group produces zero hunks and a clear note.
-        let emptyDoc = await DiffLoader.load(req, includedGroupHunks: [])
+        let emptyDoc = await DiffLoader.load(req, includedGroupHunks: .indices([]))
         XCTAssertTrue(emptyDoc.isGroupFiltered)
         XCTAssertTrue(emptyDoc.hunks.isEmpty)
         XCTAssertEqual(emptyDoc.left.lines, emptyDoc.right.lines)
         XCTAssertTrue(emptyDoc.groupHunkIndexMap.isEmpty)
         XCTAssertNotNil(emptyDoc.note)
+    }
+
+    func testGroupHunkFilterAllIncludesExtraLiveHunks() {
+        let oldLines = ["ctx0", "old1", "ctx1", "ctx2"]
+        let newLines = ["ctx0", "new1", "ctx1", "new2", "ctx2", "new3"]
+        let rawHunks = [
+            Hunk(leftStart: 1, leftCount: 1, rightStart: 1, rightCount: 1),
+            Hunk(leftStart: 3, leftCount: 0, rightStart: 3, rightCount: 1),
+            Hunk(leftStart: 4, leftCount: 0, rightStart: 5, rightCount: 1),
+        ]
+        let baseline = GroupFilterBaseline(
+            oldLines: oldLines,
+            newLines: newLines,
+            rawHunks: rawHunks,
+            rightSpans: [],
+            shouldHighlight: false,
+            hasWorktreeFile: false
+        )
+        let doc = DiffLoader.buildGroupFiltered(
+            baseline: baseline,
+            includedGroupHunks: .all,
+            language: .plain,
+            semanticOptions: .disabled,
+            ignoreWhitespace: false,
+            leftTitle: "old",
+            rightTitle: "new"
+        )
+        XCTAssertEqual(doc.hunks.count, 3)
+        XCTAssertEqual(doc.groupHunkIndexMap, [0: 0, 1: 1, 2: 2])
+    }
+
+    func testGroupHunkFilterReanchorsSplitAndShiftedHunksViaAIHunkSpan() {
+        // Suppose originally raw hunks were [0: lines 1..3, 1: lines 5..6, 2: pure insert at base line 8].
+        // Later DiffRefiner splits hunk 0 into two hunks (0 and 1), shifting old hunk 1 -> 2 and old hunk 2 -> 3.
+        let oldLines = ["h0", "a1", "a2", "a3", "m0", "b1", "m1", "m2"]
+        let newLines = ["h0", "a1_x", "x_mid", "a3_y", "m0", "b1_new", "m1", "m2", "added_tail"]
+        let liveRawHunks = [
+            Hunk(leftStart: 1, leftCount: 2, rightStart: 1, rightCount: 2), // split part 1 of old hunk 0
+            Hunk(leftStart: 3, leftCount: 1, rightStart: 3, rightCount: 1), // split part 2 of old hunk 0
+            Hunk(leftStart: 5, leftCount: 1, rightStart: 5, rightCount: 1), // shifted old hunk 1
+            Hunk(leftStart: 8, leftCount: 0, rightStart: 8, rightCount: 1), // shifted old hunk 2
+        ]
+        let baseline = GroupFilterBaseline(
+            oldLines: oldLines,
+            newLines: newLines,
+            rawHunks: liveRawHunks,
+            rightSpans: [],
+            shouldHighlight: false,
+            hasWorktreeFile: false
+        )
+
+        // Group B saved old hunk 2 (`oldStart: 8, oldCount: 0, newStart: 8, newCount: 1`),
+        // which is now live hunk 3 after the split of hunk 0.
+        let filterB = GroupHunkFilter.subset(
+            indices: [2],
+            anchors: [AIHunkAnchor(index: 2, span: AIHunkSpan(oldStart: 8, oldCount: 0, newStart: 8, newCount: 1))]
+        )
+        let docB = DiffLoader.buildGroupFiltered(
+            baseline: baseline,
+            includedGroupHunks: filterB,
+            language: .plain,
+            semanticOptions: .disabled,
+            ignoreWhitespace: false,
+            leftTitle: "old",
+            rightTitle: "new"
+        )
+        XCTAssertEqual(docB.hunks.count, 1)
+        XCTAssertEqual(docB.hunks[0].rightStart, 8)
+        XCTAssertEqual(docB.groupHunkIndexMap[2], 0, "Saved badge index #2 must resolve to filtered hunk 0")
+        XCTAssertEqual(docB.groupHunkIndexMap[3], 0)
+        // Excluded hunk 1 (b1 -> b1_new) is synced to right side.
+        XCTAssertEqual(docB.left.lines[5], "b1_new")
+
+        // Group A saved old hunk 0 (`oldStart: 1, oldCount: 3`); anchor matches both split live hunks 0 and 1.
+        let filterA = GroupHunkFilter.subset(
+            indices: [0],
+            anchors: [AIHunkAnchor(index: 0, span: AIHunkSpan(oldStart: 1, oldCount: 3, newStart: 1, newCount: 3))]
+        )
+        let docA = DiffLoader.buildGroupFiltered(
+            baseline: baseline,
+            includedGroupHunks: filterA,
+            language: .plain,
+            semanticOptions: .disabled,
+            ignoreWhitespace: false,
+            leftTitle: "old",
+            rightTitle: "new"
+        )
+        XCTAssertEqual(docA.hunks.count, 2)
+        XCTAssertEqual(docA.groupHunkIndexMap[0], 0)
+    }
+
+    func testAIHunkSpanMatchesEdgeCasesAndRejectsShiftedFalsePositives() {
+        // 1. Left-side overlap (modified/deleted): matches even when rightStart shifted.
+        let modSpan = AIHunkSpan(oldStart: 10, oldCount: 4, newStart: 10, newCount: 2)
+        XCTAssertTrue(modSpan.matches(Hunk(leftStart: 12, leftCount: 2, rightStart: 90, rightCount: 5)))
+        XCTAssertFalse(modSpan.matches(Hunk(leftStart: 14, leftCount: 2, rightStart: 10, rightCount: 2)))
+
+        // 2. Pure insertion: requires exact base anchor line (does NOT falsely match shifted right range elsewhere).
+        let insertSpan = AIHunkSpan(oldStart: 20, oldCount: 0, newStart: 25, newCount: 3)
+        XCTAssertTrue(insertSpan.matches(Hunk(leftStart: 20, leftCount: 0, rightStart: 40, rightCount: 2)))
+        XCTAssertFalse(insertSpan.matches(Hunk(leftStart: 50, leftCount: 0, rightStart: 25, rightCount: 3)))
+
+        // 3. Asymmetric split: saved modified hunk split into pure insertion inside its left/right bounds.
+        let splitSource = AIHunkSpan(oldStart: 30, oldCount: 5, newStart: 32, newCount: 6)
+        XCTAssertTrue(splitSource.matches(Hunk(leftStart: 33, leftCount: 0, rightStart: 35, rightCount: 2)))
+        XCTAssertFalse(splitSource.matches(Hunk(leftStart: 33, leftCount: 0, rightStart: 50, rightCount: 2)))
+        XCTAssertFalse(splitSource.matches(Hunk(leftStart: 29, leftCount: 0, rightStart: 35, rightCount: 2)))
     }
 
     // MARK: - Helpers

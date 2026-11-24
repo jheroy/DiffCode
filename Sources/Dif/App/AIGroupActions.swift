@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import SwiftUI
 
@@ -148,6 +149,96 @@ extension AppStore {
         settings.setAIModel(model, for: provider, task: task)
     }
 
+    // MARK: AI Grouping File Filter & Blacklist
+
+    func isAIGroupingBlacklisted(_ path: String, in project: Project) -> Bool {
+        settings.isAIGroupingBlacklisted(path, for: project.url)
+    }
+
+    func toggleAIGroupingBlacklist(path: String, in project: Project, pruneActiveSession: Bool = false) {
+        guard !AppEnvironment.isAppStore else { return }
+        let normalized = AIHunkGroupingFilter.normalizePath(path)
+        guard !normalized.isEmpty else { return }
+        let name = (normalized as NSString).lastPathComponent
+
+        if settings.isAIGroupingBlacklisted(normalized, for: project.url) {
+            settings.removeAIGroupingBlacklist(normalized, for: project.url)
+            showToast(L("Removed \(name) from AI grouping blacklist", "已将 \(name) 移出分组黑名单"))
+            return
+        }
+
+        settings.addAIGroupingBlacklist(normalized, for: project.url)
+
+        if pruneActiveSession,
+           let session = project.activeAIGroupSession {
+            let matchingPaths = Set(
+                session.result.groups
+                    .flatMap(\.files)
+                    .map(\.path)
+                    .filter { AIHunkGroupingFilter.normalizePath($0) == normalized }
+            )
+            if !matchingPaths.isEmpty {
+                let previousIndex = session.selectedGroupID.flatMap { id in
+                    session.result.groups.firstIndex(where: { $0.id == id })
+                }
+                if let updatedResult = AIHunkGrouper.resultAfterRemovingFiles(matchingPaths, in: session.result) {
+                    project.mutateAIGroupSession(id: session.id) { s in
+                        s.result = updatedResult
+                    }
+                    reconcileAIGroupSession(
+                        id: session.id,
+                        removedGroupID: nil,
+                        previousIndex: previousIndex,
+                        in: project
+                    )
+                    persistAIGroups(for: project)
+                    if project.id == selectedProjectID {
+                        syncViewer()
+                    }
+                } else {
+                    deleteAIGroupSession(session.id, in: project)
+                }
+                showToast(L("Blacklisted \(name) and removed from current grouping",
+                            "已将 \(name) 加入分组黑名单并从当前分组移除"))
+                return
+            }
+        }
+
+        showToast(L("Added \(name) to AI grouping blacklist", "已将 \(name) 加入分组黑名单"))
+    }
+
+    func removeAIGroupingBlacklist(path: String, in project: Project) {
+        guard !AppEnvironment.isAppStore else { return }
+        let normalized = AIHunkGroupingFilter.normalizePath(path)
+        guard settings.removeAIGroupingBlacklist(normalized, for: project.url) else { return }
+        let name = (normalized as NSString).lastPathComponent
+        showToast(L("Removed \(name) from AI grouping blacklist", "已将 \(name) 移出分组黑名单"))
+    }
+
+    func clearAIGroupingBlacklist(in project: Project) {
+        guard !AppEnvironment.isAppStore else { return }
+        guard !settings.aiGroupingBlacklist(for: project.url).isEmpty else { return }
+        settings.clearAIGroupingBlacklist(for: project.url)
+        showToast(L("Cleared AI grouping blacklist", "已清空分组黑名单"))
+    }
+
+    func addAIGroupingBlacklistMenuItem(
+        for path: String,
+        in project: Project,
+        pruneActiveSession: Bool = false,
+        to menu: NSMenu
+    ) {
+        guard !AppEnvironment.isAppStore else { return }
+        let blacklisted = isAIGroupingBlacklisted(path, in: project)
+        let title = blacklisted
+            ? L("Remove from AI Grouping Blacklist", "移出分组黑名单")
+            : L("Add to AI Grouping Blacklist", "加入分组黑名单")
+        menu.addItem(ClosureMenuItem(title) { [weak self, weak project] in
+            guard let self, let project else { return }
+            self.toggleAIGroupingBlacklist(path: path, in: project, pruneActiveSession: pruneActiveSession)
+        })
+    }
+
     // MARK: AI Hunk Grouping (Multi-Source & Multi-Session)
 
     /// Generates logical AI groups for the active context: comparison if one is open, else working-tree changes.
@@ -175,13 +266,20 @@ extension AppStore {
             showToast(AIHunkGroupingError.noChangesToGroup.localizedDescription)
             return
         }
+        let filter = settings.aiGroupingFilter(for: project.url)
+        let filteredFiles = filter.apply(to: project.changes)
+        guard !filteredFiles.isEmpty else {
+            let message = AIHunkGroupingError.noMatchingFilesAfterFilter(filter.summaryText).localizedDescription
+            project.aiGroupError = message
+            showToast(message)
+            return
+        }
         // Flush any unsaved inline edits so the collected hunks match the working tree.
         guard viewer.saveEdits() else { return }
 
         let targetSessionID = replacingSessionID ?? project.aiGroupSessions.first(where: \.isCommittable)?.id
         let provider = settings.aiProvider(for: .grouping)
         let model = settings.aiModel(for: provider, task: .grouping)
-        let files = project.changes
         let repoRoot = project.url
         let headOID = project.status.headOID
 
@@ -197,7 +295,8 @@ extension AppStore {
                 let result = try await AIHunkGrouper.generateGroups(
                     repoRoot: repoRoot,
                     source: .workingTree,
-                    files: files,
+                    files: filteredFiles,
+                    filter: filter,
                     provider: provider,
                     model: model
                 )
@@ -207,9 +306,10 @@ extension AppStore {
                 self.applyGeneratedGroupingResult(
                     result,
                     source: .workingTree,
-                    files: files,
+                    files: filteredFiles,
                     headOID: headOID,
                     replacingSessionID: targetSessionID,
+                    filter: filter.isActive ? filter : nil,
                     in: project
                 )
             } catch is CancellationError {
@@ -286,6 +386,7 @@ extension AppStore {
 
         prepareGroupsTabForGeneration(replacingSessionID: replacingSessionID, in: project)
 
+        let filter = settings.aiGroupingFilter(for: project.url)
         let provider = settings.aiProvider(for: .grouping)
         let model = settings.aiModel(for: provider, task: .grouping)
         let repoRoot = project.url
@@ -305,6 +406,10 @@ extension AppStore {
                 guard !summary.files.isEmpty else {
                     throw AIHunkGroupingError.noChangesToGroup
                 }
+                let filteredFiles = filter.apply(to: summary.files)
+                guard !filteredFiles.isEmpty else {
+                    throw AIHunkGroupingError.noMatchingFilesAfterFilter(filter.summaryText)
+                }
 
                 let newest = orderedCommits[0]
                 let oldest = orderedCommits[orderedCommits.count - 1]
@@ -322,7 +427,8 @@ extension AppStore {
                 let result = try await AIHunkGrouper.generateGroups(
                     repoRoot: repoRoot,
                     source: source,
-                    files: summary.files,
+                    files: filteredFiles,
+                    filter: filter,
                     provider: provider,
                     model: model
                 )
@@ -331,9 +437,10 @@ extension AppStore {
                 self.applyGeneratedGroupingResult(
                     result,
                     source: source,
-                    files: summary.files,
+                    files: filteredFiles,
                     headOID: nil,
                     replacingSessionID: replacingSessionID,
+                    filter: filter.isActive ? filter : nil,
                     in: project
                 )
             } catch is CancellationError {
@@ -441,6 +548,7 @@ extension AppStore {
 
         prepareGroupsTabForGeneration(replacingSessionID: replacingSessionID, in: project)
 
+        let filter = settings.aiGroupingFilter(for: project.url)
         let provider = settings.aiProvider(for: .grouping)
         let model = settings.aiModel(for: provider, task: .grouping)
         let repoRoot = project.url
@@ -490,6 +598,10 @@ extension AppStore {
                 guard !resolvedFiles.isEmpty else {
                     throw AIHunkGroupingError.noChangesToGroup
                 }
+                let filteredFiles = filter.apply(to: resolvedFiles)
+                guard !filteredFiles.isEmpty else {
+                    throw AIHunkGroupingError.noMatchingFilesAfterFilter(filter.summaryText)
+                }
 
                 let finalSource = AIHunkGroupingSource.comparison(resolvedComp)
                 project.generatingGroupSource = finalSource
@@ -498,7 +610,8 @@ extension AppStore {
                 let result = try await AIHunkGrouper.generateGroups(
                     repoRoot: repoRoot,
                     source: finalSource,
-                    files: resolvedFiles,
+                    files: filteredFiles,
+                    filter: filter,
                     provider: provider,
                     model: model
                 )
@@ -507,9 +620,10 @@ extension AppStore {
                 self.applyGeneratedGroupingResult(
                     result,
                     source: finalSource,
-                    files: resolvedFiles,
+                    files: filteredFiles,
                     headOID: nil,
                     replacingSessionID: replacingSessionID,
+                    filter: filter.isActive ? filter : nil,
                     in: project
                 )
             } catch is CancellationError {
@@ -552,6 +666,7 @@ extension AppStore {
         files: [FileChange],
         headOID: String?,
         replacingSessionID: UUID?,
+        filter: AIHunkGroupingFilter? = nil,
         in project: Project
     ) {
         let sessionID = replacingSessionID ?? UUID()
@@ -570,7 +685,8 @@ extension AppStore {
             selectedGroupFilePath: firstFile?.path,
             selectedGroupHunkIndex: firstFile?.hunkIndices.first ?? 0,
             groupCommitMessages: [:],
-            headOID: headOID
+            headOID: headOID,
+            filter: filter
         )
 
         if let existingIdx = project.aiGroupSessions.firstIndex(where: { $0.id == sessionID }) {
@@ -1064,6 +1180,7 @@ extension AppStore {
         }
 
         let allChanges = project.changes
+        let allGroups = session.result.groups
         let repoRoot = project.url
         let isInitial = project.status.isInitial
         let sessionID = session.id
@@ -1077,6 +1194,7 @@ extension AppStore {
             do {
                 let selection = try await AIHunkGrouper.buildCommitSelection(
                     for: group,
+                    allGroups: allGroups,
                     allChanges: allChanges,
                     repoRoot: repoRoot,
                     isInitial: isInitial
@@ -1156,6 +1274,7 @@ extension AppStore {
         let provider = settings.aiProvider(for: .commit)
         let model = settings.aiModel(for: provider, task: .commit)
         let allChanges = project.changes
+        let allGroups = session.result.groups
         let repoRoot = project.url
         let isInitial = project.status.isInitial
         let token = project.beginGroupCommitMessageGeneration(for: group.id)
@@ -1168,6 +1287,7 @@ extension AppStore {
             do {
                 let selection = try await AIHunkGrouper.buildCommitSelection(
                     for: group,
+                    allGroups: allGroups,
                     allChanges: allChanges,
                     repoRoot: repoRoot,
                     isInitial: isInitial

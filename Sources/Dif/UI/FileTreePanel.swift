@@ -197,6 +197,9 @@ struct FileTreePanel: View {
             }
         }
         menu.addItem(.separator())
+        if !row.isDirectory {
+            store.addAIGroupingBlacklistMenuItem(for: row.path, in: project, to: menu)
+        }
         add(L("Reveal in Finder", "在 Finder 中显示")) { NSWorkspace.shared.activateFileViewerSelecting([url]) }
         add(L("Copy Path", "复制路径")) { store.copyText(row.path) }
         return menu

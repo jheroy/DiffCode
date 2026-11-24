@@ -2051,7 +2051,7 @@ enum DiffLoader {
         try? FileManager.default.removeItem(at: scratch)
     }
 
-    static func load(_ request: DiffRequest, includedGroupHunks: Set<Int>? = nil) async -> DiffDocument {
+    static func load(_ request: DiffRequest, includedGroupHunks: GroupHunkFilter? = nil) async -> DiffDocument {
         let started = DispatchTime.now()
         let doc = await build(request, includedGroupHunks: includedGroupHunks)
         doc.loadMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000
@@ -2124,7 +2124,7 @@ enum DiffLoader {
         return try? Data(contentsOf: url, options: .mappedIfSafe)
     }
 
-    private static func build(_ request: DiffRequest, includedGroupHunks: Set<Int>? = nil) async -> DiffDocument {
+    private static func build(_ request: DiffRequest, includedGroupHunks: GroupHunkFilter? = nil) async -> DiffDocument {
         if Self.isSpreadsheetPath(request.path) {
             return await buildSpreadsheet(request)
         }
@@ -2365,7 +2365,7 @@ enum DiffLoader {
     /// already-loaded `GroupFilterBaseline` (zero disk I/O or git subprocesses).
     static func buildGroupFiltered(
         baseline: GroupFilterBaseline,
-        includedGroupHunks: Set<Int>,
+        includedGroupHunks: GroupHunkFilter,
         language: LanguageSpec,
         semanticOptions: SemanticDiffOptions,
         ignoreWhitespace: Bool,
@@ -2376,14 +2376,17 @@ enum DiffLoader {
         let right: TextBuffer
         var filteredHunks: [Hunk]
         var rawToFiltered: [Int: Int]
+        var savedToLiveRaw: [Int: Int] = [:]
         let bothSidesExist: Bool
 
         if let oldLines = baseline.oldLines, let newLines = baseline.newLines {
+            let resolved = includedGroupHunks.resolved(for: baseline.rawHunks)
+            savedToLiveRaw = resolved.savedToLiveRaw
             let result = SemanticDiff.applyGroupHunkFilter(
                 oldLines: oldLines,
                 newLines: newLines,
                 rawHunks: baseline.rawHunks,
-                includedHunkIndices: includedGroupHunks
+                includedHunkIndices: resolved.includedRawIndices
             )
             left = TextBuffer(lines: result.filteredOldLines)
             if baseline.shouldHighlight {
@@ -2406,7 +2409,7 @@ enum DiffLoader {
             } else if baseline.shouldHighlight {
                 right.spans = Highlighter.highlight(newLines, language: language)
             }
-            if !newLines.isEmpty && includedGroupHunks.contains(0) {
+            if !newLines.isEmpty && includedGroupHunks.includesSingleFallbackHunk {
                 left = .empty
                 filteredHunks = [Hunk(leftStart: 0, leftCount: 0, rightStart: 0, rightCount: newLines.count)]
                 rawToFiltered = [0: 0]
@@ -2421,7 +2424,7 @@ enum DiffLoader {
         } else if let oldLines = baseline.oldLines {
             // Deleted file: single raw hunk at index 0.
             right = .empty
-            if !oldLines.isEmpty && includedGroupHunks.contains(0) {
+            if !oldLines.isEmpty && includedGroupHunks.includesSingleFallbackHunk {
                 left = TextBuffer(lines: oldLines)
                 if baseline.shouldHighlight {
                     left.spans = Highlighter.highlight(oldLines, language: language)
@@ -2485,6 +2488,19 @@ enum DiffLoader {
             if let finalIdx = inputToFinal[filteredIdx] {
                 finalRawToFiltered[rawIdx] = finalIdx
             }
+        }
+        if !savedToLiveRaw.isEmpty {
+            var mapped: [Int: Int] = [:]
+            mapped.reserveCapacity(savedToLiveRaw.count + finalRawToFiltered.count)
+            for (savedIdx, liveRawIdx) in savedToLiveRaw {
+                if let finalIdx = finalRawToFiltered[liveRawIdx] {
+                    mapped[savedIdx] = finalIdx
+                }
+            }
+            for (liveRawIdx, finalIdx) in finalRawToFiltered where mapped[liveRawIdx] == nil {
+                mapped[liveRawIdx] = finalIdx
+            }
+            finalRawToFiltered = mapped
         }
 
         let doc = DiffDocument(

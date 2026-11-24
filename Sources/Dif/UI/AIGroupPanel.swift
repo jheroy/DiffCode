@@ -16,7 +16,7 @@ struct AIGroupPanel: View {
     @State private var preferWorkingTreeInCreation = false
 
     private static let defaultTopRatio: Double = 0.40
-    private static let minTopHeight: Double = 170
+    private static let minTopHeight: Double = 196
     private static let minBottomHeight: Double = 230
 
     var body: some View {
@@ -77,17 +77,20 @@ struct AIGroupPanel: View {
     // MARK: - Empty / Creation State
 
     private var emptyStateView: some View {
+        let filter = store.settings.aiGroupingFilter(for: project.url)
         let comparison = project.comparison
         let hasComparison = comparison != nil
+        let matchedCompareCount = hasComparison ? filter.apply(to: project.compareChanges).count : 0
+        let matchedWorkingCount = filter.apply(to: project.changes).count
         let hasCompareChanges = hasComparison && !project.compareChanges.isEmpty
         let hasWorkingChanges = !project.changes.isEmpty
         let useComparisonSource = hasComparison && (!preferWorkingTreeInCreation || !hasWorkingChanges)
         let isGeneratingNewSession = project.isGeneratingGroups && project.generatingGroupSessionID == nil
         let hasTargetChanges: Bool = {
             if useComparisonSource {
-                return !project.isLoadingCompare && hasCompareChanges
+                return !project.isLoadingCompare && matchedCompareCount > 0
             }
-            return hasWorkingChanges
+            return matchedWorkingCount > 0
         }()
 
         return ScrollView {
@@ -135,6 +138,10 @@ struct AIGroupPanel: View {
 
                 // Compact inline Agent Provider + Model selector for AI Grouping (independent of Commit Message).
                 AgentModelSelectorCard(task: .grouping, compact: false)
+                    .padding(.horizontal, 12)
+
+                // File glob filter, test-file exclusion toggle, and per-project blacklist manager.
+                AIGroupFilterCard(project: project, compact: false)
                     .padding(.horizontal, 12)
 
                 // Primary CTA button
@@ -200,7 +207,10 @@ struct AIGroupPanel: View {
                             useComparison: useComparisonSource,
                             isLoadingCompare: project.isLoadingCompare,
                             compareCount: project.compareChanges.count,
-                            workingCount: project.changes.count
+                            matchedCompareCount: matchedCompareCount,
+                            workingCount: project.changes.count,
+                            matchedWorkingCount: matchedWorkingCount,
+                            filterActive: filter.isActive
                         ))
                         .font(.ui(size: 11))
                         .foregroundStyle(Color.difText3)
@@ -296,7 +306,10 @@ struct AIGroupPanel: View {
         useComparison: Bool,
         isLoadingCompare: Bool,
         compareCount: Int,
-        workingCount: Int
+        matchedCompareCount: Int,
+        workingCount: Int,
+        matchedWorkingCount: Int,
+        filterActive: Bool
     ) -> String {
         if useComparison {
             if isLoadingCompare && compareCount == 0 {
@@ -305,6 +318,14 @@ struct AIGroupPanel: View {
             if compareCount == 0 {
                 return L("No differences in current comparison", "当前比较暂无差异")
             }
+            if filterActive {
+                if matchedCompareCount == 0 {
+                    return L("0 of \(compareCount) compared files match filter",
+                             "当前 \(compareCount) 个对比文件中无匹配筛选条件的文件")
+                }
+                return L("\(matchedCompareCount) of \(compareCount) compared files match filter (read-only)",
+                         "当前筛选后 \(matchedCompareCount) / \(compareCount) 个对比文件可分组（仅查看）")
+            }
             return compareCount == 1
                 ? L("1 compared file ready to group (read-only)", "当前对比有 1 个变更文件可分组（仅查看）")
                 : L("\(compareCount) compared files ready to group (read-only)", "当前对比有 \(compareCount) 个变更文件可分组（仅查看）")
@@ -312,6 +333,14 @@ struct AIGroupPanel: View {
         if workingCount == 0 {
             return L("No uncommitted changes · compare with a branch or select commits in Log",
                      "工作区暂无变更 · 可与分支比较或在历史中选择提交分组")
+        }
+        if filterActive {
+            if matchedWorkingCount == 0 {
+                return L("0 of \(workingCount) changed files match filter",
+                         "当前 \(workingCount) 个变更文件中无匹配筛选条件的文件")
+            }
+            return L("\(matchedWorkingCount) of \(workingCount) changed files match filter",
+                     "当前筛选后 \(matchedWorkingCount) / \(workingCount) 个变更文件可分组")
         }
         return workingCount == 1
             ? L("1 changed file ready to group", "当前有 1 个变更文件可分组")
@@ -499,6 +528,16 @@ struct AIGroupPanel: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Spacer(minLength: 4)
+                if let sessionFilter = session.filter, sessionFilter.isActive {
+                    Text(sessionFilter.compactBadgeText)
+                        .font(.ui(size: 9.5, weight: .medium, design: .monospaced))
+                        .foregroundStyle(Color.difText2)
+                        .lineLimit(1)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(Color.difChip))
+                        .help(sessionFilter.summaryText)
+                }
                 if !session.isCommittable {
                     Text(L("Read-only", "仅查看"))
                         .font(.ui(size: 9.5, weight: .semibold))
@@ -516,6 +555,9 @@ struct AIGroupPanel: View {
 
             // Inline quick provider/model switcher for AI Grouping
             AgentModelSelectorCard(task: .grouping, compact: true)
+
+            // Compact file filter, test exclusion, and per-project blacklist popover
+            AIGroupFilterCard(project: project, compact: true)
 
             if let error = project.aiGroupError, !error.isEmpty {
                 errorCard(message: error)
@@ -1084,6 +1126,8 @@ private struct AIGroupChangesPane: View {
                 })
             }
             menu.addItem(.separator())
+            store.addAIGroupingBlacklistMenuItem(for: file.path, in: project, pruneActiveSession: true, to: menu)
+            menu.addItem(.separator())
             let fileURL = project.url.appendingPathComponent(file.path)
             if FileManager.default.fileExists(atPath: fileURL.path) {
                 menu.addItem(ClosureMenuItem(L("Reveal in Finder", "在 Finder 中显示")) {
@@ -1438,5 +1482,293 @@ private struct AgentModelSelectorCard: View {
                     .frame(width: UI.s(20), height: UI.s(20))
             }
         }
+    }
+}
+
+// MARK: - AI Grouping File Filter & Per-Project Blacklist
+
+private struct AIGroupFilterCard: View {
+    @Bindable var project: Project
+    var compact: Bool
+    @Environment(AppStore.self) private var store
+    @State private var showBlacklist = false
+
+    private var patternTooltip: String {
+        L("Only group files matching these globs (e.g. *.go *.sql, db/**/*.sql, !*.pb.go). Leave empty for all files.",
+          "仅对匹配通配符的文件进行分组（如 *.go *.sql、db/**/*.sql、!*.pb.go），留空表示全部文件。")
+    }
+
+    private var includeBinding: Binding<String> {
+        Binding(
+            get: { store.settings.aiGroupingIncludePatterns },
+            set: {
+                guard store.settings.aiGroupingIncludePatterns != $0 else { return }
+                store.settings.aiGroupingIncludePatterns = $0
+                store.settings.save()
+            }
+        )
+    }
+
+    var body: some View {
+        let blacklist = store.settings.aiGroupingBlacklist(for: project.url)
+        let excludeTests = store.settings.aiGroupingExcludeTestFiles
+
+        if compact {
+            HStack(spacing: 5) {
+                patternField(height: UI.s(22), fontSize: 10.5)
+
+                compactTogglePill(
+                    label: L("No tests", "不含测试"),
+                    help: L("Exclude test files from AI grouping", "分组时排除测试文件"),
+                    isOn: excludeTests
+                ) {
+                    store.settings.aiGroupingExcludeTestFiles.toggle()
+                    store.settings.save()
+                }
+
+                if !blacklist.isEmpty {
+                    blacklistButton(count: blacklist.count, compact: true)
+                }
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    Text(L("Filter", "筛选"))
+                        .font(.ui(size: 11, weight: .medium))
+                        .foregroundStyle(Color.difText2)
+                        .frame(width: UI.s(42), alignment: .leading)
+                    patternField(height: UI.s(24), fontSize: 11)
+                }
+
+                HStack(spacing: 6) {
+                    Color.clear.frame(width: UI.s(42), height: 1)
+
+                    compactTogglePill(
+                        label: L("Exclude test files", "排除测试文件"),
+                        help: L("Exclude test files (*_test.go, *Tests.swift, tests/, etc.)",
+                                "排除测试文件（*_test.go、*Tests.swift、tests/ 目录等）"),
+                        isOn: excludeTests
+                    ) {
+                        store.settings.aiGroupingExcludeTestFiles.toggle()
+                        store.settings.save()
+                    }
+
+                    if !blacklist.isEmpty {
+                        blacklistButton(count: blacklist.count, compact: false)
+                    }
+
+                    Spacer(minLength: 0)
+                }
+            }
+            .padding(9)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.difChip.opacity(0.65)))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(Color.difHairline, lineWidth: 1)
+            )
+        }
+    }
+
+    private func patternField(height: CGFloat, fontSize: CGFloat) -> some View {
+        let hasText = !store.settings.aiGroupingIncludePatterns.isEmpty
+        return HStack(spacing: 4) {
+            Image(systemName: "line.3.horizontal.decrease")
+                .font(.ui(size: 9.5, weight: .medium))
+                .foregroundStyle(hasText ? Color.difAccent : Color.difText3)
+            TextField(L("e.g. *.go *.sql", "如 *.go *.sql"), text: includeBinding)
+                .textFieldStyle(.plain)
+                .font(.ui(size: fontSize, design: .monospaced))
+                .foregroundStyle(Color.difText)
+            if hasText {
+                Button {
+                    store.settings.aiGroupingIncludePatterns = ""
+                    store.settings.save()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.ui(size: 10))
+                        .foregroundStyle(Color.difText3)
+                }
+                .buttonStyle(.plain)
+                .help(L("Clear file filter", "清空文件过滤"))
+            }
+        }
+        .padding(.horizontal, 6)
+        .frame(height: height)
+        .frame(maxWidth: .infinity)
+        .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.difChip))
+        .overlay(
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .strokeBorder(hasText ? Color.difAccent.opacity(0.4) : Color.difHairline, lineWidth: 1)
+        )
+        .help(patternTooltip)
+    }
+
+    private func compactTogglePill(
+        label: String,
+        help: String,
+        isOn: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.ui(size: 10.5, weight: isOn ? .semibold : .medium))
+                .foregroundStyle(isOn ? Color.difAccent : Color.difText2)
+                .lineLimit(1)
+                .padding(.horizontal, 7)
+                .frame(height: UI.s(compact ? 22 : 24))
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(isOn ? Color.difAccent.opacity(0.16) : Color.difChip)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .strokeBorder(isOn ? Color.difAccent.opacity(0.45) : Color.difHairline, lineWidth: 1)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+        .help(help)
+    }
+
+    private func blacklistButton(count: Int, compact: Bool) -> some View {
+        Button {
+            showBlacklist.toggle()
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "nosign")
+                    .font(.ui(size: 9.5, weight: .semibold))
+                Text(compact ? "\(count)" : L("Blacklist (\(count))", "黑名单 (\(count))"))
+                    .font(.ui(size: 10.5, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .lineLimit(1)
+            }
+            .foregroundStyle(Color.difRemoved)
+            .padding(.horizontal, 6)
+            .frame(height: UI.s(compact ? 22 : 24))
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(Color.difRemoved.opacity(0.12))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .strokeBorder(Color.difRemoved.opacity(0.35), lineWidth: 1)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+        .help(L("Manage blacklisted files excluded from AI grouping", "管理不参与 AI 分组的黑名单文件"))
+        .popover(isPresented: $showBlacklist, arrowEdge: .trailing) {
+            AIGroupBlacklistPopover(project: project, isPresented: $showBlacklist)
+        }
+    }
+}
+
+private struct AIGroupBlacklistPopover: View {
+    @Bindable var project: Project
+    @Binding var isPresented: Bool
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        let paths = store.settings.aiGroupingBlacklist(for: project.url)
+
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "nosign")
+                    .font(.ui(size: 11, weight: .semibold))
+                    .foregroundStyle(Color.difRemoved)
+                Text(L("AI Grouping Blacklist", "分组黑名单"))
+                    .font(.ui(size: 12, weight: .semibold))
+                    .foregroundStyle(Color.difText)
+                Text("\(paths.count)")
+                    .font(.ui(size: 10.5, weight: .semibold, design: .rounded))
+                    .foregroundStyle(Color.difText3)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Color.difChip))
+                Spacer()
+                if !paths.isEmpty {
+                    Button {
+                        store.clearAIGroupingBlacklist(in: project)
+                        isPresented = false
+                    } label: {
+                        Text(L("Clear All", "清空"))
+                            .font(.ui(size: 11, weight: .medium))
+                            .foregroundStyle(Color.difRemoved)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
+
+            Text(L("Right-click any file to add or remove it.", "右键点击任意文件可加入或移出黑名单。"))
+                .font(.ui(size: 10.5))
+                .foregroundStyle(Color.difText3)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+
+            Rectangle().fill(Color.difHairline).frame(height: 1)
+
+            if paths.isEmpty {
+                Text(L("No blacklisted files", "暂无黑名单文件"))
+                    .font(.ui(size: 11.5))
+                    .foregroundStyle(Color.difText3)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 20)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        ForEach(paths, id: \.self) { path in
+                            let nsPath = path as NSString
+                            let fileName = nsPath.lastPathComponent
+                            let dir = nsPath.deletingLastPathComponent
+                            HStack(spacing: 6) {
+                                FileIcon(path: path, size: 12)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(fileName)
+                                        .font(.ui(size: 11.5, weight: .medium))
+                                        .foregroundStyle(Color.difText)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                    if !dir.isEmpty {
+                                        Text(dir)
+                                            .font(.ui(size: 10))
+                                            .foregroundStyle(Color.difText3)
+                                            .lineLimit(1)
+                                            .truncationMode(.head)
+                                    }
+                                }
+                                Spacer(minLength: 4)
+                                Button {
+                                    store.removeAIGroupingBlacklist(path: path, in: project)
+                                    if store.settings.aiGroupingBlacklist(for: project.url).isEmpty {
+                                        isPresented = false
+                                    }
+                                } label: {
+                                    Image(systemName: "xmark")
+                                        .font(.ui(size: 9, weight: .bold))
+                                        .foregroundStyle(Color.difText3)
+                                        .frame(width: UI.s(18), height: UI.s(18))
+                                        .background(RoundedRectangle(cornerRadius: 4, style: .continuous).fill(Color.difChip))
+                                        .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .help(L("Remove from blacklist", "移出黑名单"))
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.difChip.opacity(0.45)))
+                            .help(path)
+                        }
+                    }
+                    .padding(8)
+                }
+                .frame(maxHeight: 220)
+            }
+        }
+        .frame(width: 320)
     }
 }

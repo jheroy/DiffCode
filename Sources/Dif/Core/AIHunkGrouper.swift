@@ -61,16 +61,140 @@ struct HunkDescriptor: Identifiable, Hashable, Codable, Sendable {
     }
 }
 
+/// 0-based line range anchor of a diff hunk, used to re-identify hunks across refiner splits or working-tree edits.
+struct AIHunkSpan: Hashable, Codable, Sendable {
+    let oldStart: Int
+    let oldCount: Int
+    let newStart: Int
+    let newCount: Int
+
+    func matches(_ hunk: Hunk) -> Bool {
+        if hunk.leftCount > 0 && oldCount > 0 {
+            return max(hunk.leftStart, oldStart) < min(hunk.leftStart + hunk.leftCount, oldStart + oldCount)
+        }
+        if hunk.leftCount == 0 && oldCount == 0 {
+            return hunk.rightCount > 0 && newCount > 0 && hunk.leftStart == oldStart
+        }
+        guard hunk.rightCount > 0 && newCount > 0 else { return false }
+        let rightOverlaps = max(hunk.rightStart, newStart) < min(hunk.rightStart + hunk.rightCount, newStart + newCount)
+        guard rightOverlaps else { return false }
+        if hunk.leftCount == 0 {
+            return hunk.leftStart >= oldStart && hunk.leftStart <= oldStart + oldCount
+        }
+        return oldStart >= hunk.leftStart && oldStart <= hunk.leftStart + hunk.leftCount
+    }
+}
+
+/// Pairs a saved 0-based hunk index with its recorded line span.
+struct AIHunkAnchor: Hashable, Sendable {
+    let index: Int
+    let span: AIHunkSpan
+}
+
+/// Resolved group filter applied when viewing or committing a file inside an AI group.
+enum GroupHunkFilter: Equatable, Hashable, Sendable {
+    case all
+    case subset(indices: Set<Int>, anchors: [AIHunkAnchor] = [])
+
+    static func indices(_ indices: Set<Int>) -> GroupHunkFilter {
+        .subset(indices: indices, anchors: [])
+    }
+
+    /// Resolves live 0-based raw hunk indices matching this filter, plus a map from saved indices to live raw indices.
+    func resolved(for rawHunks: [Hunk]) -> (includedRawIndices: Set<Int>, savedToLiveRaw: [Int: Int]) {
+        switch self {
+        case .all:
+            return (Set(rawHunks.indices), [:])
+        case .subset(let indices, let anchors):
+            guard !anchors.isEmpty else {
+                return (indices, [:])
+            }
+            var matched: Set<Int> = []
+            var savedToLive: [Int: Int] = [:]
+            for anchor in anchors {
+                var firstMatch: Int?
+                for (liveIdx, hunk) in rawHunks.enumerated() where anchor.span.matches(hunk) {
+                    matched.insert(liveIdx)
+                    if firstMatch == nil {
+                        firstMatch = liveIdx
+                    }
+                }
+                if let firstMatch, savedToLive[anchor.index] == nil {
+                    savedToLive[anchor.index] = firstMatch
+                }
+            }
+            return (matched, savedToLive)
+        }
+    }
+
+    var includesSingleFallbackHunk: Bool {
+        switch self {
+        case .all:
+            return true
+        case .subset(let indices, let anchors):
+            if !anchors.isEmpty {
+                return anchors.contains {
+                    $0.index == 0 || ($0.span.oldStart == 0 && $0.span.newStart == 0 && ($0.span.oldCount > 0 || $0.span.newCount > 0))
+                }
+            }
+            return indices.contains(0)
+        }
+    }
+
+    func merged(with other: GroupHunkFilter) -> GroupHunkFilter {
+        switch (self, other) {
+        case (.all, _), (_, .all):
+            return .all
+        case (.subset(let lhsIndices, let lhsAnchors), .subset(let rhsIndices, let rhsAnchors)):
+            var combinedAnchors = lhsAnchors
+            for anchor in rhsAnchors where !combinedAnchors.contains(anchor) {
+                combinedAnchors.append(anchor)
+            }
+            return .subset(indices: lhsIndices.union(rhsIndices), anchors: combinedAnchors)
+        }
+    }
+}
+
 /// A file and the 0-based hunk indices belonging to a single AI logical group.
 struct AIHunkGroupFile: Identifiable, Hashable, Codable, Sendable {
     var id: String { path }
     let path: String
     /// Sorted, unique 0-based hunk indices within `path`.
     let hunkIndices: [Int]
+    /// `true` when this entry owns every hunk (or the whole file fallback) in `path`; `false` when split across groups.
+    let coversWholeFile: Bool?
+    /// Optional per-hunk 0-based line spans aligned 1:1 with `hunkIndices` for split-file re-anchoring.
+    let hunkSpans: [AIHunkSpan]?
 
-    init(path: String, hunkIndices: [Int]) {
+    init(
+        path: String,
+        hunkIndices: [Int],
+        coversWholeFile: Bool? = nil,
+        hunkSpans: [AIHunkSpan]? = nil
+    ) {
         self.path = path
         self.hunkIndices = hunkIndices
+        self.coversWholeFile = coversWholeFile
+        self.hunkSpans = hunkSpans
+    }
+
+    var anchors: [AIHunkAnchor] {
+        guard let spans = hunkSpans, spans.count == hunkIndices.count else { return [] }
+        return zip(hunkIndices, spans).map { AIHunkAnchor(index: $0.0, span: $0.1) }
+    }
+
+    func isEffectivelyWholeFile(groupID: UUID, in allGroups: [AIHunkGroup]?) -> Bool {
+        if let explicit = coversWholeFile { return explicit }
+        guard let allGroups, !hunkIndices.isEmpty else { return false }
+        guard hunkIndices.enumerated().allSatisfy({ $0.offset == $0.element }) else { return false }
+        return !allGroups.contains { $0.id != groupID && $0.files.contains(where: { $0.path == path }) }
+    }
+
+    func hunkFilter(groupID: UUID, in allGroups: [AIHunkGroup]?) -> GroupHunkFilter {
+        if isEffectivelyWholeFile(groupID: groupID, in: allGroups) {
+            return .all
+        }
+        return .subset(indices: Set(hunkIndices), anchors: anchors)
     }
 }
 
@@ -242,10 +366,218 @@ enum AIHunkGroupingSource: Equatable, Hashable, Codable, Sendable {
     }
 }
 
+/// Configurable file-level filter applied before AI hunk grouping.
+struct AIHunkGroupingFilter: Equatable, Hashable, Codable, Sendable {
+    var includePatternsRaw: String = ""
+    var excludeTestFiles: Bool = false
+    var excludedPaths: [String] = []
+
+    /// Normalizes repository-relative paths by replacing backslashes and stripping leading `./` or `/`.
+    static func normalizePath(_ raw: String) -> String {
+        var result = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\\", with: "/")
+        while result.hasPrefix("./") {
+            result.removeFirst(2)
+        }
+        while result.hasPrefix("/") {
+            result.removeFirst()
+        }
+        return result
+    }
+
+    var parsedTokens: [String] {
+        let separators = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: ",;，；"))
+        return includePatternsRaw
+            .components(separatedBy: separators)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    var excludedPathSet: Set<String> {
+        Set(excludedPaths.map(Self.normalizePath).filter { !$0.isEmpty })
+    }
+
+    var isActive: Bool {
+        !parsedTokens.isEmpty || excludeTestFiles || !excludedPathSet.isEmpty
+    }
+
+    var summaryText: String {
+        var parts: [String] = []
+        let tokens = parsedTokens
+        if !tokens.isEmpty {
+            parts.append(tokens.joined(separator: " "))
+        }
+        if excludeTestFiles {
+            parts.append(L("No tests", "不含测试"))
+        }
+        let blacklistCount = excludedPathSet.count
+        if blacklistCount > 0 {
+            parts.append(L("\(blacklistCount) blacklisted", "黑名单 \(blacklistCount) 项"))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    var compactBadgeText: String {
+        let full = summaryText
+        guard full.count > 28 else { return full }
+        return String(full.prefix(27)) + "…"
+    }
+
+    /// Multi-language test-file detector avoiding false positives like `contest.go`, `latest.go`, or `testclient`.
+    static func isTestFile(path: String) -> Bool {
+        let normalized = normalizePath(path)
+        guard !normalized.isEmpty else { return false }
+
+        let components = normalized.split(separator: "/").map(String.init)
+        guard let fileName = components.last, !fileName.isEmpty else { return false }
+
+        let testDirs: Set<String> = [
+            "test", "tests", "__tests__", "spec", "specs", "testdata", "unittest", "unittests",
+        ]
+        for dir in components.dropLast() {
+            if testDirs.contains(dir.lowercased()) {
+                return true
+            }
+        }
+
+        let rawStem = fileName.lastIndex(of: ".").map { String(fileName[..<$0]) } ?? fileName
+        let lowerStem = rawStem.lowercased()
+        if lowerStem == "test" || lowerStem == "tests" || lowerStem == "spec" || lowerStem == "specs" {
+            return true
+        }
+
+        let lowerSuffixes = [
+            "_test", "_tests", ".test", ".tests", "-test", "-tests",
+            "_spec", "_specs", ".spec", ".specs", "-spec", "-specs",
+        ]
+        if lowerSuffixes.contains(where: { lowerStem.hasSuffix($0) }) {
+            return true
+        }
+
+        if lowerStem.hasPrefix("test_") || lowerStem.hasPrefix("spec_") {
+            return true
+        }
+
+        let camelSuffixes = ["Test", "Tests", "Spec", "Specs"]
+        for suffix in camelSuffixes where rawStem.count > suffix.count && rawStem.hasSuffix(suffix) {
+            return true
+        }
+
+        return false
+    }
+
+    /// Matches `pattern` (supporting `*`, `?`, and `**` directory wildcards) against `path`.
+    static func matchesGlob(pattern rawPattern: String, path rawPath: String) -> Bool {
+        let pattern = normalizePath(rawPattern).lowercased()
+        let path = normalizePath(rawPath).lowercased()
+        guard !pattern.isEmpty, !path.isEmpty else { return false }
+
+        if pattern.contains("/") {
+            let patSegs = pattern.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+            let pathSegs = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+            return matchSegments(patSegs, pathSegs)
+        }
+        let fileName = (path as NSString).lastPathComponent
+        return matchesWildcardSegment(pattern, fileName)
+    }
+
+    private static func matchSegments(_ patSegs: [String], _ pathSegs: [String]) -> Bool {
+        let m = patSegs.count
+        let n = pathSegs.count
+        var dp = Array(repeating: Array(repeating: false, count: n + 1), count: m + 1)
+        dp[m][n] = true
+
+        for pi in stride(from: m - 1, through: 0, by: -1) {
+            if patSegs[pi] == "**" {
+                dp[pi][n] = dp[pi + 1][n]
+                for si in stride(from: n - 1, through: 0, by: -1) {
+                    dp[pi][si] = dp[pi + 1][si] || dp[pi][si + 1]
+                }
+            } else {
+                for si in stride(from: n - 1, through: 0, by: -1) {
+                    dp[pi][si] = matchesWildcardSegment(patSegs[pi], pathSegs[si]) && dp[pi + 1][si + 1]
+                }
+            }
+        }
+        return dp[0][0]
+    }
+
+    private static func matchesWildcardSegment(_ pattern: String, _ text: String) -> Bool {
+        let p = Array(pattern)
+        let t = Array(text)
+        var pi = 0
+        var ti = 0
+        var starIdx = -1
+        var matchIdx = 0
+
+        while ti < t.count {
+            if pi < p.count && (p[pi] == "?" || p[pi] == t[ti]) {
+                pi += 1
+                ti += 1
+            } else if pi < p.count && p[pi] == "*" {
+                starIdx = pi
+                matchIdx = ti
+                pi += 1
+            } else if starIdx != -1 {
+                pi = starIdx + 1
+                matchIdx += 1
+                ti = matchIdx
+            } else {
+                return false
+            }
+        }
+
+        while pi < p.count && p[pi] == "*" {
+            pi += 1
+        }
+        return pi == p.count
+    }
+
+    func matches(path: String) -> Bool {
+        let normalized = Self.normalizePath(path)
+        guard !normalized.isEmpty else { return false }
+
+        if excludedPathSet.contains(normalized) {
+            return false
+        }
+        if excludeTestFiles && Self.isTestFile(path: normalized) {
+            return false
+        }
+
+        var positive: [String] = []
+        var negative: [String] = []
+        for token in parsedTokens {
+            if token.hasPrefix("!") {
+                let body = String(token.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !body.isEmpty {
+                    negative.append(body)
+                }
+            } else {
+                positive.append(token)
+            }
+        }
+
+        if negative.contains(where: { Self.matchesGlob(pattern: $0, path: normalized) }) {
+            return false
+        }
+        if !positive.isEmpty {
+            return positive.contains(where: { Self.matchesGlob(pattern: $0, path: normalized) })
+        }
+        return true
+    }
+
+    func apply(to changes: [FileChange]) -> [FileChange] {
+        guard isActive else { return changes }
+        return changes.filter { matches(path: $0.path) }
+    }
+}
+
 /// Errors specific to collecting hunks or parsing AI grouping output.
 enum AIHunkGroupingError: Error, LocalizedError, Equatable, Sendable {
     case unavailableInAppStore
     case noChangesToGroup
+    case noMatchingFilesAfterFilter(String)
     case invalidJSONResponse(String)
 
     var errorDescription: String? {
@@ -256,6 +588,14 @@ enum AIHunkGroupingError: Error, LocalizedError, Equatable, Sendable {
         case .noChangesToGroup:
             return L("There are no changes to group.",
                      "当前没有可分组的变更。")
+        case .noMatchingFilesAfterFilter(let detail):
+            let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                return L("No changed files match the active grouping filter.",
+                         "当前没有符合分组筛选条件的变更文件。")
+            }
+            return L("No changed files match the grouping filter (\(trimmed)).",
+                     "当前没有符合分组筛选条件的变更文件（\(trimmed)）。")
         case .invalidJSONResponse(let detail):
             let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
@@ -895,12 +1235,46 @@ enum AIHunkGrouper {
 
         // Index valid hunks and preserve canonical file order.
         var validByPath: [String: Set<Int>] = [:]
+        var descriptorsByKey: [String: HunkDescriptor] = [:]
+        var isFallbackByPath: [String: Bool] = [:]
         var canonicalFileOrder: [String] = []
         for hunk in validHunks {
             if validByPath[hunk.filePath] == nil {
                 canonicalFileOrder.append(hunk.filePath)
             }
             validByPath[hunk.filePath, default: []].insert(hunk.hunkIndex)
+            descriptorsByKey[hunk.id] = hunk
+            if hunk.isFileLevelFallback {
+                isFallbackByPath[hunk.filePath] = true
+            }
+        }
+
+        func makeGroupFile(path: String, sortedIndices: [Int]) -> AIHunkGroupFile {
+            let totalValid = validByPath[path]?.count ?? 0
+            let isWhole = (isFallbackByPath[path] == true) || (totalValid > 0 && sortedIndices.count == totalValid)
+            if isWhole {
+                return AIHunkGroupFile(
+                    path: path,
+                    hunkIndices: sortedIndices,
+                    coversWholeFile: true,
+                    hunkSpans: nil
+                )
+            }
+            let spans: [AIHunkSpan] = sortedIndices.compactMap { idx in
+                guard let desc = descriptorsByKey["\(path)#\(idx)"] else { return nil }
+                return AIHunkSpan(
+                    oldStart: desc.oldStart,
+                    oldCount: desc.oldCount,
+                    newStart: desc.newStart,
+                    newCount: desc.newCount
+                )
+            }
+            return AIHunkGroupFile(
+                path: path,
+                hunkIndices: sortedIndices,
+                coversWholeFile: false,
+                hunkSpans: spans.count == sortedIndices.count ? spans : nil
+            )
         }
 
         var assigned: Set<String> = []
@@ -950,7 +1324,7 @@ enum AIHunkGrouper {
 
             let groupFiles: [AIHunkGroupFile] = groupFileOrder.compactMap { path in
                 guard let indices = groupHunksByPath[path], !indices.isEmpty else { return nil }
-                return AIHunkGroupFile(path: path, hunkIndices: indices.sorted())
+                return makeGroupFile(path: path, sortedIndices: indices.sorted())
             }
 
             if !groupFiles.isEmpty {
@@ -966,7 +1340,7 @@ enum AIHunkGrouper {
                 .filter { !assigned.contains("\(path)#\($0)") }
                 .sorted()
             if !missing.isEmpty {
-                missingFiles.append(AIHunkGroupFile(path: path, hunkIndices: missing))
+                missingFiles.append(makeGroupFile(path: path, sortedIndices: missing))
             }
         }
 
@@ -1011,6 +1385,7 @@ enum AIHunkGrouper {
         repoRoot: URL,
         source: AIHunkGroupingSource = .workingTree,
         files: [FileChange]? = nil,
+        filter: AIHunkGroupingFilter = AIHunkGroupingFilter(),
         provider: AgentProvider = .agy,
         model: String? = nil,
         timeout: TimeInterval = defaultTimeout,
@@ -1024,12 +1399,30 @@ enum AIHunkGrouper {
         let hunks: [HunkDescriptor]
         switch source {
         case .workingTree:
-            hunks = try await collectWorkingTreeHunks(repoRoot: repoRoot, files: files)
+            let candidateFiles: [FileChange]
+            if let files {
+                candidateFiles = files
+            } else {
+                let status = try await Git.status(in: repoRoot)
+                candidateFiles = status.changes
+            }
+            guard !candidateFiles.isEmpty else {
+                throw AIHunkGroupingError.noChangesToGroup
+            }
+            let filteredFiles = filter.apply(to: candidateFiles)
+            guard !filteredFiles.isEmpty else {
+                throw AIHunkGroupingError.noMatchingFilesAfterFilter(filter.summaryText)
+            }
+            hunks = try await collectHunks(repoRoot: repoRoot, source: .workingTree, files: filteredFiles)
         case .comparison, .commits:
             guard let files, !files.isEmpty else {
                 throw AIHunkGroupingError.noChangesToGroup
             }
-            hunks = try await collectHunks(repoRoot: repoRoot, source: source, files: files)
+            let filteredFiles = filter.apply(to: files)
+            guard !filteredFiles.isEmpty else {
+                throw AIHunkGroupingError.noMatchingFilesAfterFilter(filter.summaryText)
+            }
+            hunks = try await collectHunks(repoRoot: repoRoot, source: source, files: filteredFiles)
         }
         guard !hunks.isEmpty else {
             throw AIHunkGroupingError.noChangesToGroup
@@ -1070,6 +1463,7 @@ enum AIHunkGrouper {
     /// the hunks belonging to `group`, without mutating any external working-tree selection state.
     static func buildCommitSelection(
         for group: AIHunkGroup,
+        allGroups: [AIHunkGroup]? = nil,
         allChanges: [FileChange],
         repoRoot: URL,
         isInitial: Bool = false
@@ -1082,12 +1476,15 @@ enum AIHunkGrouper {
         let changesByPath = Dictionary(allChanges.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
         // Merge duplicate paths defensively while preserving group file order.
         var orderedPaths: [String] = []
-        var indicesByPath: [String: Set<Int>] = [:]
+        var filtersByPath: [String: GroupHunkFilter] = [:]
         for file in group.files {
-            if indicesByPath[file.path] == nil {
+            let fileFilter = file.hunkFilter(groupID: group.id, in: allGroups)
+            if let existing = filtersByPath[file.path] {
+                filtersByPath[file.path] = existing.merged(with: fileFilter)
+            } else {
                 orderedPaths.append(file.path)
+                filtersByPath[file.path] = fileFilter
             }
-            indicesByPath[file.path, default: []].formUnion(file.hunkIndices)
         }
 
         var selectedFiles: [FileChange] = []
@@ -1097,13 +1494,21 @@ enum AIHunkGrouper {
         for path in orderedPaths {
             try Task.checkCancellation()
             guard let change = changesByPath[path],
-                  let wantedIndices = indicesByPath[path],
-                  !wantedIndices.isEmpty else { continue }
+                  let filter = filtersByPath[path] else { continue }
+
+            if case .subset(let indices, _) = filter, indices.isEmpty {
+                continue
+            }
+
+            if filter == .all {
+                selectedFiles.append(change)
+                continue
+            }
 
             // Submodules, initial (unborn) repos, added, untracked, and deleted files are single-hunk whole-file commits.
             if isInitial || change.isSubmodule
                 || change.kind == .added || change.kind == .untracked || change.kind == .deleted {
-                if wantedIndices.contains(0) {
+                if filter.includesSingleFallbackHunk {
                     selectedFiles.append(change)
                 }
                 continue
@@ -1111,14 +1516,14 @@ enum AIHunkGrouper {
 
             // Read HEAD and working-tree bytes using the same strategy as `collectHunks` / `WorkingTree.partialSides`.
             guard let oldData = await Git.blob(rev: "HEAD", path: change.oldPath ?? change.path, in: repoRoot) else {
-                if wantedIndices.contains(0) {
+                if filter.includesSingleFallbackHunk {
                     selectedFiles.append(change)
                 }
                 continue
             }
 
             if oldData.count > defaultMaxInspectableFileBytes {
-                if wantedIndices.contains(0) {
+                if filter.includesSingleFallbackHunk {
                     selectedFiles.append(change)
                 }
                 continue
@@ -1128,7 +1533,7 @@ enum AIHunkGrouper {
             let fm = FileManager.default
             guard let attrs = try? fm.attributesOfItem(atPath: url.path),
                   (attrs[.type] as? FileAttributeType) == .typeRegular else {
-                if wantedIndices.contains(0) {
+                if filter.includesSingleFallbackHunk {
                     selectedFiles.append(change)
                 }
                 continue
@@ -1136,14 +1541,14 @@ enum AIHunkGrouper {
 
             let fileSize = (attrs[.size] as? NSNumber)?.intValue ?? 0
             if fileSize > defaultMaxInspectableFileBytes {
-                if wantedIndices.contains(0) {
+                if filter.includesSingleFallbackHunk {
                     selectedFiles.append(change)
                 }
                 continue
             }
 
             guard let newData = try? Data(contentsOf: url) else {
-                if wantedIndices.contains(0) {
+                if filter.includesSingleFallbackHunk {
                     selectedFiles.append(change)
                 }
                 continue
@@ -1151,7 +1556,7 @@ enum AIHunkGrouper {
 
             if TextCodec.looksBinary(oldData) || TextCodec.looksBinary(newData)
                 || HunkPatch.isUTF16(oldData) || HunkPatch.isUTF16(newData) {
-                if wantedIndices.contains(0) {
+                if filter.includesSingleFallbackHunk {
                     selectedFiles.append(change)
                 }
                 continue
@@ -1160,13 +1565,13 @@ enum AIHunkGrouper {
             guard let hunks = await DiffLoader.computeHunks(old: oldData, new: newData, ignoreWhitespace: false),
                   !hunks.isEmpty else {
                 // Pure rename, mode/metadata change, or undiffable fallback -> single file-level hunk at index 0.
-                if wantedIndices.contains(0) {
+                if filter.includesSingleFallbackHunk {
                     selectedFiles.append(change)
                 }
                 continue
             }
 
-            let validWanted = wantedIndices.filter { hunks.indices.contains($0) }
+            let validWanted = filter.resolved(for: hunks).includedRawIndices.filter { hunks.indices.contains($0) }
             guard !validWanted.isEmpty else { continue }
 
             selectedFiles.append(change)
@@ -1207,8 +1612,21 @@ enum AIHunkGrouper {
         }
 
         var committedByPath: [String: Set<Int>] = [:]
+        var committedHasCompleteSpansByPath: [String: Bool] = [:]
+        var committedSpansByPath: [String: [AIHunkSpan]] = [:]
         for file in committedGroup.files {
             committedByPath[file.path, default: []].formUnion(file.hunkIndices)
+            if let spans = file.hunkSpans, spans.count == file.hunkIndices.count {
+                if committedHasCompleteSpansByPath[file.path] == nil {
+                    committedHasCompleteSpansByPath[file.path] = true
+                    committedSpansByPath[file.path] = spans
+                } else if committedHasCompleteSpansByPath[file.path] == true {
+                    committedSpansByPath[file.path, default: []].append(contentsOf: spans)
+                }
+            } else {
+                committedHasCompleteSpansByPath[file.path] = false
+                committedSpansByPath.removeValue(forKey: file.path)
+            }
         }
 
         var remainingGroups: [AIHunkGroup] = []
@@ -1226,18 +1644,44 @@ enum AIHunkGrouper {
                     continue
                 }
 
-                var shifted: [Int] = []
-                shifted.reserveCapacity(file.hunkIndices.count)
-                for idx in file.hunkIndices where !committedIndices.contains(idx) {
+                let fileHasCompleteSpans = file.hunkSpans?.count == file.hunkIndices.count
+                let canShiftSpans = fileHasCompleteSpans && (committedHasCompleteSpansByPath[file.path] == true)
+                let committedSpans = committedSpansByPath[file.path] ?? []
+
+                var shiftedByIndex: [Int: AIHunkSpan?] = [:]
+                for (pos, idx) in file.hunkIndices.enumerated() where !committedIndices.contains(idx) {
                     let shift = committedIndices.reduce(0) { $0 + ($1 < idx ? 1 : 0) }
                     let adjusted = idx - shift
-                    if adjusted >= 0 {
-                        shifted.append(adjusted)
+                    guard adjusted >= 0 else { continue }
+                    if shiftedByIndex[adjusted] != nil { continue }
+                    var adjustedSpan: AIHunkSpan?
+                    if canShiftSpans, let span = file.hunkSpans?[pos] {
+                        let lineDelta = committedSpans.reduce(0) { acc, c in
+                            let precedes = c.oldStart < span.oldStart
+                                || (c.oldStart == span.oldStart && c.newStart < span.newStart)
+                            return precedes ? acc + (c.newCount - c.oldCount) : acc
+                        }
+                        adjustedSpan = AIHunkSpan(
+                            oldStart: max(0, span.oldStart + lineDelta),
+                            oldCount: span.oldCount,
+                            newStart: span.newStart,
+                            newCount: span.newCount
+                        )
                     }
+                    shiftedByIndex[adjusted] = adjustedSpan
                 }
-                let uniqueSorted = Array(Set(shifted)).sorted()
+
+                let uniqueSorted = shiftedByIndex.keys.sorted()
                 if !uniqueSorted.isEmpty {
-                    updatedFiles.append(AIHunkGroupFile(path: file.path, hunkIndices: uniqueSorted))
+                    let shiftedSpans: [AIHunkSpan]? = canShiftSpans
+                        ? uniqueSorted.compactMap { shiftedByIndex[$0] ?? nil }
+                        : nil
+                    updatedFiles.append(AIHunkGroupFile(
+                        path: file.path,
+                        hunkIndices: uniqueSorted,
+                        coversWholeFile: file.coversWholeFile,
+                        hunkSpans: shiftedSpans?.count == uniqueSorted.count ? shiftedSpans : nil
+                    ))
                 }
             }
 
@@ -1260,7 +1704,33 @@ enum AIHunkGrouper {
         groupID: UUID,
         in result: AIHunkGroupingResult
     ) -> AIHunkGroupingResult? {
-        let remainingGroups = result.groups.filter { $0.id != groupID }
+        let deletedPaths = Set(
+            result.groups.first(where: { $0.id == groupID })?.files.map(\.path) ?? []
+        )
+        let remainingGroups = result.groups.compactMap { group -> AIHunkGroup? in
+            guard group.id != groupID else { return nil }
+            guard !deletedPaths.isEmpty else { return group }
+            let pinnedFiles = group.files.map { file in
+                if file.coversWholeFile == nil,
+                   deletedPaths.contains(file.path),
+                   !file.hunkIndices.isEmpty,
+                   file.hunkIndices.enumerated().allSatisfy({ $0.offset == $0.element }) {
+                    return AIHunkGroupFile(
+                        path: file.path,
+                        hunkIndices: file.hunkIndices,
+                        coversWholeFile: false,
+                        hunkSpans: file.hunkSpans
+                    )
+                }
+                return file
+            }
+            return AIHunkGroup(
+                id: group.id,
+                name: group.name,
+                summary: group.summary,
+                files: pinnedFiles
+            )
+        }
         return rebuildResult(from: remainingGroups, basedOn: result)
     }
 
