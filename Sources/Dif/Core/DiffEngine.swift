@@ -237,6 +237,8 @@ struct GroupFilterBaseline {
     var rightSpans: [[SyntaxSpan]]
     var shouldHighlight: Bool
     var hasWorktreeFile: Bool
+    var isSyntheticReplay: Bool = false
+    var resolutionNote: String? = nil
 }
 
 final class DiffDocument {
@@ -2275,7 +2277,9 @@ enum DiffLoader {
                 rawHunks: rawHunks,
                 rightSpans: rightSpans,
                 shouldHighlight: shouldHighlight,
-                hasWorktreeFile: url != nil
+                hasWorktreeFile: url != nil,
+                isSyntheticReplay: isSyntheticReplay,
+                resolutionNote: resolutionNote
             )
             return buildGroupFiltered(
                 baseline: baseline,
@@ -2341,7 +2345,9 @@ enum DiffLoader {
                 rawHunks: hunks,
                 rightSpans: right.spans,
                 shouldHighlight: max(oldBytes?.count ?? 0, newBytes?.count ?? 0) <= 4 * 1024 * 1024,
-                hasWorktreeFile: url != nil
+                hasWorktreeFile: url != nil,
+                isSyntheticReplay: isSyntheticReplay,
+                resolutionNote: resolutionNote
             )
         }
         doc.note = resolutionNote ?? note(
@@ -2493,13 +2499,14 @@ enum DiffLoader {
         doc.semanticOptions = semanticOptions
         doc.isJSONNormalized = false
         doc.isGroupFiltered = true
+        doc.isSyntheticReplay = baseline.isSyntheticReplay
         doc.groupHunkIndexMap = finalRawToFiltered
         doc.groupFilterBaseline = baseline
         doc.setRenameGroups(processed.renameGroups)
         if baseline.hasWorktreeFile {
             doc.editing = EditInfo(readOnlyReason: L("Group view · read-only", "分组视图 · 只读"))
         }
-        doc.note = note(
+        doc.note = baseline.resolutionNote ?? note(
             hunks: doc.hunks,
             old: nil,
             new: nil,
@@ -2766,7 +2773,7 @@ enum DiffLoader {
         return hunks
     }
 
-    private struct CommitStepsResolution {
+    struct CommitStepsResolution {
         var oldData: Data?
         var newData: Data?
         var leftTitle: String
@@ -2777,7 +2784,7 @@ enum DiffLoader {
 
     /// Resolves a file across non-contiguous selected commits (`oldest` → `newest`) by chaining steps directly
     /// when untouched in between, or replaying patches with `git merge-file` when unselected commits intervened.
-    private static func resolveCommitSteps(_ steps: [FileCommitStep], in root: URL) async -> CommitStepsResolution {
+    static func resolveCommitSteps(_ steps: [FileCommitStep], in root: URL) async -> CommitStepsResolution {
         guard !steps.isEmpty else {
             return CommitStepsResolution(oldData: nil, newData: nil, leftTitle: "", rightTitle: "", isSynthetic: false, note: nil)
         }

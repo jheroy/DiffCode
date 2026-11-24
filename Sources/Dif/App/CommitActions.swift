@@ -175,8 +175,8 @@ extension AppStore {
                 // Lines picked before the merge were picked against the old HEAD.
                 if !project.excludedLines.isEmpty { project.excludedLines = [:] }
                 if project.commitMessage == message { project.commitMessage = "" }
-                if project.aiGroupResult != nil {
-                    self.clearAIGroups(for: project)
+                if project.aiGroupSessions.contains(where: \.isCommittable) {
+                    self.clearWorkingTreeAIGroups(for: project)
                 }
                 let clashes = await Git.conflictedPaths(in: project.url)
                 if !clashes.isEmpty {

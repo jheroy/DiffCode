@@ -1,6 +1,7 @@
 import Foundation
+import SwiftUI
 
-/// Local AI agent discovery, model listing, and AI working-tree hunk grouping actions.
+/// Local AI agent discovery, model listing, and multi-source / multi-session AI hunk grouping actions.
 extension AppStore {
     // MARK: Agent Availability & Models
 
@@ -147,15 +148,24 @@ extension AppStore {
         settings.setAIModel(model, for: provider, task: task)
     }
 
-    // MARK: AI Hunk Grouping
+    // MARK: AI Hunk Grouping (Multi-Source & Multi-Session)
 
-    /// Generates logical AI groups for all uncommitted working-tree hunks in `project`.
+    /// Generates logical AI groups for the active context: comparison if one is open, else working-tree changes.
     /// Calling again while generation is in progress cancels the active request.
     func generateAIGroups(for project: Project) {
         if project.isGeneratingGroups {
             cancelAIGroupGeneration(for: project)
             return
         }
+        if let comparison = project.comparison {
+            generateComparisonAIGroups(for: project, comparison: comparison)
+        } else {
+            generateWorkingTreeAIGroups(for: project)
+        }
+    }
+
+    /// Generates logical AI groups for all uncommitted working-tree hunks in `project`.
+    func generateWorkingTreeAIGroups(for project: Project, replacingSessionID: UUID? = nil) {
         guard !AppEnvironment.isAppStore else {
             showToast(AIHunkGroupingError.unavailableInAppStore.localizedDescription)
             return
@@ -168,11 +178,15 @@ extension AppStore {
         // Flush any unsaved inline edits so the collected hunks match the working tree.
         guard viewer.saveEdits() else { return }
 
+        let targetSessionID = replacingSessionID ?? project.aiGroupSessions.first(where: \.isCommittable)?.id
         let provider = settings.aiProvider(for: .grouping)
         let model = settings.aiModel(for: provider, task: .grouping)
         let files = project.changes
         let repoRoot = project.url
-        let token = project.beginAIGroupGeneration()
+        let headOID = project.status.headOID
+
+        project.lastFailedGroupTarget = .workingTree
+        let token = project.beginAIGroupGeneration(sessionID: targetSessionID, source: .workingTree)
 
         project.aiGroupGenerationTask = Task { @MainActor [weak self, weak project] in
             guard let self, let project else { return }
@@ -182,6 +196,7 @@ extension AppStore {
             do {
                 let result = try await AIHunkGrouper.generateGroups(
                     repoRoot: repoRoot,
+                    source: .workingTree,
                     files: files,
                     provider: provider,
                     model: model
@@ -189,51 +204,511 @@ extension AppStore {
                 try Task.checkCancellation()
                 guard project.aiGroupGenerationToken == token else { return }
                 project.cancelGroupCommitMessageGeneration()
-                project.groupCommitMessages.removeAll()
-                project.aiGroupResult = result
-                project.aiGroupError = nil
-                project.groupCollapsed.removeAll()
-
-                let chosenGroup: AIHunkGroup?
-                if let currentID = project.selectedGroupID,
-                   let existing = result.groups.first(where: { $0.id == currentID }) {
-                    chosenGroup = existing
-                } else {
-                    chosenGroup = result.groups.first
-                }
-                project.selectedGroupID = chosenGroup?.id
-                project.selectedGroupFilePath = nil
-                project.selectedGroupRowID = nil
-                project.selectedGroupHunkIndex = nil
-
-                if let group = chosenGroup {
-                    if project.id == self.selectedProjectID, project.tab == .groups {
-                        self.selectAIGroup(group, in: project, openFirstFile: true)
-                    } else if let firstFile = project.orderedGroupFiles(for: group, flat: self.settings.flatList).first ?? group.files.first {
-                        project.selectedGroupFilePath = firstFile.path
-                        project.selectedGroupRowID = ChangeRow.fileID(firstFile.path)
-                        project.selectedGroupHunkIndex = firstFile.hunkIndices.first ?? 0
-                    }
-                }
-                self.persistAIGroups(for: project)
-
-                let summary = result.groups.count == 1
-                    ? L("Grouped \(result.totalHunks) changes into 1 group", "已将 \(result.totalHunks) 处变更归为 1 组")
-                    : L("Grouped \(result.totalHunks) changes into \(result.groups.count) groups",
-                        "已将 \(result.totalHunks) 处变更分为 \(result.groups.count) 组")
-                self.showToast(summary)
+                self.applyGeneratedGroupingResult(
+                    result,
+                    source: .workingTree,
+                    files: files,
+                    headOID: headOID,
+                    replacingSessionID: targetSessionID,
+                    in: project
+                )
             } catch is CancellationError {
                 // Cancelled by user or project switch.
             } catch {
                 guard project.aiGroupGenerationToken == token else { return }
+                project.lastFailedGroupTarget = .workingTree
                 project.aiGroupError = error.localizedDescription
                 self.showToast(error.localizedDescription)
             }
         }
     }
 
+    /// Generates logical AI groups for the active branch/commit/stash comparison (or `comparison`).
+    func generateComparisonAIGroups(
+        for project: Project,
+        comparison: Comparison? = nil,
+        files: [FileChange]? = nil,
+        replacingSessionID: UUID? = nil
+    ) {
+        guard let activeComparison = comparison ?? project.comparison else {
+            showToast(AIHunkGroupingError.noChangesToGroup.localizedDescription)
+            return
+        }
+        let compSource: AIHunkGroupingSource.ComparisonSource
+        if case .comparison(let cs) = AIHunkGroupingSource.from(comparison: activeComparison) {
+            compSource = cs
+        } else {
+            return
+        }
+        let preloadedFiles: [FileChange]?
+        if let files {
+            preloadedFiles = files
+        } else if activeComparison == project.comparison && !project.isLoadingCompare && !project.compareChanges.isEmpty {
+            preloadedFiles = project.compareChanges
+        } else {
+            preloadedFiles = nil
+        }
+        runComparisonAIGrouping(
+            for: project,
+            comparisonSource: compSource,
+            stash: activeComparison.stash,
+            preloadedFiles: preloadedFiles,
+            replacingSessionID: replacingSessionID
+        )
+    }
+
+    /// Generates logical AI groups from one or more selected Log / Git Graph commits (`commits` ordered newest first).
+    func generateCommitsAIGroups(
+        for project: Project,
+        commits: [Commit],
+        replacingSessionID: UUID? = nil
+    ) {
+        guard !AppEnvironment.isAppStore else {
+            showToast(AIHunkGroupingError.unavailableInAppStore.localizedDescription)
+            return
+        }
+        guard !project.isCommittingGroup, !project.isCommitting else { return }
+        guard !commits.isEmpty else {
+            showToast(AIHunkGroupingError.noChangesToGroup.localizedDescription)
+            return
+        }
+
+        let orderedCommits = commits
+        let hashes = orderedCommits.map(\.hash)
+        let placeholderSource = AIHunkGroupingSource.commits(.init(
+            commitHashes: hashes,
+            oldestParentHash: orderedCommits.count == 1 ? orderedCommits[0].parents.first : nil,
+            isNonContiguous: false,
+            primarySubject: orderedCommits.count == 1 ? orderedCommits[0].subject : nil,
+            skippedMergeCount: 0,
+            fileSteps: [:]
+        ))
+
+        prepareGroupsTabForGeneration(replacingSessionID: replacingSessionID, in: project)
+
+        let provider = settings.aiProvider(for: .grouping)
+        let model = settings.aiModel(for: provider, task: .grouping)
+        let repoRoot = project.url
+
+        project.lastFailedGroupTarget = .commits(hashes)
+        let token = project.beginAIGroupGeneration(sessionID: replacingSessionID, source: placeholderSource)
+
+        project.aiGroupGenerationTask = Task { @MainActor [weak self, weak project] in
+            guard let self, let project else { return }
+            defer {
+                project.finishAIGroupGeneration(token: token)
+            }
+            do {
+                let summary = try await Git.commitSelectionSummary(orderedCommits, in: repoRoot)
+                try Task.checkCancellation()
+                guard project.aiGroupGenerationToken == token else { return }
+                guard !summary.files.isEmpty else {
+                    throw AIHunkGroupingError.noChangesToGroup
+                }
+
+                let newest = orderedCommits[0]
+                let oldest = orderedCommits[orderedCommits.count - 1]
+                let commitsSource = AIHunkGroupingSource.CommitsSource(
+                    commitHashes: hashes,
+                    oldestParentHash: summary.isNonContiguous ? nil : oldest.parents.first,
+                    isNonContiguous: summary.isNonContiguous,
+                    primarySubject: orderedCommits.count == 1 ? newest.subject : nil,
+                    skippedMergeCount: summary.skippedMergeCount,
+                    fileSteps: summary.fileSteps
+                )
+                let source = AIHunkGroupingSource.commits(commitsSource)
+                project.generatingGroupSource = source
+
+                let result = try await AIHunkGrouper.generateGroups(
+                    repoRoot: repoRoot,
+                    source: source,
+                    files: summary.files,
+                    provider: provider,
+                    model: model
+                )
+                try Task.checkCancellation()
+                guard project.aiGroupGenerationToken == token else { return }
+                self.applyGeneratedGroupingResult(
+                    result,
+                    source: source,
+                    files: summary.files,
+                    headOID: nil,
+                    replacingSessionID: replacingSessionID,
+                    in: project
+                )
+            } catch is CancellationError {
+                // Cancelled by user or project switch.
+            } catch {
+                guard project.aiGroupGenerationToken == token else { return }
+                project.lastFailedGroupTarget = .commits(hashes)
+                project.aiGroupError = error.localizedDescription
+                self.showToast(error.localizedDescription)
+            }
+        }
+    }
+
+    /// Re-runs AI grouping for an existing session using its recorded source.
+    func regenerateAIGroupSession(_ sessionID: UUID, in project: Project) {
+        guard !AppEnvironment.isAppStore else {
+            showToast(AIHunkGroupingError.unavailableInAppStore.localizedDescription)
+            return
+        }
+        if project.isGeneratingGroups {
+            cancelAIGroupGeneration(for: project)
+            return
+        }
+        guard let session = project.aiGroupSession(id: sessionID) else {
+            generateAIGroups(for: project)
+            return
+        }
+        switch session.source {
+        case .workingTree:
+            generateWorkingTreeAIGroups(for: project, replacingSessionID: sessionID)
+        case .comparison(let compSource):
+            runComparisonAIGrouping(
+                for: project,
+                comparisonSource: compSource,
+                stash: nil,
+                preloadedFiles: nil,
+                replacingSessionID: sessionID
+            )
+        case .commits(let commitsSource):
+            let hashes = commitsSource.commitHashes
+            let repoRoot = project.url
+            Task { @MainActor [weak self, weak project] in
+                guard let self, let project else { return }
+                let fetched = await Git.commits(hashes: hashes, in: repoRoot)
+                let byHash = Dictionary(fetched.map { ($0.hash, $0) }, uniquingKeysWith: { first, _ in first })
+                let ordered = hashes.compactMap { byHash[$0] }
+                guard !ordered.isEmpty else {
+                    let message = L("Selected commits are no longer available", "所选提交已不存在")
+                    project.aiGroupError = message
+                    self.showToast(message)
+                    return
+                }
+                self.generateCommitsAIGroups(for: project, commits: ordered, replacingSessionID: sessionID)
+            }
+        }
+    }
+
+    /// Retries the most recent failed AI grouping attempt, or falls back to the active context.
+    func retryFailedAIGroupGeneration(for project: Project) {
+        guard !project.isGeneratingGroups, !project.isCommittingGroup, !project.isCommitting else { return }
+        switch project.lastFailedGroupTarget {
+        case .workingTree:
+            generateWorkingTreeAIGroups(for: project)
+        case .comparison(let compSource):
+            runComparisonAIGrouping(
+                for: project,
+                comparisonSource: compSource,
+                stash: nil,
+                preloadedFiles: nil,
+                replacingSessionID: nil
+            )
+        case .commits(let hashes):
+            let repoRoot = project.url
+            Task { @MainActor [weak self, weak project] in
+                guard let self, let project else { return }
+                let fetched = await Git.commits(hashes: hashes, in: repoRoot)
+                let byHash = Dictionary(fetched.map { ($0.hash, $0) }, uniquingKeysWith: { first, _ in first })
+                let ordered = hashes.compactMap { byHash[$0] }
+                guard !ordered.isEmpty else {
+                    self.generateAIGroups(for: project)
+                    return
+                }
+                self.generateCommitsAIGroups(for: project, commits: ordered)
+            }
+        case nil:
+            generateAIGroups(for: project)
+        }
+    }
+
+    private func runComparisonAIGrouping(
+        for project: Project,
+        comparisonSource: AIHunkGroupingSource.ComparisonSource,
+        stash: StashEntry?,
+        preloadedFiles: [FileChange]?,
+        replacingSessionID: UUID?
+    ) {
+        guard !AppEnvironment.isAppStore else {
+            showToast(AIHunkGroupingError.unavailableInAppStore.localizedDescription)
+            return
+        }
+        guard !project.isCommittingGroup, !project.isCommitting else { return }
+        if comparisonSource.headHash == nil {
+            guard viewer.saveEdits() else { return }
+        }
+
+        prepareGroupsTabForGeneration(replacingSessionID: replacingSessionID, in: project)
+
+        let provider = settings.aiProvider(for: .grouping)
+        let model = settings.aiModel(for: provider, task: .grouping)
+        let repoRoot = project.url
+        let initialSource = AIHunkGroupingSource.comparison(comparisonSource)
+
+        project.lastFailedGroupTarget = .comparison(comparisonSource)
+        let token = project.beginAIGroupGeneration(sessionID: replacingSessionID, source: initialSource)
+
+        project.aiGroupGenerationTask = Task { @MainActor [weak self, weak project] in
+            guard let self, let project else { return }
+            defer {
+                project.finishAIGroupGeneration(token: token)
+            }
+            do {
+                var resolvedComp = comparisonSource
+                let resolvedFiles: [FileChange]
+                if let preloadedFiles {
+                    resolvedFiles = preloadedFiles
+                } else if resolvedComp.isStash, let headHash = resolvedComp.headHash {
+                    let entry = stash ?? StashEntry(
+                        hash: headHash,
+                        index: 0,
+                        message: resolvedComp.title,
+                        date: Date(),
+                        base: resolvedComp.baseHash,
+                        untracked: resolvedComp.stashUntrackedHash
+                    )
+                    resolvedFiles = try await Git.stashFiles(entry, in: repoRoot)
+                } else {
+                    if resolvedComp.headHash == nil {
+                        let resolvedBase = resolvedComp.forkPoint
+                            ? await Git.mergeBase("HEAD", resolvedComp.targetRef, in: repoRoot)
+                            : await Git.resolveCommit(resolvedComp.targetRef, in: repoRoot)
+                        if let resolvedBase {
+                            resolvedComp.baseHash = resolvedBase
+                        }
+                    }
+                    resolvedFiles = try await Git.compareFiles(
+                        base: resolvedComp.baseHash,
+                        head: resolvedComp.headHash,
+                        in: repoRoot
+                    )
+                }
+
+                try Task.checkCancellation()
+                guard project.aiGroupGenerationToken == token else { return }
+                guard !resolvedFiles.isEmpty else {
+                    throw AIHunkGroupingError.noChangesToGroup
+                }
+
+                let finalSource = AIHunkGroupingSource.comparison(resolvedComp)
+                project.generatingGroupSource = finalSource
+                project.lastFailedGroupTarget = .comparison(resolvedComp)
+
+                let result = try await AIHunkGrouper.generateGroups(
+                    repoRoot: repoRoot,
+                    source: finalSource,
+                    files: resolvedFiles,
+                    provider: provider,
+                    model: model
+                )
+                try Task.checkCancellation()
+                guard project.aiGroupGenerationToken == token else { return }
+                self.applyGeneratedGroupingResult(
+                    result,
+                    source: finalSource,
+                    files: resolvedFiles,
+                    headOID: nil,
+                    replacingSessionID: replacingSessionID,
+                    in: project
+                )
+            } catch is CancellationError {
+                // Cancelled by user or project switch.
+            } catch {
+                guard project.aiGroupGenerationToken == token else { return }
+                project.lastFailedGroupTarget = .comparison(comparisonSource)
+                project.aiGroupError = error.localizedDescription
+                self.showToast(error.localizedDescription)
+            }
+        }
+    }
+
+    private func prepareGroupsTabForGeneration(replacingSessionID: UUID?, in project: Project) {
+        exitExternalFileMode()
+        if selectedProjectID != project.id {
+            select(project)
+        }
+        project.browsedPath = nil
+        if project.tab != .groups {
+            project.tab = .groups
+        }
+        if !listVisible {
+            withAnimation(.snappy(duration: 0.2)) { listVisible = true }
+        }
+        if project.activeGroupSessionID != replacingSessionID {
+            project.activeGroupSessionID = replacingSessionID
+            project.groupCollapsed.removeAll()
+            project.selectedGroupRowID = nil
+            pendingGroupHunkFocus = nil
+            if project.id == selectedProjectID {
+                syncViewer()
+            }
+        }
+    }
+
+    private func applyGeneratedGroupingResult(
+        _ result: AIHunkGroupingResult,
+        source: AIHunkGroupingSource,
+        files: [FileChange],
+        headOID: String?,
+        replacingSessionID: UUID?,
+        in project: Project
+    ) {
+        let sessionID = replacingSessionID ?? UUID()
+        let firstGroup = result.groups.first
+        let firstFile = firstGroup.flatMap { group in
+            let tempSession = AIGroupSession(id: sessionID, source: source, result: result, files: files)
+            return project.orderedGroupFiles(for: group, in: tempSession, flat: settings.flatList).first ?? group.files.first
+        }
+
+        let newSession = AIGroupSession(
+            id: sessionID,
+            source: source,
+            result: result,
+            files: files,
+            selectedGroupID: firstGroup?.id,
+            selectedGroupFilePath: firstFile?.path,
+            selectedGroupHunkIndex: firstFile?.hunkIndices.first ?? 0,
+            groupCommitMessages: [:],
+            headOID: headOID
+        )
+
+        if let existingIdx = project.aiGroupSessions.firstIndex(where: { $0.id == sessionID }) {
+            project.aiGroupSessions[existingIdx] = newSession
+        } else {
+            project.aiGroupSessions.append(newSession)
+        }
+        project.activeGroupSessionID = sessionID
+        project.aiGroupError = nil
+        project.lastFailedGroupTarget = nil
+        project.groupCollapsed.removeAll()
+        project.selectedGroupRowID = firstFile.map { ChangeRow.fileID($0.path) }
+
+        if project.id == selectedProjectID, project.tab == .groups,
+           let group = firstGroup, let file = firstFile {
+            openGroupItem(project: project, group: group, filePath: file.path, hunkIndex: file.hunkIndices.first ?? 0)
+        }
+        persistAIGroups(for: project, headOIDOverride: headOID)
+
+        let summary = result.groups.count == 1
+            ? L("Grouped \(result.totalHunks) changes into 1 group", "已将 \(result.totalHunks) 处变更归为 1 组")
+            : L("Grouped \(result.totalHunks) changes into \(result.groups.count) groups",
+                "已将 \(result.totalHunks) 处变更分为 \(result.groups.count) 组")
+        showToast(summary)
+    }
+
     func cancelAIGroupGeneration(for project: Project) {
         project.cancelAIGroupGeneration(includeGroupCommitMessage: false)
+    }
+
+    // MARK: Session Management
+
+    func selectAIGroupSession(_ sessionID: UUID, in project: Project) {
+        guard let session = project.aiGroupSession(id: sessionID) else { return }
+        if project.activeGroupSessionID != sessionID {
+            project.activeGroupSessionID = sessionID
+            project.aiGroupError = nil
+            project.groupCollapsed.removeAll()
+            project.selectedGroupRowID = session.selectedGroupFilePath.map(ChangeRow.fileID)
+            schedulePersistAIGroups(for: project)
+        }
+        guard project.id == selectedProjectID else { return }
+        if let group = session.activeGroup {
+            let targetFile: AIHunkGroupFile? = {
+                if let path = session.selectedGroupFilePath,
+                   let existing = group.files.first(where: { $0.path == path }) {
+                    return existing
+                }
+                return project.orderedGroupFiles(for: group, in: session, flat: settings.flatList).first ?? group.files.first
+            }()
+            if let file = targetFile {
+                let targetHunk = session.selectedGroupFilePath == file.path
+                    ? (session.selectedGroupHunkIndex ?? file.hunkIndices.first ?? 0)
+                    : (file.hunkIndices.first ?? 0)
+                openGroupItem(project: project, group: group, filePath: file.path, hunkIndex: targetHunk)
+                return
+            }
+        }
+        syncViewer()
+    }
+
+    /// Switches the Groups panel to the creation view so the user can start another grouping session.
+    func startNewAIGroupSession(in project: Project) {
+        if pendingGroupHunkFocus?.root == project.url {
+            pendingGroupHunkFocus = nil
+        }
+        project.activeGroupSessionID = nil
+        project.aiGroupError = nil
+        project.groupCollapsed.removeAll()
+        project.selectedGroupRowID = nil
+        if project.id == selectedProjectID {
+            syncViewer()
+        }
+    }
+
+    /// Deletes a single grouping session from `project` without touching any other sessions or git state.
+    func deleteAIGroupSession(_ sessionID: UUID, in project: Project) {
+        guard !project.isCommittingGroup else { return }
+        guard let previousIndex = project.aiGroupSessions.firstIndex(where: { $0.id == sessionID }) else { return }
+        let removedSession = project.aiGroupSessions[previousIndex]
+
+        if project.generatingGroupSessionID == sessionID {
+            project.cancelAIGroupGeneration(includeGroupCommitMessage: removedSession.isCommittable)
+        } else if removedSession.isCommittable {
+            project.cancelGroupCommitMessageGeneration()
+        }
+
+        if pendingGroupHunkFocus?.root == project.url, project.activeGroupSessionID == sessionID {
+            pendingGroupHunkFocus = nil
+        }
+
+        project.aiGroupSessions.remove(at: previousIndex)
+
+        if project.aiGroupSessions.isEmpty {
+            project.activeGroupSessionID = nil
+            project.selectedGroupRowID = nil
+            project.groupCollapsed.removeAll()
+            deletePersistedAIGroups(for: project)
+            if project.id == selectedProjectID {
+                viewer.setHighlightedGroupHunks(nil)
+                syncViewer()
+            }
+            return
+        }
+
+        if project.activeGroupSessionID == sessionID {
+            let nextIdx = min(max(0, previousIndex), project.aiGroupSessions.count - 1)
+            let nextSession = project.aiGroupSessions[nextIdx]
+            project.activeGroupSessionID = nextSession.id
+            project.groupCollapsed.removeAll()
+            project.selectedGroupRowID = nextSession.selectedGroupFilePath.map(ChangeRow.fileID)
+        }
+        persistAIGroups(for: project)
+
+        if project.id == selectedProjectID {
+            syncViewer()
+        }
+    }
+
+    func deleteOtherAIGroupSessions(keeping sessionID: UUID, in project: Project) {
+        guard !project.isCommittingGroup,
+              let kept = project.aiGroupSession(id: sessionID) else { return }
+        if let genID = project.generatingGroupSessionID, genID != sessionID {
+            project.cancelAIGroupGeneration(includeGroupCommitMessage: false)
+        }
+        if !kept.isCommittable {
+            project.cancelGroupCommitMessageGeneration()
+        }
+        project.aiGroupSessions = [kept]
+        if project.activeGroupSessionID != sessionID {
+            project.activeGroupSessionID = sessionID
+            project.groupCollapsed.removeAll()
+            project.selectedGroupRowID = kept.selectedGroupFilePath.map(ChangeRow.fileID)
+        }
+        persistAIGroups(for: project)
+        if project.id == selectedProjectID {
+            syncViewer()
+        }
     }
 
     func clearAIGroups(for project: Project) {
@@ -244,29 +719,47 @@ extension AppStore {
         deletePersistedAIGroups(for: project)
         if project.id == selectedProjectID {
             viewer.setHighlightedGroupHunks(nil)
+            syncViewer()
         }
     }
 
-    /// Deletes a single logical group from `project` without touching git working-tree changes,
-    /// updating the selection and persisted record immediately.
+    /// Removes only working-tree grouping sessions (leaving comparison and commit-log sessions intact).
+    func clearWorkingTreeAIGroups(for project: Project) {
+        let hadActiveWT = project.activeAIGroupSession?.isCommittable == true
+        if pendingGroupHunkFocus?.root == project.url, hadActiveWT {
+            pendingGroupHunkFocus = nil
+        }
+        project.removeWorkingTreeAIGroupSessions()
+        persistAIGroups(for: project)
+        if project.id == selectedProjectID && hadActiveWT {
+            syncViewer()
+        }
+    }
+
+    /// Deletes a single logical group from the active session without touching git working-tree changes.
     func deleteAIGroup(_ group: AIHunkGroup, in project: Project) {
-        guard !project.isCommittingGroup, let currentResult = project.aiGroupResult else { return }
+        guard !project.isCommittingGroup, let session = project.activeAIGroupSession else { return }
+        let sessionID = session.id
         let groupID = group.id
-        let previousIndex = currentResult.groups.firstIndex(where: { $0.id == groupID })
-        guard let updatedResult = AIHunkGrouper.resultAfterDeleting(groupID: groupID, in: currentResult) else {
-            clearAIGroups(for: project)
-            if project.id == selectedProjectID {
-                syncViewer()
-            }
+        let previousIndex = session.result.groups.firstIndex(where: { $0.id == groupID })
+        guard let updatedResult = AIHunkGrouper.resultAfterDeleting(groupID: groupID, in: session.result) else {
+            deleteAIGroupSession(sessionID, in: project)
             return
         }
 
         if project.generatingGroupCommitID == groupID {
             project.cancelGroupCommitMessageGeneration()
         }
-        project.groupCommitMessages.removeValue(forKey: groupID)
-        project.aiGroupResult = updatedResult
-        reconcileAIGroupState(for: updatedResult, removedGroupID: groupID, previousIndex: previousIndex, in: project)
+        project.mutateAIGroupSession(id: sessionID) { s in
+            s.groupCommitMessages.removeValue(forKey: groupID.uuidString)
+            s.result = updatedResult
+        }
+        reconcileAIGroupSession(
+            id: sessionID,
+            removedGroupID: groupID,
+            previousIndex: previousIndex,
+            in: project
+        )
         persistAIGroups(for: project)
 
         if project.id == selectedProjectID {
@@ -274,22 +767,50 @@ extension AppStore {
         }
     }
 
-    /// Prunes or clears AI group records when files are committed outside the Groups tab.
+    /// Prunes or removes working-tree AI group sessions when files are committed outside the Groups tab.
+    /// Non-committable sessions (comparison & commits) are unaffected.
     func updateAIGroupsAfterExternalCommit(
         committedPaths: Set<String>,
         in project: Project,
         newHeadOID: String?
     ) {
-        guard !committedPaths.isEmpty, let currentResult = project.aiGroupResult else { return }
-        let previousIndex = project.selectedGroupID.flatMap { id in
-            currentResult.groups.firstIndex(where: { $0.id == id })
+        guard !committedPaths.isEmpty else { return }
+        let workingTreeIDs = project.aiGroupSessions.filter(\.isCommittable).map(\.id)
+        guard !workingTreeIDs.isEmpty else { return }
+
+        for sessionID in workingTreeIDs {
+            guard let session = project.aiGroupSession(id: sessionID) else { continue }
+            let previousIndex = session.selectedGroupID.flatMap { id in
+                session.result.groups.firstIndex(where: { $0.id == id })
+            }
+            guard let updatedResult = AIHunkGrouper.resultAfterRemovingFiles(committedPaths, in: session.result) else {
+                let idx = project.aiGroupSessions.firstIndex(where: { $0.id == sessionID })
+                project.aiGroupSessions.removeAll { $0.id == sessionID }
+                if project.activeGroupSessionID == sessionID {
+                    if let firstRemaining = idx.flatMap({ i in
+                        project.aiGroupSessions.isEmpty ? nil : project.aiGroupSessions[min(i, project.aiGroupSessions.count - 1)]
+                    }) {
+                        project.activeGroupSessionID = firstRemaining.id
+                        project.selectedGroupRowID = firstRemaining.selectedGroupFilePath.map(ChangeRow.fileID)
+                    } else {
+                        project.activeGroupSessionID = nil
+                        project.selectedGroupRowID = nil
+                    }
+                    project.groupCollapsed.removeAll()
+                }
+                continue
+            }
+            project.mutateAIGroupSession(id: sessionID) { s in
+                s.result = updatedResult
+                if let newHeadOID { s.headOID = newHeadOID }
+            }
+            reconcileAIGroupSession(
+                id: sessionID,
+                removedGroupID: nil,
+                previousIndex: previousIndex,
+                in: project
+            )
         }
-        guard let updatedResult = AIHunkGrouper.resultAfterRemovingFiles(committedPaths, in: currentResult) else {
-            clearAIGroups(for: project)
-            return
-        }
-        project.aiGroupResult = updatedResult
-        reconcileAIGroupState(for: updatedResult, removedGroupID: nil, previousIndex: previousIndex, in: project)
         persistAIGroups(for: project, headOIDOverride: newHeadOID)
     }
 
@@ -337,120 +858,130 @@ extension AppStore {
         }
         aiGroupPersistTasks.removeAll()
         guard !AppEnvironment.isAppStore else { return }
-        for project in projects where project.aiGroupResult != nil {
+        for project in projects where !project.aiGroupSessions.isEmpty {
             persistAIGroups(for: project)
         }
     }
 
-    private func reconcileAIGroupState(
-        for updatedResult: AIHunkGroupingResult,
+    private func reconcileAIGroupSession(
+        id sessionID: UUID,
         removedGroupID: UUID? = nil,
         previousIndex: Int? = nil,
         in project: Project
     ) {
+        guard let session = project.aiGroupSession(id: sessionID) else { return }
+        let updatedResult = session.result
+        guard !updatedResult.groups.isEmpty else { return }
+
         let validIDs = Set(updatedResult.groups.map(\.id))
-        if project.groupCommitMessages.keys.contains(where: { !validIDs.contains($0) }) {
-            project.groupCommitMessages = project.groupCommitMessages.filter { validIDs.contains($0.key) }
-        }
-        if let generatingID = project.generatingGroupCommitID, !validIDs.contains(generatingID) {
-            project.cancelGroupCommitMessageGeneration()
+        let isActiveSession = project.activeGroupSessionID == sessionID
+
+        project.mutateAIGroupSession(id: sessionID) { s in
+            if s.groupCommitMessages.keys.contains(where: { UUID(uuidString: $0).map { !validIDs.contains($0) } ?? true }) {
+                s.groupCommitMessages = s.groupCommitMessages.filter { key, _ in
+                    UUID(uuidString: key).map { validIDs.contains($0) } ?? false
+                }
+            }
+
+            let needsReselect = s.selectedGroupID == nil
+                || (removedGroupID != nil && s.selectedGroupID == removedGroupID)
+                || !validIDs.contains(s.selectedGroupID!)
+            if needsReselect {
+                let nextIdx = min(max(0, previousIndex ?? 0), updatedResult.groups.count - 1)
+                let nextGroup = updatedResult.groups[nextIdx]
+                s.selectedGroupID = nextGroup.id
+                let firstFile = project.orderedGroupFiles(for: nextGroup, in: s, flat: settings.flatList).first ?? nextGroup.files.first
+                s.selectedGroupFilePath = firstFile?.path
+                s.selectedGroupHunkIndex = firstFile?.hunkIndices.first ?? 0
+            } else if let activeID = s.selectedGroupID,
+                      let activeGroup = updatedResult.groups.first(where: { $0.id == activeID }) {
+                if let currentPath = s.selectedGroupFilePath,
+                   let activeFile = activeGroup.files.first(where: { $0.path == currentPath }) {
+                    if let hunk = s.selectedGroupHunkIndex, !activeFile.hunkIndices.contains(hunk) {
+                        s.selectedGroupHunkIndex = activeFile.hunkIndices.first ?? 0
+                    }
+                } else if let firstFile = project.orderedGroupFiles(for: activeGroup, in: s, flat: settings.flatList).first ?? activeGroup.files.first {
+                    s.selectedGroupFilePath = firstFile.path
+                    s.selectedGroupHunkIndex = firstFile.hunkIndices.first ?? 0
+                } else {
+                    s.selectedGroupFilePath = nil
+                    s.selectedGroupHunkIndex = nil
+                }
+            }
         }
 
-        let needsReselect = project.selectedGroupID == nil
-            || (removedGroupID != nil && project.selectedGroupID == removedGroupID)
-            || !validIDs.contains(project.selectedGroupID!)
-        if needsReselect {
-            let nextIdx = min(max(0, previousIndex ?? 0), updatedResult.groups.count - 1)
-            let nextGroup = updatedResult.groups[nextIdx]
-            project.selectedGroupID = nextGroup.id
-            project.groupCollapsed.removeAll()
-            project.selectedGroupFilePath = nil
-            project.selectedGroupRowID = nil
-            project.selectedGroupHunkIndex = nil
-            if let firstFile = project.orderedGroupFiles(for: nextGroup, flat: settings.flatList).first ?? nextGroup.files.first {
-                project.selectedGroupFilePath = firstFile.path
-                project.selectedGroupRowID = ChangeRow.fileID(firstFile.path)
-                project.selectedGroupHunkIndex = firstFile.hunkIndices.first ?? 0
+        if let generatingID = project.generatingGroupCommitID, !validIDs.contains(generatingID), isActiveSession {
+            project.cancelGroupCommitMessageGeneration()
+        }
+        if isActiveSession {
+            if removedGroupID != nil {
+                project.groupCollapsed.removeAll()
             }
-        } else if let activeID = project.selectedGroupID,
-                  let activeGroup = updatedResult.groups.first(where: { $0.id == activeID }) {
-            if let currentPath = project.selectedGroupFilePath,
-               let activeFile = activeGroup.files.first(where: { $0.path == currentPath }) {
-                if let hunk = project.selectedGroupHunkIndex, !activeFile.hunkIndices.contains(hunk) {
-                    project.selectedGroupHunkIndex = activeFile.hunkIndices.first ?? 0
-                }
-            } else if let firstFile = project.orderedGroupFiles(for: activeGroup, flat: settings.flatList).first ?? activeGroup.files.first {
-                project.selectedGroupFilePath = firstFile.path
-                project.selectedGroupRowID = ChangeRow.fileID(firstFile.path)
-                project.selectedGroupHunkIndex = firstFile.hunkIndices.first ?? 0
-            } else {
-                project.selectedGroupFilePath = nil
-                project.selectedGroupRowID = nil
-                project.selectedGroupHunkIndex = nil
-            }
+            project.selectedGroupRowID = project.aiGroupSession(id: sessionID)?.selectedGroupFilePath.map(ChangeRow.fileID)
         }
     }
 
     /// Selects `group` in the top Groups pane, updates the bottom changes list, and opens its first file
     /// with the group's hunk filter applied in a single pass.
     func selectAIGroup(_ group: AIHunkGroup, in project: Project, openFirstFile: Bool = true) {
-        let changedGroup = project.selectedGroupID != group.id
+        guard let session = project.activeAIGroupSession else { return }
+        let changedGroup = session.selectedGroupID != group.id
         if changedGroup {
-            project.selectedGroupID = group.id
+            project.mutateAIGroupSession(id: session.id) { $0.selectedGroupID = group.id }
             project.groupCollapsed.removeAll()
             schedulePersistAIGroups(for: project)
         }
         guard project.id == selectedProjectID else { return }
 
         if !changedGroup,
-           let currentPath = project.selectedGroupFilePath,
+           let currentPath = session.selectedGroupFilePath,
            let existingFile = group.files.first(where: { $0.path == currentPath }),
            project.browsedPath == nil,
            externalRequest == nil,
            viewer.request?.root == project.url,
            viewer.request?.path == currentPath {
-            let targetHunk = project.selectedGroupHunkIndex ?? existingFile.hunkIndices.first ?? 0
+            let targetHunk = session.selectedGroupHunkIndex ?? existingFile.hunkIndices.first ?? 0
             openGroupItem(project: project, group: group, filePath: existingFile.path, hunkIndex: targetHunk)
             return
         }
 
         guard openFirstFile,
-              let firstFile = project.orderedGroupFiles(for: group, flat: settings.flatList).first ?? group.files.first else {
+              let firstFile = project.orderedGroupFiles(for: group, in: session, flat: settings.flatList).first ?? group.files.first else {
             return
         }
         openGroupItem(project: project, group: group, filePath: firstFile.path, hunkIndex: firstFile.hunkIndices.first ?? 0)
     }
 
-    /// Selects a file and hunk inside an AI group, opening the working-tree diff on the right
+    /// Selects a file and hunk inside an AI group, opening its diff on the right
     /// with the group's hunk filter applied synchronously and focusing raw `hunkIndex` once loaded.
     func openGroupItem(project: Project, group: AIHunkGroup, filePath: String, hunkIndex: Int) {
-        guard project.id == selectedProjectID else { return }
+        guard project.id == selectedProjectID, let session = project.activeAIGroupSession else { return }
         exitExternalFileMode()
         project.browsedPath = nil
-        let selectionChanged = project.selectedGroupID != group.id
-            || project.selectedGroupFilePath != filePath
-            || project.selectedGroupHunkIndex != hunkIndex
-        if project.selectedGroupID != group.id {
-            project.selectedGroupID = group.id
+        let selectionChanged = session.selectedGroupID != group.id
+            || session.selectedGroupFilePath != filePath
+            || session.selectedGroupHunkIndex != hunkIndex
+        project.mutateAIGroupSession(id: session.id) { s in
+            s.selectedGroupID = group.id
+            s.selectedGroupFilePath = filePath
+            s.selectedGroupHunkIndex = hunkIndex
         }
-        project.selectedGroupFilePath = filePath
         project.selectedGroupRowID = ChangeRow.fileID(filePath)
-        project.selectedGroupHunkIndex = hunkIndex
-        if selectionChanged, project.aiGroupResult != nil {
+        if selectionChanged {
             schedulePersistAIGroups(for: project)
         }
 
-        let rawRequest: DiffRequest
-        if let change = project.change(forPath: filePath) {
-            rawRequest = project.request(for: change, ignoreWhitespace: settings.ignoreWhitespace)
-        } else {
-            rawRequest = worktreeRequest(for: filePath, in: project)
+        guard let rawRequest = project.diffRequest(for: filePath, in: session, ignoreWhitespace: settings.ignoreWhitespace) else {
+            viewer.highlightedGroupHunks = nil
+            viewer.clear()
+            return
         }
         let request = resolvedRequest(rawRequest)
+        let baseStamp = session.baseStamp(projectHeadOID: project.status.headOID)
 
         noteRecent(project, filePath)
         follow(filePath, in: project)
-        viewer.setBaseStamp(project.status.headOID)
+        viewer.setBaseStamp(baseStamp)
 
         let targetHunks = project.highlightedGroupHunks(for: filePath)
         let sameRequest = viewer.request == request
@@ -502,12 +1033,13 @@ extension AppStore {
         }
     }
 
-    // MARK: Direct Group Commit
+    // MARK: Direct Group Commit (Working Tree Only)
 
     /// Commits ONLY the hunks belonging to `group` using its current commit message draft
-    /// (without mutating Tab 1's file checkboxes or line exclusions).
+    /// (without mutating Tab 1's file checkboxes or line exclusions). Only enabled for `.workingTree` sessions.
     func commitGroup(for project: Project, group: AIHunkGroup) {
         guard !project.isCommittingGroup, !project.isCommitting else { return }
+        guard let session = project.activeAIGroupSession, session.isCommittable else { return }
         if let operation = project.status.operation {
             showToast(L("A \(operation.command) is in progress · finish it in Changes first",
                         "正在进行 \(operation.command) · 请先在变更页完成"))
@@ -523,8 +1055,8 @@ extension AppStore {
         // Flush any unsaved inline edits so the diff committed matches the working tree.
         guard viewer.saveEdits() else { return }
 
-        // Cancel any in-flight regrouping against the old HEAD so it cannot overwrite the post-commit groups.
-        if project.isGeneratingGroups {
+        // Cancel any in-flight working-tree regrouping against the old HEAD so it cannot overwrite post-commit groups.
+        if project.isGeneratingGroups, project.generatingGroupSource?.isCommittable == true {
             project.cancelAIGroupGeneration(includeGroupCommitMessage: false)
         }
         if project.generatingGroupCommitID == group.id {
@@ -534,6 +1066,7 @@ extension AppStore {
         let allChanges = project.changes
         let repoRoot = project.url
         let isInitial = project.status.isInitial
+        let sessionID = session.id
         let groupID = group.id
         let groupName = group.name
 
@@ -567,23 +1100,24 @@ extension AppStore {
                     : try await WorkingTree.commit(message: trimmed, whole: whole, partial: partial, amend: false, in: repoRoot)
 
                 project.lastCommit = result
-                project.groupCommitMessages.removeValue(forKey: groupID)
 
-                if let currentResult = project.aiGroupResult {
-                    let previousIndex = currentResult.groups.firstIndex(where: { $0.id == groupID })
-                    let updatedResult = AIHunkGrouper.resultAfterCommitting(groupID: groupID, in: currentResult)
-                    project.aiGroupResult = updatedResult
-
-                    if let updatedResult {
-                        self.reconcileAIGroupState(
-                            for: updatedResult,
+                if let currentSession = project.aiGroupSession(id: sessionID) {
+                    let previousIndex = currentSession.result.groups.firstIndex(where: { $0.id == groupID })
+                    if let updatedResult = AIHunkGrouper.resultAfterCommitting(groupID: groupID, in: currentSession.result) {
+                        project.mutateAIGroupSession(id: sessionID) { s in
+                            s.groupCommitMessages.removeValue(forKey: groupID.uuidString)
+                            s.result = updatedResult
+                            s.headOID = result.hash
+                        }
+                        self.reconcileAIGroupSession(
+                            id: sessionID,
                             removedGroupID: groupID,
                             previousIndex: previousIndex,
                             in: project
                         )
                         self.persistAIGroups(for: project, headOIDOverride: result.hash)
                     } else {
-                        self.clearAIGroups(for: project)
+                        self.deleteAIGroupSession(sessionID, in: project)
                     }
                 }
 
@@ -614,6 +1148,7 @@ extension AppStore {
             showToast(AICommitError.unavailableInAppStore.localizedDescription)
             return
         }
+        guard let session = project.activeAIGroupSession, session.isCommittable else { return }
         guard !project.isCommittingGroup, !project.isCommitting else { return }
         guard viewer.saveEdits() else { return }
 

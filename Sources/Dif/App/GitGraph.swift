@@ -228,6 +228,20 @@ final class GitGraphModel {
         menu.addItem(ClosureMenuItem(L("Compare with Working Tree", "与工作区比较")) { [weak self] in
             self?.store?.compare(with: row.commit.hash, title: row.commit.shortHash, forkPoint: false)
         })
+        if !AppEnvironment.isAppStore,
+           let store,
+           let project = projectID.flatMap({ store.project($0) }) {
+            let list = rows.map(\.commit)
+            let targets = store.menuCommits(row.commit, picked: selectedCommitIDs, in: list)
+            let title = targets.count == 1
+                ? L("Group Commit with AI", "使用 AI 分组此提交")
+                : L("Group \(targets.count) Commits with AI", "使用 AI 分组这 \(targets.count) 个提交")
+            menu.addItem(ClosureMenuItem(title) { [weak store] in
+                guard let store else { return }
+                store.dismissPopup(restoreFocus: false)
+                store.generateCommitsAIGroups(for: project, commits: targets)
+            })
+        }
         menu.addItem(.separator())
         menu.addItem(ClosureMenuItem(L("New Branch Here…", "在此新建分支…")) { [weak self] in
             self?.store?.newBranch(from: row.commit.hash, startTitle: row.commit.shortHash)

@@ -661,8 +661,8 @@ extension AppStore {
                 if op == .merge {
                     project.lastCommit = nil
                     if !project.excludedLines.isEmpty { project.excludedLines = [:] }
-                    if project.aiGroupResult != nil {
-                        self.clearAIGroups(for: project)
+                    if project.aiGroupSessions.contains(where: \.isCommittable) {
+                        self.clearWorkingTreeAIGroups(for: project)
                     }
                 }
                 let postClashes = await Git.conflictedPaths(in: project.url)

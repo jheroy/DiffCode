@@ -758,15 +758,15 @@ final class AppStore {
         }
         if project.hasLoaded,
            project.errorMessage == nil,
-           project.aiGroupResult != nil,
+           project.aiGroupSessions.contains(where: \.isCommittable),
            project.changes.isEmpty,
            !project.isCommitting,
            !project.isCommittingGroup,
-           !project.isGeneratingGroups {
+           !(project.isGeneratingGroups && project.generatingGroupSource?.isCommittable == true) {
             let editingInProject = viewer.request?.root == project.url
                 && viewer.isEditing(root: project.url, path: viewer.request?.path ?? "")
             if !editingInProject {
-                clearAIGroups(for: project)
+                clearWorkingTreeAIGroups(for: project)
             }
         }
         let currentSig = project.status.conflictSignature
@@ -882,42 +882,38 @@ final class AppStore {
                 }
             }
         case .groups:
-            if let group = project.activeAIGroup {
-                if project.selectedGroupID != group.id {
-                    project.selectedGroupID = group.id
+            if let session = project.activeAIGroupSession, let group = session.activeGroup {
+                if session.selectedGroupID != group.id {
+                    project.mutateAIGroupSession(id: session.id) { $0.selectedGroupID = group.id }
                 }
                 let targetFile: AIHunkGroupFile? = {
-                    if let selectedPath = project.selectedGroupFilePath,
+                    if let selectedPath = session.selectedGroupFilePath,
                        let match = group.files.first(where: { $0.path == selectedPath }) {
                         return match
                     }
-                    return project.orderedGroupFiles(for: group, flat: settings.flatList).first ?? group.files.first
+                    return project.orderedGroupFiles(for: group, in: session, flat: settings.flatList).first ?? group.files.first
                 }()
                 if let file = targetFile {
-                    let targetHunk = project.selectedGroupFilePath == file.path
-                        ? (project.selectedGroupHunkIndex ?? file.hunkIndices.first ?? 0)
+                    let targetHunk = session.selectedGroupFilePath == file.path
+                        ? (session.selectedGroupHunkIndex ?? file.hunkIndices.first ?? 0)
                         : (file.hunkIndices.first ?? 0)
-                    if project.selectedGroupFilePath != file.path {
-                        project.selectedGroupFilePath = file.path
-                        project.selectedGroupRowID = ChangeRow.fileID(file.path)
-                        project.selectedGroupHunkIndex = targetHunk
-                    } else if project.selectedGroupRowID == nil {
+                    if session.selectedGroupFilePath != file.path || session.selectedGroupHunkIndex != targetHunk {
+                        project.mutateAIGroupSession(id: session.id) {
+                            $0.selectedGroupFilePath = file.path
+                            $0.selectedGroupHunkIndex = targetHunk
+                        }
+                    }
+                    if project.selectedGroupRowID != ChangeRow.fileID(file.path) {
                         project.selectedGroupRowID = ChangeRow.fileID(file.path)
                     }
                     let targetHunks = project.highlightedGroupHunks(for: file.path)
-                    let rawRequest: DiffRequest?
-                    if let change = project.change(forPath: file.path) {
-                        rawRequest = project.request(for: change, ignoreWhitespace: settings.ignoreWhitespace)
-                    } else if FileManager.default.fileExists(atPath: project.url.appendingPathComponent(file.path).path) {
-                        rawRequest = worktreeRequest(for: file.path, in: project)
-                    } else {
-                        rawRequest = nil
-                    }
-                    if let rawRequest {
+                    if let rawRequest = project.diffRequest(for: file.path, in: session, ignoreWhitespace: settings.ignoreWhitespace) {
                         let request = resolvedRequest(rawRequest)
+                        let baseStamp = session.baseStamp(projectHeadOID: project.status.headOID)
+                        viewer.setBaseStamp(baseStamp)
                         if request == viewer.request {
                             viewer.setHighlightedGroupHunks(targetHunks)
-                            viewer.reloadIfStale(base: project.status.headOID)
+                            viewer.reloadIfStale(base: baseStamp)
                         } else {
                             // Prime group filter before viewer.open so ViewerModel loads filtered in a single pass
                             // without re-filtering the outgoing file.
@@ -930,12 +926,17 @@ final class AppStore {
                     }
                 }
             }
-            if let current = viewer.request, current.root == project.url, case .worktree = current.source {
+            if let current = viewer.request, current.root == project.url, current.source != .file {
+                let stamp = project.comparison?.base ?? project.status.headOID
+                viewer.setBaseStamp(stamp)
                 viewer.setHighlightedGroupHunks(nil)
-                viewer.reloadIfStale(base: project.status.headOID)
+                viewer.reloadIfStale(base: stamp)
                 return
             }
-            if let first = project.changes.first {
+            if let comparison = project.comparison, let first = project.compareChanges.first {
+                viewer.highlightedGroupHunks = nil
+                showCompared(first, with: comparison, in: project)
+            } else if let first = project.changes.first {
                 show(first, in: project, groupHunks: nil)
             } else if project.hasLoaded || viewer.request?.root != project.url {
                 viewer.highlightedGroupHunks = nil
@@ -1132,13 +1133,13 @@ final class AppStore {
             project.selectedChangeID = ChangeRow.fileID(target.path)
             changeSelectionChanged(project)
         case .groups:
-            guard let groups = project.aiGroupResult?.groups, !groups.isEmpty else { return false }
-            let items: [(group: AIHunkGroup, file: AIHunkGroupFile)] = groups.flatMap { group in
-                project.orderedGroupFiles(for: group, flat: settings.flatList).map { (group, $0) }
+            guard let session = project.activeAIGroupSession, !session.result.groups.isEmpty else { return false }
+            let items: [(group: AIHunkGroup, file: AIHunkGroupFile)] = session.result.groups.flatMap { group in
+                project.orderedGroupFiles(for: group, in: session, flat: settings.flatList).map { (group, $0) }
             }
             guard !items.isEmpty else { return false }
             let currentIndex = items.firstIndex {
-                $0.group.id == project.selectedGroupID && $0.file.path == project.selectedGroupFilePath
+                $0.group.id == session.selectedGroupID && $0.file.path == session.selectedGroupFilePath
             }
             let nextIndex = currentIndex.map { $0 + delta } ?? (delta > 0 ? 0 : items.count - 1)
             guard items.indices.contains(nextIndex) else { return false }

@@ -585,6 +585,15 @@ extension AppStore {
         menu.addItem(ClosureMenuItem(L("Compare with Working Tree", "与工作区比较")) { [weak self] in
             self?.compare(with: commit.hash, title: commit.shortHash, forkPoint: false, in: project)
         })
+        if !AppEnvironment.isAppStore {
+            let targets = menuCommits(commit, picked: project.selectedCommitIDs, in: project.commits)
+            let title = targets.count == 1
+                ? L("Group Commit with AI", "使用 AI 分组此提交")
+                : L("Group \(targets.count) Commits with AI", "使用 AI 分组这 \(targets.count) 个提交")
+            menu.addItem(ClosureMenuItem(title) { [weak self] in
+                self?.generateCommitsAIGroups(for: project, commits: targets)
+            })
+        }
         menu.addItem(.separator())
         menu.addItem(ClosureMenuItem(L("New Branch Here…", "在此新建分支…")) { [weak self] in
             self?.newBranch(from: commit.hash, startTitle: commit.shortHash, in: project)

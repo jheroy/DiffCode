@@ -58,7 +58,7 @@ struct ProjectTabsHeader: View {
                     store.setTab(.changes)
                 }
                 if !AppEnvironment.isAppStore {
-                    TabButton(title: L("Groups", "分组"), count: project.aiGroupResult?.groups.count,
+                    TabButton(title: L("Groups", "分组"), count: project.groupsTabBadgeCount,
                               shortcut: "⌘8", isSelected: project.tab == .groups) {
                         store.setTab(.groups)
                     }
@@ -91,7 +91,7 @@ struct ProjectTabsHeader: View {
                     if buttons == .all, project.tab == .changes {
                         IconButton(symbol: "tray.full", help: L("Stashes…", "Stash 列表…"), size: 11.5) { store.showStashes() }
                     }
-                    if buttons == .all, project.tab != .groups || project.aiGroupResult != nil {
+                    if buttons == .all, project.tab != .groups || project.activeAIGroupSession != nil {
                         IconButton(symbol: store.settings.flatList ? "list.bullet" : "list.bullet.indent",
                                    help: L("Toggle Tree / Flat List", "切换 目录树 / 平铺列表"), size: 12) {
                             store.settings.flatList.toggle()
@@ -469,7 +469,15 @@ struct ComparisonList: View {
                 if let stash = comparison.stash {
                     StashBanner(entry: stash, project: project)
                 } else {
-                    ComparisonBanner(comparison: comparison) { store.endComparison() }
+                    ComparisonBanner(
+                        comparison: comparison,
+                        onGroupWithAI: AppEnvironment.isAppStore ? nil : {
+                            store.generateComparisonAIGroups(for: project, comparison: comparison)
+                        },
+                        isGroupDisabled: project.isLoadingCompare || project.compareChanges.isEmpty
+                    ) {
+                        store.endComparison()
+                    }
                 }
             }
             if project.compareChanges.count > 8 || !project.filter.isEmpty {
@@ -583,6 +591,8 @@ struct ComparisonList: View {
 /// What the Changes tab compares with, over its list.
 private struct ComparisonBanner: View {
     var comparison: Comparison
+    var onGroupWithAI: (() -> Void)? = nil
+    var isGroupDisabled: Bool = false
     var onClose: () -> Void
 
     var body: some View {
@@ -607,6 +617,18 @@ private struct ComparisonBanner: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 4)
+            if let onGroupWithAI {
+                Button(action: onGroupWithAI) {
+                    Image(systemName: "sparkles")
+                        .font(.ui(size: 10.5, weight: .semibold))
+                        .foregroundStyle(isGroupDisabled ? Color.difText3.opacity(0.45) : Color.difAccent)
+                        .padding(4)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(isGroupDisabled)
+                .help(L("Group compared changes with AI", "使用 AI 对当前比较结果分组"))
+            }
             Button(action: onClose) {
                 Image(systemName: "xmark").font(.ui(size: 9, weight: .bold)).foregroundStyle(Color.difText2)
                     .padding(4).contentShape(Rectangle())
@@ -657,6 +679,21 @@ private struct StashBanner: View {
                         .lineLimit(1)
                 }
                 Spacer(minLength: 4)
+                if !AppEnvironment.isAppStore {
+                    let groupDisabled = project.isLoadingCompare || project.compareChanges.isEmpty
+                    Button {
+                        store.generateComparisonAIGroups(for: project)
+                    } label: {
+                        Image(systemName: "sparkles")
+                            .font(.ui(size: 10.5, weight: .semibold))
+                            .foregroundStyle(groupDisabled ? Color.difText3.opacity(0.45) : Color.difAccent)
+                            .padding(4)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(groupDisabled)
+                    .help(L("Group stash changes with AI", "使用 AI 对此 Stash 变更分组"))
+                }
                 Button { store.endComparison(in: project) } label: {
                     Image(systemName: "xmark").font(.ui(size: 9, weight: .bold)).foregroundStyle(Color.difText2)
                         .padding(4).contentShape(Rectangle())
@@ -1514,6 +1551,32 @@ private struct CommitDetail: View {
                 }
             }
             Spacer(minLength: 4)
+            if !AppEnvironment.isAppStore {
+                let groupDisabled = project.isLoadingCommit || project.selectedCommits.isEmpty || project.commitFiles.isEmpty
+                Button {
+                    store.generateCommitsAIGroups(for: project, commits: project.selectedCommits)
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: "sparkles")
+                            .font(.ui(size: 10, weight: .semibold))
+                        Text(L("AI Group", "AI 分组"))
+                            .font(.ui(size: 10.5, weight: .medium))
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(groupDisabled ? Color.difText3.opacity(0.45) : Color.difAccent)
+                    .padding(.horizontal, 6)
+                    .frame(height: UI.s(20))
+                    .background(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(Color.difSelection.opacity(groupDisabled ? 0.35 : 1))
+                    )
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .fixedSize()
+                .disabled(groupDisabled)
+                .help(L("Group selected commits with AI", "使用 AI 对所选提交进行分组"))
+            }
             if !store.settings.flatList, !folderIDs.isEmpty {
                 IconButton(symbol: hasExpandedFolder ? "rectangle.compress.vertical" : "rectangle.expand.vertical",
                            help: hasExpandedFolder ? L("Collapse all folders", "折叠全部目录") : L("Expand all folders", "展开全部目录"),

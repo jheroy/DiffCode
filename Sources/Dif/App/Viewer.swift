@@ -651,7 +651,7 @@ final class ViewerModel: CodeCanvasDelegate {
     /// that ⌘Z takes back.
     func reloadIfStale(base: String?) {
         guard let request, !isLoading else { return }
-        if case .commit = request.source { return }
+        if request.isCommitDiff { return }
         let current = Self.signature(for: request, base: base)
         guard current != signature else { return }
         guard let editor, document === editor.document else { reload(); return }

@@ -2,10 +2,10 @@ import AppKit
 import SwiftUI
 
 /// Middle-column panel for the "Groups" tab:
-/// - Empty state: provider/model selector (`.grouping` task) + CTA to generate AI hunk groups.
+/// - Session tab bar when one or more grouping sessions exist (`Working Tree`, `Comparison`, `Commits`).
+/// - Empty / creation state: source selector (active comparison vs working tree), provider/model selector, and CTA.
 /// - Populated state: resizable two-pane split matching `LogPanel` — top island lists logical groups,
-///   bottom island renders the selected group's changed files using the same `ChangeTree` + `ChangeRowView`
-///   style as the Changes tab (without commit checkboxes).
+///   bottom island renders the selected group's changed files and shows the commit box ONLY for working-tree sessions.
 struct AIGroupPanel: View {
     @Bindable var project: Project
     @Environment(AppStore.self) private var store
@@ -13,6 +13,7 @@ struct AIGroupPanel: View {
     @State private var topSplitRatio: Double = Self.defaultTopRatio
     @State private var dragStartTopHeight: Double?
     @State private var filesFocusToken = 0
+    @State private var preferWorkingTreeInCreation = false
 
     private static let defaultTopRatio: Double = 0.40
     private static let minTopHeight: Double = 170
@@ -22,8 +23,8 @@ struct AIGroupPanel: View {
         Group {
             if AppEnvironment.isAppStore {
                 singleCard { appStoreUnsupportedView }
-            } else if let result = project.aiGroupResult, !result.groups.isEmpty {
-                populatedSplitView(result: result)
+            } else if let session = project.activeAIGroupSession, !session.result.groups.isEmpty {
+                populatedSplitView(session: session)
             } else {
                 singleCard { emptyStateView }
             }
@@ -38,6 +39,7 @@ struct AIGroupPanel: View {
             store.loadAgentModels(for: provider, forceRefresh: false)
         }
         .onChange(of: project.id) { oldID, _ in
+            preferWorkingTreeInCreation = false
             if let previous = store.project(oldID) {
                 if previous.isGeneratingGroups {
                     store.cancelAIGroupGeneration(for: previous)
@@ -52,6 +54,9 @@ struct AIGroupPanel: View {
     private func singleCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
         VStack(spacing: 0) {
             ProjectTabsHeader(project: project)
+            if !AppEnvironment.isAppStore, !project.aiGroupSessions.isEmpty {
+                AIGroupSessionBar(project: project)
+            }
             content()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -69,10 +74,22 @@ struct AIGroupPanel: View {
         )
     }
 
-    // MARK: - Empty State
+    // MARK: - Empty / Creation State
 
     private var emptyStateView: some View {
-        let hasChanges = !project.changes.isEmpty
+        let comparison = project.comparison
+        let hasComparison = comparison != nil
+        let hasCompareChanges = hasComparison && !project.compareChanges.isEmpty
+        let hasWorkingChanges = !project.changes.isEmpty
+        let useComparisonSource = hasComparison && (!preferWorkingTreeInCreation || !hasWorkingChanges)
+        let isGeneratingNewSession = project.isGeneratingGroups && project.generatingGroupSessionID == nil
+        let hasTargetChanges: Bool = {
+            if useComparisonSource {
+                return !project.isLoadingCompare && hasCompareChanges
+            }
+            return hasWorkingChanges
+        }()
+
         return ScrollView {
             VStack(spacing: 14) {
                 Spacer(minLength: 24)
@@ -90,8 +107,11 @@ struct AIGroupPanel: View {
                     Text(L("AI Change Grouping", "AI 变更分组"))
                         .font(.ui(size: 13.5, weight: .semibold))
                         .foregroundStyle(Color.difText)
-                    Text(L("Automatically organize all uncommitted hunks by feature or module.",
-                           "将当前所有未提交变更按功能或模块对 Hunk 自动分组。"))
+                    Text(useComparisonSource
+                         ? L("Organize compared changes by feature or module (read-only view).",
+                             "将当前对比变更按功能或模块对 Hunk 自动分组（仅查看）。")
+                         : L("Automatically organize all uncommitted hunks by feature or module.",
+                             "将当前未提交变更按功能或模块对 Hunk 自动分组。"))
                         .font(.ui(size: 11.5))
                         .foregroundStyle(Color.difText2)
                         .multilineTextAlignment(.center)
@@ -99,13 +119,27 @@ struct AIGroupPanel: View {
                 }
                 .padding(.horizontal, 12)
 
+                if !isGeneratingNewSession, let comparison {
+                    let compSource = AIHunkGroupingSource.from(comparison: comparison)
+                    if hasCompareChanges && hasWorkingChanges {
+                        creationSourcePicker(
+                            comparisonLabel: compSource.tabTitle,
+                            useComparison: useComparisonSource
+                        )
+                        .padding(.horizontal, 12)
+                    } else {
+                        creationSourceChip(source: compSource)
+                            .padding(.horizontal, 12)
+                    }
+                }
+
                 // Compact inline Agent Provider + Model selector for AI Grouping (independent of Commit Message).
                 AgentModelSelectorCard(task: .grouping, compact: false)
                     .padding(.horizontal, 12)
 
                 // Primary CTA button
                 VStack(spacing: 6) {
-                    if project.isGeneratingGroups {
+                    if isGeneratingNewSession {
                         Button {
                             store.cancelAIGroupGeneration(for: project)
                         } label: {
@@ -128,9 +162,21 @@ struct AIGroupPanel: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+
+                        if let source = project.generatingGroupSource {
+                            Text(source.detailTitle)
+                                .font(.ui(size: 11))
+                                .foregroundStyle(Color.difText3)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
                     } else {
                         Button {
-                            store.generateAIGroups(for: project)
+                            if useComparisonSource {
+                                store.generateComparisonAIGroups(for: project)
+                            } else {
+                                store.generateWorkingTreeAIGroups(for: project)
+                            }
                         } label: {
                             HStack(spacing: 6) {
                                 Image(systemName: "sparkles")
@@ -143,21 +189,23 @@ struct AIGroupPanel: View {
                             .frame(height: UI.s(30))
                             .background(
                                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                    .fill(Color.difAccent.opacity(hasChanges ? 1 : 0.38))
+                                    .fill(Color.difAccent.opacity(hasTargetChanges ? 1 : 0.38))
                             )
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .disabled(!hasChanges)
-                    }
+                        .disabled(!hasTargetChanges)
 
-                    Text(hasChanges
-                         ? (project.changes.count == 1
-                            ? L("1 changed file ready to group", "当前有 1 个变更文件可分组")
-                            : L("\(project.changes.count) changed files ready to group", "当前有 \(project.changes.count) 个变更文件可分组"))
-                         : L("No uncommitted changes in working tree", "工作区暂无变更"))
+                        Text(creationStatusCaption(
+                            useComparison: useComparisonSource,
+                            isLoadingCompare: project.isLoadingCompare,
+                            compareCount: project.compareChanges.count,
+                            workingCount: project.changes.count
+                        ))
                         .font(.ui(size: 11))
                         .foregroundStyle(Color.difText3)
+                        .multilineTextAlignment(.center)
+                    }
                 }
                 .padding(.horizontal, 12)
 
@@ -172,11 +220,110 @@ struct AIGroupPanel: View {
         }
     }
 
+    private func creationSourcePicker(comparisonLabel: String, useComparison: Bool) -> some View {
+        HStack(spacing: 4) {
+            sourceTogglePill(
+                symbol: project.comparison?.stash != nil ? "tray.full" : "arrow.left.arrow.right",
+                title: comparisonLabel,
+                selected: useComparison
+            ) {
+                preferWorkingTreeInCreation = false
+            }
+            sourceTogglePill(
+                symbol: "square.and.pencil",
+                title: L("Working Tree", "工作区"),
+                selected: !useComparison
+            ) {
+                preferWorkingTreeInCreation = true
+            }
+        }
+        .padding(3)
+        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.difChip.opacity(0.65)))
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .strokeBorder(Color.difHairline, lineWidth: 1)
+        )
+    }
+
+    private func sourceTogglePill(symbol: String, title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: symbol)
+                    .font(.ui(size: 10, weight: .semibold))
+                Text(title)
+                    .font(.ui(size: 11, weight: selected ? .semibold : .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .foregroundStyle(selected ? Color.difAccent : Color.difText2)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(selected ? Color.difSelection : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func creationSourceChip(source: AIHunkGroupingSource) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: source.symbolName)
+                .font(.ui(size: 10.5, weight: .semibold))
+                .foregroundStyle(Color.difAccent)
+            Text(source.detailTitle)
+                .font(.ui(size: 11, weight: .medium))
+                .foregroundStyle(Color.difText)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 4)
+            Text(L("Read-only", "仅查看"))
+                .font(.ui(size: 9.5, weight: .semibold))
+                .foregroundStyle(Color.difText2)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1.5)
+                .background(Capsule().fill(Color.difChip))
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.difSelection.opacity(0.75)))
+        .help(source.tooltip)
+    }
+
+    private func creationStatusCaption(
+        useComparison: Bool,
+        isLoadingCompare: Bool,
+        compareCount: Int,
+        workingCount: Int
+    ) -> String {
+        if useComparison {
+            if isLoadingCompare && compareCount == 0 {
+                return L("Loading compared changes…", "正在加载对比变更…")
+            }
+            if compareCount == 0 {
+                return L("No differences in current comparison", "当前比较暂无差异")
+            }
+            return compareCount == 1
+                ? L("1 compared file ready to group (read-only)", "当前对比有 1 个变更文件可分组（仅查看）")
+                : L("\(compareCount) compared files ready to group (read-only)", "当前对比有 \(compareCount) 个变更文件可分组（仅查看）")
+        }
+        if workingCount == 0 {
+            return L("No uncommitted changes · compare with a branch or select commits in Log",
+                     "工作区暂无变更 · 可与分支比较或在历史中选择提交分组")
+        }
+        return workingCount == 1
+            ? L("1 changed file ready to group", "当前有 1 个变更文件可分组")
+            : L("\(workingCount) changed files ready to group", "当前有 \(workingCount) 个变更文件可分组")
+    }
+
     // MARK: - Populated Two-Pane Split State
 
-    private func populatedSplitView(result: AIHunkGroupingResult) -> some View {
+    private func populatedSplitView(session: AIGroupSession) -> some View {
+        let result = session.result
         let snapshot = project.groupChangesSnapshot(flat: store.settings.flatList)
-        let activeGroupID = snapshot?.group.id ?? project.selectedGroupID ?? result.groups.first?.id
+        let activeGroupID = snapshot?.group.id ?? session.selectedGroupID ?? result.groups.first?.id
 
         return GeometryReader { proxy in
             let gap = Double(IslandStyle.gap)
@@ -187,10 +334,11 @@ struct AIGroupPanel: View {
             let topHeight = min(maxTop, max(safeMinTop, usable * topSplitRatio))
 
             VStack(spacing: 0) {
-                // Top island: tabs header + compact toolbar + group list
+                // Top island: tabs header + session tabs + compact toolbar + group list
                 VStack(spacing: 0) {
                     ProjectTabsHeader(project: project)
-                    topToolbar(result: result)
+                    AIGroupSessionBar(project: project)
+                    topToolbar(session: session)
                     Rectangle().fill(Color.difHairline).frame(height: 1)
 
                     ScrollView {
@@ -206,6 +354,9 @@ struct AIGroupPanel: View {
                                     onDelete: {
                                         store.deleteAIGroup(group, in: project)
                                     },
+                                    onDeleteSession: {
+                                        store.deleteAIGroupSession(session.id, in: project)
+                                    },
                                     onClearAll: {
                                         store.clearAIGroups(for: project)
                                     }
@@ -220,7 +371,7 @@ struct AIGroupPanel: View {
                 .frame(height: topHeight)
                 .islandCard(background: .difPanel)
 
-                // Draggable split handle (double-click restores default 43% / 57% split)
+                // Draggable split handle (double-click restores default split)
                 DividerGrip(
                     axis: .rows,
                     islandGap: true,
@@ -243,7 +394,7 @@ struct AIGroupPanel: View {
                     }
                 )
 
-                // Bottom island: selected group's changed files tree/list (aligned with ChangesList)
+                // Bottom island: selected group's changed files tree/list (commit box only for working tree)
                 if let snapshot {
                     AIGroupChangesPane(
                         project: project,
@@ -265,13 +416,15 @@ struct AIGroupPanel: View {
         }
     }
 
-    private func topToolbar(result: AIHunkGroupingResult) -> some View {
+    private func topToolbar(session: AIGroupSession) -> some View {
+        let result = session.result
         let modelTag: String = {
             if let model = result.model, !model.isEmpty {
                 return "\(result.provider.executableName) · \(model)"
             }
             return result.provider.executableName
         }()
+        let isGeneratingThis = project.isGeneratingGroups
 
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
@@ -293,7 +446,7 @@ struct AIGroupPanel: View {
 
                 Spacer(minLength: 4)
 
-                if project.isGeneratingGroups {
+                if isGeneratingThis {
                     Button {
                         store.cancelAIGroupGeneration(for: project)
                     } label: {
@@ -314,24 +467,52 @@ struct AIGroupPanel: View {
                     .buttonStyle(.plain)
                     .help(L("Cancel AI grouping", "取消 AI 分组"))
                 } else {
-                    let regenerateDisabled = project.changes.isEmpty || project.isCommittingGroup || project.isCommitting
+                    let regenerateDisabled = (session.isCommittable && project.changes.isEmpty)
+                        || project.isCommittingGroup
+                        || project.isCommitting
                     IconButton(symbol: "sparkles",
                                help: L("Regenerate AI groups", "重新生成 AI 分组"),
                                size: 11.5) {
-                        store.generateAIGroups(for: project)
+                        store.regenerateAIGroupSession(session.id, in: project)
                     }
                     .disabled(regenerateDisabled)
                     .opacity(regenerateDisabled ? 0.35 : 1)
                 }
 
-                IconButton(symbol: "xmark.circle",
-                           help: L("Clear all groups", "清空全部分组"),
+                IconButton(symbol: "trash",
+                           help: L("Delete this grouping", "删除当前分组集"),
                            size: 11.5) {
-                    store.clearAIGroups(for: project)
+                    store.deleteAIGroupSession(session.id, in: project)
                 }
                 .disabled(project.isCommittingGroup)
                 .opacity(project.isCommittingGroup ? 0.35 : 1)
             }
+
+            // Source indicator chip (Working Tree / Comparison / Selected Commits)
+            HStack(spacing: 5) {
+                Image(systemName: session.source.symbolName)
+                    .font(.ui(size: 9.5, weight: .semibold))
+                    .foregroundStyle(Color.difAccent)
+                Text(session.source.detailTitle)
+                    .font(.ui(size: 10.5, weight: .medium))
+                    .foregroundStyle(Color.difText2)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 4)
+                if !session.isCommittable {
+                    Text(L("Read-only", "仅查看"))
+                        .font(.ui(size: 9.5, weight: .semibold))
+                        .foregroundStyle(Color.difText2)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(Color.difChip))
+                        .fixedSize()
+                }
+            }
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.difSelection.opacity(0.65)))
+            .help(session.source.tooltip)
 
             // Inline quick provider/model switcher for AI Grouping
             AgentModelSelectorCard(task: .grouping, compact: true)
@@ -345,7 +526,8 @@ struct AIGroupPanel: View {
     }
 
     private func errorCard(message: String) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let retryDisabled = project.isGeneratingGroups || project.isCommittingGroup || project.isCommitting
+        return VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .top, spacing: 6) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.ui(size: 11))
@@ -372,7 +554,7 @@ struct AIGroupPanel: View {
                 .buttonStyle(.plain)
 
                 Button {
-                    store.generateAIGroups(for: project)
+                    store.retryFailedAIGroupGeneration(for: project)
                 } label: {
                     Text(L("Retry", "重试"))
                         .font(.ui(size: 11, weight: .semibold))
@@ -382,7 +564,7 @@ struct AIGroupPanel: View {
                         .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(Color.difAccent))
                 }
                 .buttonStyle(.plain)
-                .disabled(project.changes.isEmpty || project.isGeneratingGroups || project.isCommittingGroup || project.isCommitting)
+                .disabled(retryDisabled)
             }
         }
         .padding(8)
@@ -397,6 +579,161 @@ struct AIGroupPanel: View {
     }
 }
 
+// MARK: - Top Pane: Multi-Session Tab Bar
+
+private struct AIGroupSessionBar: View {
+    @Bindable var project: Project
+    @Environment(AppStore.self) private var store
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 4) {
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 4) {
+                            ForEach(project.aiGroupSessions) { session in
+                                let isActive = session.id == project.activeGroupSessionID
+                                let isGeneratingThis = project.isGeneratingGroups
+                                    && project.generatingGroupSessionID == session.id
+                                AIGroupSessionPill(
+                                    session: session,
+                                    isActive: isActive,
+                                    isGenerating: isGeneratingThis,
+                                    canDelete: !project.isCommittingGroup,
+                                    onSelect: { store.selectAIGroupSession(session.id, in: project) },
+                                    onDelete: { store.deleteAIGroupSession(session.id, in: project) }
+                                )
+                                .id(session.id)
+                                .contextMenu {
+                                    Button(L("Regenerate", "重新分组")) {
+                                        store.regenerateAIGroupSession(session.id, in: project)
+                                    }
+                                    .disabled(project.isCommittingGroup || project.isCommitting)
+
+                                    Divider()
+
+                                    Button(role: .destructive) {
+                                        store.deleteAIGroupSession(session.id, in: project)
+                                    } label: {
+                                        Label(L("Delete This Grouping", "删除此分组集"), systemImage: "trash")
+                                    }
+                                    .disabled(project.isCommittingGroup)
+
+                                    if project.aiGroupSessions.count > 1 {
+                                        Button(L("Delete Other Groupings", "删除其他分组集")) {
+                                            store.deleteOtherAIGroupSessions(keeping: session.id, in: project)
+                                        }
+                                        .disabled(project.isCommittingGroup)
+
+                                        Button(role: .destructive) {
+                                            store.clearAIGroups(for: project)
+                                        } label: {
+                                            Label(L("Clear All Groupings", "清空全部分组集"), systemImage: "xmark.circle")
+                                        }
+                                        .disabled(project.isCommittingGroup)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                    }
+                    .onAppear {
+                        if let activeID = project.activeGroupSessionID {
+                            proxy.scrollTo(activeID)
+                        }
+                    }
+                    .onChange(of: project.activeGroupSessionID) { _, id in
+                        if let id {
+                            withAnimation(.snappy(duration: 0.18)) {
+                                proxy.scrollTo(id)
+                            }
+                        }
+                    }
+                }
+
+                IconButton(symbol: "plus", help: L("New Grouping", "新建分组"), size: 10.5) {
+                    store.startNewAIGroupSession(in: project)
+                }
+                .padding(.trailing, 4)
+            }
+            .frame(height: UI.s(30))
+
+            Rectangle().fill(Color.difHairline).frame(height: 1)
+        }
+    }
+}
+
+private struct AIGroupSessionPill: View {
+    let session: AIGroupSession
+    let isActive: Bool
+    let isGenerating: Bool
+    let canDelete: Bool
+    let onSelect: () -> Void
+    let onDelete: () -> Void
+
+    @State private var hovering = false
+    @State private var closeHovering = false
+
+    var body: some View {
+        HStack(spacing: 3) {
+            Button(action: onSelect) {
+                HStack(spacing: 4) {
+                    if isGenerating {
+                        ProgressView()
+                            .controlSize(.small)
+                            .scaleEffect(0.45)
+                            .frame(width: UI.s(10), height: UI.s(10))
+                    } else {
+                        Image(systemName: session.source.symbolName)
+                            .font(.ui(size: 10, weight: .semibold))
+                            .foregroundStyle(isActive ? Color.difAccent : Color.difText3)
+                    }
+                    Text(session.source.tabTitle)
+                        .font(.ui(size: 11.5, weight: isActive ? .semibold : .medium))
+                        .foregroundStyle(isActive ? Color.difText : Color.difText2)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: UI.s(145), alignment: .leading)
+                }
+                .padding(.leading, 7)
+                .padding(.trailing, canDelete ? 2 : 7)
+                .padding(.vertical, 3.5)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if canDelete {
+                Button(action: onDelete) {
+                    Image(systemName: "xmark")
+                        .font(.ui(size: 8, weight: .bold))
+                        .foregroundStyle(closeHovering ? Color.difText : Color.difText3)
+                        .frame(width: UI.s(15), height: UI.s(15))
+                        .background(
+                            RoundedRectangle(cornerRadius: 3.5, style: .continuous)
+                                .fill(closeHovering ? Color.difHover : Color.clear)
+                        )
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, 4)
+                .onHover { closeHovering = $0 }
+                .help(L("Delete this grouping", "删除此分组集"))
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(isActive ? Color.difChip : (hovering ? Color.difHover : Color.clear))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(isActive ? Color.difHairline : Color.clear, lineWidth: 1)
+        )
+        .onHover { hovering = $0 }
+        .help(session.source.tooltip)
+    }
+}
+
 // MARK: - Top Pane: Group List Row
 
 private struct AIGroupRow: View {
@@ -405,6 +742,7 @@ private struct AIGroupRow: View {
     let canDelete: Bool
     let onSelect: () -> Void
     let onDelete: () -> Void
+    let onDeleteSession: () -> Void
     let onClearAll: () -> Void
 
     @State private var hovering = false
@@ -486,8 +824,12 @@ private struct AIGroupRow: View {
             }
             .disabled(!canDelete)
             Divider()
+            Button(role: .destructive, action: onDeleteSession) {
+                Label(L("Delete This Grouping", "删除当前分组集"), systemImage: "trash.slash")
+            }
+            .disabled(!canDelete)
             Button(role: .destructive, action: onClearAll) {
-                Label(L("Clear All Groups", "清空全部分组"), systemImage: "xmark.circle")
+                Label(L("Clear All Groupings", "清空全部分组集"), systemImage: "xmark.circle")
             }
             .disabled(!canDelete)
         }
@@ -624,13 +966,15 @@ private struct AIGroupChangesPane: View {
                 }
             }
 
-            Rectangle().fill(Color.difHairline).frame(height: 1)
+            if snapshot.isCommittable {
+                Rectangle().fill(Color.difHairline).frame(height: 1)
 
-            AIGroupCommitBox(
-                project: project,
-                group: group,
-                hasFiles: !snapshot.changes.isEmpty
-            )
+                AIGroupCommitBox(
+                    project: project,
+                    group: group,
+                    hasFiles: !snapshot.changes.isEmpty
+                )
+            }
         }
     }
 
@@ -728,15 +1072,24 @@ private struct AIGroupChangesPane: View {
                 )
                 store.focusViewer()
             })
-            if file.kind != .untracked, file.kind != .added {
+            if let session = project.aiGroupSession(id: snapshot.sessionID),
+               let req = project.diffRequest(for: file.path, in: session, ignoreWhitespace: store.settings.ignoreWhitespace),
+               let filter = store.historyFilter(for: req, lines: nil, in: project) {
+                menu.addItem(ClosureMenuItem(L("Show History", "查看历史")) {
+                    store.showHistory(filter, in: project)
+                })
+            } else if snapshot.isCommittable, file.kind != .untracked, file.kind != .added {
                 menu.addItem(ClosureMenuItem(L("Show History", "查看历史")) {
                     store.showHistory(path: file.path, in: project)
                 })
             }
             menu.addItem(.separator())
-            menu.addItem(ClosureMenuItem(L("Reveal in Finder", "在 Finder 中显示")) {
-                NSWorkspace.shared.activateFileViewerSelecting([project.url.appendingPathComponent(file.path)])
-            })
+            let fileURL = project.url.appendingPathComponent(file.path)
+            if FileManager.default.fileExists(atPath: fileURL.path) {
+                menu.addItem(ClosureMenuItem(L("Reveal in Finder", "在 Finder 中显示")) {
+                    NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+                })
+            }
             menu.addItem(ClosureMenuItem(L("Copy Path", "复制路径")) {
                 store.copyText(file.path)
             })

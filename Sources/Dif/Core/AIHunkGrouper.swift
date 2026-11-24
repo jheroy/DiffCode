@@ -102,7 +102,147 @@ struct AIHunkGroupingResult: Equatable, Codable, Sendable {
     let generatedAt: Date
 }
 
-/// Errors specific to collecting working-tree hunks or parsing AI grouping output.
+/// Identifies the source of changes grouped into an `AIGroupSession`.
+enum AIHunkGroupingSource: Equatable, Hashable, Codable, Sendable {
+    struct ComparisonSource: Equatable, Hashable, Codable, Sendable {
+        var title: String
+        var baseHash: String
+        var targetRef: String
+        var forkPoint: Bool
+        var headTitle: String?
+        var headHash: String?
+        var stashUntrackedHash: String?
+        var isStash: Bool
+    }
+
+    struct CommitsSource: Equatable, Hashable, Codable, Sendable {
+        /// Selected commit hashes ordered newest first.
+        var commitHashes: [String]
+        /// Oldest commit's first parent hash for contiguous single/range commits (`nil` for root commit or non-contiguous).
+        var oldestParentHash: String?
+        var isNonContiguous: Bool
+        var primarySubject: String?
+        var skippedMergeCount: Int
+        /// Chronological per-file commit steps (`oldest` -> `newest`) for non-contiguous selections.
+        var fileSteps: [String: [FileCommitStep]]
+    }
+
+    case workingTree
+    case comparison(ComparisonSource)
+    case commits(CommitsSource)
+
+    /// Only working-tree groupings support direct group commit UI & actions.
+    var isCommittable: Bool {
+        if case .workingTree = self { return true }
+        return false
+    }
+
+    var symbolName: String {
+        switch self {
+        case .workingTree:
+            return "square.and.pencil"
+        case .comparison(let comp):
+            return comp.isStash ? "tray.full" : "arrow.left.arrow.right"
+        case .commits:
+            return "clock.arrow.circlepath"
+        }
+    }
+
+    var tabTitle: String {
+        switch self {
+        case .workingTree:
+            return L("Working Tree", "工作区")
+        case .comparison(let comp):
+            if comp.isStash { return comp.title }
+            if let headTitle = comp.headTitle { return "\(comp.title)..\(headTitle)" }
+            return L("vs \(comp.title)", "对比 \(comp.title)")
+        case .commits(let commits):
+            if commits.commitHashes.count == 1, let hash = commits.commitHashes.first {
+                return String(hash.prefix(7))
+            }
+            if !commits.isNonContiguous,
+               let newest = commits.commitHashes.first,
+               let oldest = commits.commitHashes.last {
+                return "\(oldest.prefix(7))..\(newest.prefix(7))"
+            }
+            return L("\(commits.commitHashes.count) commits", "\(commits.commitHashes.count) 个提交")
+        }
+    }
+
+    var detailTitle: String {
+        switch self {
+        case .workingTree:
+            return L("Working Tree Changes", "工作区未提交变更")
+        case .comparison(let comp):
+            if comp.isStash {
+                return L("Stash: \(comp.title)", "Stash：\(comp.title)")
+            }
+            if let headTitle = comp.headTitle {
+                return L("\(comp.title) → \(headTitle)", "\(comp.title) → \(headTitle)")
+            }
+            return comp.forkPoint
+                ? L("Since fork from \(comp.title) → Working Tree", "自与 \(comp.title) 分叉 → 工作区")
+                : L("Compare \(comp.title) → Working Tree", "对比 \(comp.title) → 工作区")
+        case .commits(let commits):
+            if commits.commitHashes.count == 1, let hash = commits.commitHashes.first {
+                if let subject = commits.primarySubject, !subject.isEmpty {
+                    return "\(hash.prefix(7)) · \(subject)"
+                }
+                return L("Commit \(hash.prefix(7))", "提交 \(hash.prefix(7))")
+            }
+            if !commits.isNonContiguous,
+               let newest = commits.commitHashes.first,
+               let oldest = commits.commitHashes.last {
+                return L("\(commits.commitHashes.count) commits (\(oldest.prefix(7))..\(newest.prefix(7)))",
+                         "\(commits.commitHashes.count) 个提交 (\(oldest.prefix(7))..\(newest.prefix(7)))")
+            }
+            return L("\(commits.commitHashes.count) selected commits", "已选 \(commits.commitHashes.count) 个提交")
+        }
+    }
+
+    var tooltip: String {
+        switch self {
+        case .workingTree:
+            return L("Uncommitted working tree changes (committable by group)",
+                     "工作区未提交变更（支持按分组直接提交）")
+        case .comparison(let comp):
+            if comp.isStash {
+                return L("Stash \(comp.title) (\(comp.baseHash.prefix(7)))\nRead-only view",
+                         "Stash \(comp.title) (\(comp.baseHash.prefix(7)))\n仅查看")
+            }
+            if let headHash = comp.headHash, let headTitle = comp.headTitle {
+                return L("Comparing \(comp.title) (\(comp.baseHash.prefix(7))) → \(headTitle) (\(headHash.prefix(7)))\nRead-only view",
+                         "对比 \(comp.title) (\(comp.baseHash.prefix(7))) → \(headTitle) (\(headHash.prefix(7)))\n仅查看")
+            }
+            return L("Comparing \(comp.title) (\(comp.baseHash.prefix(7))) → Working Tree\nRead-only view",
+                     "对比 \(comp.title) (\(comp.baseHash.prefix(7))) → 工作区\n仅查看")
+        case .commits(let commits):
+            let hashes = commits.commitHashes.prefix(5).map { String($0.prefix(7)) }.joined(separator: ", ")
+                + (commits.commitHashes.count > 5 ? "…" : "")
+            if commits.commitHashes.count == 1, let subject = commits.primarySubject, !subject.isEmpty {
+                return L("Commit \(hashes) · \(subject)\nRead-only view",
+                         "提交 \(hashes) · \(subject)\n仅查看")
+            }
+            return L("\(commits.commitHashes.count) commits: \(hashes)\nRead-only view",
+                     "\(commits.commitHashes.count) 个提交：\(hashes)\n仅查看")
+        }
+    }
+
+    static func from(comparison: Comparison) -> AIHunkGroupingSource {
+        .comparison(ComparisonSource(
+            title: comparison.title,
+            baseHash: comparison.base,
+            targetRef: comparison.target,
+            forkPoint: comparison.forkPoint,
+            headTitle: comparison.other?.title,
+            headHash: comparison.other?.hash,
+            stashUntrackedHash: comparison.stash?.untracked,
+            isStash: comparison.stash != nil
+        ))
+    }
+}
+
+/// Errors specific to collecting hunks or parsing AI grouping output.
 enum AIHunkGroupingError: Error, LocalizedError, Equatable, Sendable {
     case unavailableInAppStore
     case noChangesToGroup
@@ -114,8 +254,8 @@ enum AIHunkGroupingError: Error, LocalizedError, Equatable, Sendable {
             return L("AI hunk grouping is unavailable in the Mac App Store edition.",
                      "Mac App Store 版本不支持 AI 变更分组。")
         case .noChangesToGroup:
-            return L("There are no uncommitted changes to group.",
-                     "当前没有可分组的未提交变更。")
+            return L("There are no changes to group.",
+                     "当前没有可分组的变更。")
         case .invalidJSONResponse(let detail):
             let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
@@ -150,7 +290,7 @@ enum AIHunkGrouper {
     {"type":"object","additionalProperties":false,"required":["groups"],"properties":{"groups":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["name","summary","files"],"properties":{"name":{"type":"string"},"summary":{"type":"string"},"files":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","hunkIndices"],"properties":{"path":{"type":"string"},"hunkIndices":{"type":"array","items":{"type":"integer","minimum":0}}}}}}}}}}
     """
 
-    // MARK: - Working-Tree Hunk Collection
+    // MARK: - Hunk Collection
 
     /// Extracts exact 0-based `HunkDescriptor` entries for all uncommitted working-tree changes
     /// (staged, unstaged, and untracked). Binary, huge, symlink, submodule, or metadata-only files
@@ -168,26 +308,100 @@ enum AIHunkGrouper {
             let status = try await Git.status(in: repoRoot)
             changes = status.changes
         }
+        return try await collectHunks(
+            repoRoot: repoRoot,
+            source: .workingTree,
+            files: changes,
+            maxInspectableFileBytes: maxInspectableFileBytes
+        )
+    }
 
-        guard !changes.isEmpty else { return [] }
+    /// Extracts exact 0-based `HunkDescriptor` entries for `files` under `source` (working tree,
+    /// branch/commit/stash comparison, or selected log commits), preserving `files` order.
+    static func collectHunks(
+        repoRoot: URL,
+        source: AIHunkGroupingSource,
+        files: [FileChange],
+        maxInspectableFileBytes: Int = defaultMaxInspectableFileBytes
+    ) async throws -> [HunkDescriptor] {
+        try Task.checkCancellation()
+        guard !files.isEmpty else { return [] }
+
+        var buckets = [[HunkDescriptor]?](repeating: nil, count: files.count)
+        let maxConcurrency = 8
+
+        try await withThrowingTaskGroup(of: (Int, [HunkDescriptor]).self) { group in
+            for (index, change) in files.enumerated() {
+                if index >= maxConcurrency, let done = try await group.next() {
+                    buckets[done.0] = done.1
+                }
+                try Task.checkCancellation()
+                group.addTask {
+                    try Task.checkCancellation()
+                    let fileHunks = await collectHunks(
+                        for: change,
+                        source: source,
+                        in: repoRoot,
+                        maxInspectableFileBytes: maxInspectableFileBytes
+                    )
+                    return (index, fileHunks)
+                }
+            }
+            for try await done in group {
+                buckets[done.0] = done.1
+            }
+        }
 
         var descriptors: [HunkDescriptor] = []
-        descriptors.reserveCapacity(changes.count * 2)
-
-        for change in changes {
-            try Task.checkCancellation()
-            let fileHunks = await collectHunks(
-                for: change,
-                in: repoRoot,
-                maxInspectableFileBytes: maxInspectableFileBytes
-            )
-            descriptors.append(contentsOf: fileHunks)
+        descriptors.reserveCapacity(files.count * 2)
+        for bucket in buckets {
+            if let bucket {
+                descriptors.append(contentsOf: bucket)
+            }
         }
         return descriptors
     }
 
+    private enum WorktreeReadResult {
+        case data(Data)
+        case fallback(HunkDescriptor)
+    }
+
+    private static func readWorkingTreeBytes(
+        for change: FileChange,
+        in repoRoot: URL,
+        maxInspectableFileBytes: Int
+    ) -> WorktreeReadResult {
+        let url = repoRoot.appendingPathComponent(change.path)
+        let fm = FileManager.default
+        guard let attrs = try? fm.attributesOfItem(atPath: url.path) else {
+            return .fallback(fallbackDescriptor(for: change, kind: descriptorKind(for: change.kind), header: "[\(change.kind.rawValue) file]"))
+        }
+        let fileType = attrs[.type] as? FileAttributeType
+        if fileType == .typeSymbolicLink {
+            let dest = (try? fm.destinationOfSymbolicLink(atPath: url.path)) ?? ""
+            return .fallback(fallbackDescriptor(for: change, kind: descriptorKind(for: change.kind), header: "[symlink -> \(dest)]"))
+        }
+        guard fileType == .typeRegular else {
+            return .fallback(fallbackDescriptor(for: change, kind: descriptorKind(for: change.kind), header: "[\(change.kind.rawValue) file]"))
+        }
+        let fileSize = (attrs[.size] as? NSNumber)?.intValue ?? 0
+        if fileSize > maxInspectableFileBytes {
+            return .fallback(fallbackDescriptor(
+                for: change,
+                kind: descriptorKind(for: change.kind),
+                header: "[large file: \(fileSize.byteSizeString)]"
+            ))
+        }
+        guard let data = try? Data(contentsOf: url) else {
+            return .fallback(fallbackDescriptor(for: change, kind: descriptorKind(for: change.kind), header: "[\(change.kind.rawValue) file]"))
+        }
+        return .data(data)
+    }
+
     private static func collectHunks(
         for change: FileChange,
+        source: AIHunkGroupingSource,
         in repoRoot: URL,
         maxInspectableFileBytes: Int
     ) async -> [HunkDescriptor] {
@@ -195,38 +409,77 @@ enum AIHunkGrouper {
             return [fallbackDescriptor(for: change, kind: .modified, header: "[submodule]")]
         }
 
-        let wantOld = change.kind != .added && change.kind != .untracked
-        let wantNew = change.kind != .deleted
-
         var oldData: Data?
-        if wantOld {
-            oldData = await Git.blob(rev: "HEAD", path: change.oldPath ?? change.path, in: repoRoot)
-        }
-
         var newData: Data?
-        if wantNew {
-            let url = repoRoot.appendingPathComponent(change.path)
-            let fm = FileManager.default
-            guard let attrs = try? fm.attributesOfItem(atPath: url.path) else {
-                return [fallbackDescriptor(for: change, kind: descriptorKind(for: change.kind), header: "[\(change.kind.rawValue) file]")]
+
+        switch source {
+        case .workingTree:
+            let wantOld = change.kind != .added && change.kind != .untracked
+            let wantNew = change.kind != .deleted
+            if wantOld {
+                oldData = await Git.blob(rev: "HEAD", path: change.oldPath ?? change.path, in: repoRoot)
             }
-            let fileType = attrs[.type] as? FileAttributeType
-            if fileType == .typeSymbolicLink {
-                let dest = (try? fm.destinationOfSymbolicLink(atPath: url.path)) ?? ""
-                return [fallbackDescriptor(for: change, kind: descriptorKind(for: change.kind), header: "[symlink -> \(dest)]")]
+            if wantNew {
+                switch readWorkingTreeBytes(for: change, in: repoRoot, maxInspectableFileBytes: maxInspectableFileBytes) {
+                case .data(let data): newData = data
+                case .fallback(let desc): return [desc]
+                }
             }
-            guard fileType == .typeRegular else {
-                return [fallbackDescriptor(for: change, kind: descriptorKind(for: change.kind), header: "[\(change.kind.rawValue) file]")]
+
+        case .comparison(let comp):
+            if comp.isStash && change.kind == .untracked {
+                if let untrackedRev = comp.stashUntrackedHash {
+                    newData = await Git.blob(rev: untrackedRev, path: change.path, in: repoRoot)
+                }
+            } else {
+                let wantOld = change.kind != .added && change.kind != .untracked
+                let wantNew = change.kind != .deleted
+                if wantOld {
+                    oldData = await Git.blob(rev: comp.baseHash, path: change.oldPath ?? change.path, in: repoRoot)
+                }
+                if wantNew {
+                    if let headHash = comp.headHash {
+                        newData = await Git.blob(rev: headHash, path: change.path, in: repoRoot)
+                    } else {
+                        switch readWorkingTreeBytes(for: change, in: repoRoot, maxInspectableFileBytes: maxInspectableFileBytes) {
+                        case .data(let data): newData = data
+                        case .fallback(let desc): return [desc]
+                        }
+                    }
+                }
             }
-            let fileSize = (attrs[.size] as? NSNumber)?.intValue ?? 0
-            if fileSize > maxInspectableFileBytes {
-                return [fallbackDescriptor(
-                    for: change,
-                    kind: descriptorKind(for: change.kind),
-                    header: "[large file: \(fileSize.byteSizeString)]"
-                )]
+
+        case .commits(let commits):
+            if commits.isNonContiguous, let steps = commits.fileSteps[change.path], !steps.isEmpty {
+                if steps.count == 1 {
+                    let step = steps[0]
+                    let wantOld = step.kind != .added && step.parent != nil
+                    let wantNew = step.kind != .deleted
+                    async let oldBlob: Data? = wantOld
+                        ? Git.blob(rev: step.parent!, path: step.oldPath ?? step.path, in: repoRoot)
+                        : nil
+                    async let newBlob: Data? = wantNew
+                        ? Git.blob(rev: step.hash, path: step.path, in: repoRoot)
+                        : nil
+                    oldData = await oldBlob
+                    newData = await newBlob
+                } else {
+                    let resolution = await DiffLoader.resolveCommitSteps(steps, in: repoRoot)
+                    oldData = resolution.oldData
+                    newData = resolution.newData
+                }
+            } else if let headHash = commits.commitHashes.first {
+                let wantOld = change.kind != .added && commits.oldestParentHash != nil
+                let wantNew = change.kind != .deleted
+                async let oldBlob: Data? = wantOld
+                    ? Git.blob(rev: commits.oldestParentHash!, path: change.oldPath ?? change.path, in: repoRoot)
+                    : nil
+                async let newBlob: Data? = wantNew
+                    ? Git.blob(rev: headHash, path: change.path, in: repoRoot)
+                    : nil
+                oldData = await oldBlob
+                newData = await newBlob
             }
-            newData = try? Data(contentsOf: url)
         }
 
         if let oldData, oldData.count > maxInspectableFileBytes {
@@ -234,6 +487,14 @@ enum AIHunkGrouper {
                 for: change,
                 kind: descriptorKind(for: change.kind),
                 header: "[large file: \(oldData.count.byteSizeString)]"
+            )]
+        }
+
+        if let newData, newData.count > maxInspectableFileBytes {
+            return [fallbackDescriptor(
+                for: change,
+                kind: descriptorKind(for: change.kind),
+                header: "[large file: \(newData.count.byteSizeString)]"
             )]
         }
 
@@ -246,7 +507,12 @@ enum AIHunkGrouper {
             )]
         }
 
-        // Added / untracked file (no HEAD blob)
+        // Neither side has readable content (e.g. submodule or missing blob on both sides).
+        if oldData == nil && newData == nil {
+            return [fallbackDescriptor(for: change, kind: descriptorKind(for: change.kind), header: "[\(change.kind.rawValue) file]")]
+        }
+
+        // Added / untracked file (no old blob)
         if oldData == nil {
             let lines = newData.map { TextCodec.splitLines(TextCodec.decode($0)) } ?? []
             if lines.isEmpty {
@@ -377,10 +643,31 @@ enum AIHunkGrouper {
     /// while preserving EVERY `path#hunkIndex` header and line range so AI can assign 100% of hunks.
     static func buildPrompt(
         hunks: [HunkDescriptor],
+        source: AIHunkGroupingSource = .workingTree,
         maxDiffBytes: Int = defaultMaxDiffBytes
     ) -> String {
+        let introLine: String
+        let overviewPrefix: String
+        switch source {
+        case .workingTree:
+            introLine = "你是一个资深代码审查与 Git 变更整理助手。请根据下方列出的所有未提交变更 Hunk，按功能、模块或逻辑目的将它们划分为清晰合理的逻辑分组，方便开发者逐组审查和拆分提交。"
+            overviewPrefix = "## 未提交变更 Hunk 清单"
+        case .comparison(let comp):
+            let scope = comp.isStash
+                ? "Stash \(comp.title)"
+                : (comp.headTitle.map { "对比 \(comp.title) 与 \($0)" } ?? "对比 \(comp.title) 与工作区")
+            introLine = "你是一个资深代码审查与 Git 变更整理助手。请根据下方列出的所有对比变更 Hunk（\(scope)），按功能、模块或逻辑目的将它们划分为清晰合理的逻辑分组，方便开发者按逻辑单元审查代码。"
+            overviewPrefix = "## 对比变更 Hunk 清单"
+        case .commits(let commits):
+            let scope = commits.commitHashes.count == 1
+                ? "提交 \(commits.commitHashes[0].prefix(7))"
+                : "所选 \(commits.commitHashes.count) 个历史提交"
+            introLine = "你是一个资深代码审查与 Git 变更整理助手。请根据下方列出的所有历史提交变更 Hunk（\(scope)），按功能、模块或逻辑目的将它们划分为清晰合理的逻辑分组，方便开发者按逻辑单元审查代码。"
+            overviewPrefix = "## 历史提交变更 Hunk 清单"
+        }
+
         let rules = """
-            你是一个资深代码审查与 Git 变更整理助手。请根据下方列出的所有未提交变更 Hunk，按功能、模块或逻辑目的将它们划分为清晰合理的逻辑分组，方便开发者逐组审查和拆分提交。
+            \(introLine)
 
             严格要求：
             1. 不要调用任何工具、不要执行命令、不要读取磁盘文件，仅根据下方提供的 Hunk 信息分析。
@@ -429,7 +716,7 @@ enum AIHunkGrouper {
         }
 
         let fileCount = Set(hunks.map(\.filePath)).count
-        let overview = "## 未提交变更 Hunk 清单（共 \(fileCount) 个文件，\(hunks.count) 个 Hunk）"
+        let overview = "\(overviewPrefix)（共 \(fileCount) 个文件，\(hunks.count) 个 Hunk）"
         return "\(rules)\n\n\(overview)\n\n\(sections.joined(separator: "\n\n"))"
     }
 
@@ -595,6 +882,7 @@ enum AIHunkGrouper {
     static func parseGroupingResponse(
         _ raw: String,
         validHunks: [HunkDescriptor],
+        source: AIHunkGroupingSource = .workingTree,
         provider: AgentProvider = .agy,
         model: String? = nil,
         generatedAt: Date = Date()
@@ -683,9 +971,12 @@ enum AIHunkGrouper {
         }
 
         if !missingFiles.isEmpty {
+            let fallbackSummary = source.isCommittable
+                ? "其余未被 AI 显式归类的未提交变更。"
+                : "其余未被 AI 显式归类的变更。"
             groups.append(AIHunkGroup(
                 name: fallbackGroupName,
-                summary: "其余未被 AI 显式归类的未提交变更。",
+                summary: fallbackSummary,
                 files: missingFiles
             ))
         }
@@ -715,9 +1006,10 @@ enum AIHunkGrouper {
 
     // MARK: - End-to-End Generation
 
-    /// Collects uncommitted working-tree hunks and asks the selected local AI agent to group them.
+    /// Collects hunks for `source` and asks the selected local AI agent to group them.
     static func generateGroups(
         repoRoot: URL,
+        source: AIHunkGroupingSource = .workingTree,
         files: [FileChange]? = nil,
         provider: AgentProvider = .agy,
         model: String? = nil,
@@ -729,12 +1021,21 @@ enum AIHunkGrouper {
         }
         try Task.checkCancellation()
 
-        let hunks = try await collectWorkingTreeHunks(repoRoot: repoRoot, files: files)
+        let hunks: [HunkDescriptor]
+        switch source {
+        case .workingTree:
+            hunks = try await collectWorkingTreeHunks(repoRoot: repoRoot, files: files)
+        case .comparison, .commits:
+            guard let files, !files.isEmpty else {
+                throw AIHunkGroupingError.noChangesToGroup
+            }
+            hunks = try await collectHunks(repoRoot: repoRoot, source: source, files: files)
+        }
         guard !hunks.isEmpty else {
             throw AIHunkGroupingError.noChangesToGroup
         }
 
-        let prompt = buildPrompt(hunks: hunks)
+        let prompt = buildPrompt(hunks: hunks, source: source)
         let rawResponse = try await service.generate(
             provider: provider,
             model: model,
@@ -747,6 +1048,7 @@ enum AIHunkGrouper {
         return try parseGroupingResponse(
             rawResponse,
             validHunks: hunks,
+            source: source,
             provider: provider,
             model: model
         )

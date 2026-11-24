@@ -624,7 +624,7 @@ struct LineHistoryEntry: Identifiable, Equatable, Sendable {
 }
 
 /// A single commit's touch on a file when aggregating non-contiguous Log commit selections.
-struct FileCommitStep: Equatable, Hashable, Sendable {
+struct FileCommitStep: Equatable, Hashable, Codable, Sendable {
     var hash: String
     /// First parent hash, or nil for a root commit.
     var parent: String?

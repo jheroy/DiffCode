@@ -640,7 +640,8 @@ final class AIHunkGrouperTests: XCTestCase {
             summary: "验证读写与删除",
             files: [AIHunkGroupFile(path: "Sources/App.swift", hunkIndices: [0, 2])]
         )
-        let state = PersistedAIGroupState(
+        let sessionWT = AIGroupSession(
+            source: .workingTree,
             result: AIHunkGroupingResult(
                 groups: [group],
                 totalHunks: 2,
@@ -649,11 +650,45 @@ final class AIHunkGrouperTests: XCTestCase {
                 model: "gpt-6-luna",
                 generatedAt: Date(timeIntervalSince1970: 1_700_000_123)
             ),
+            files: [FileChange(path: "Sources/App.swift", oldPath: nil, kind: .modified)],
             selectedGroupID: group.id,
             selectedGroupFilePath: "Sources/App.swift",
             selectedGroupHunkIndex: 2,
             groupCommitMessages: [group.id.uuidString: "feat: custom message"],
             headOID: "deadbeef"
+        )
+        let compareGroup = AIHunkGroup(
+            name: "对比分组",
+            summary: "分支对比改动",
+            files: [AIHunkGroupFile(path: "Sources/Other.swift", hunkIndices: [0])]
+        )
+        let sessionComp = AIGroupSession(
+            source: .comparison(.init(
+                title: "main",
+                baseHash: "1111111111111111111111111111111111111111",
+                targetRef: "refs/heads/main",
+                forkPoint: false,
+                headTitle: nil,
+                headHash: nil,
+                stashUntrackedHash: nil,
+                isStash: false
+            )),
+            result: AIHunkGroupingResult(
+                groups: [compareGroup],
+                totalHunks: 1,
+                totalFiles: 1,
+                provider: .agy,
+                model: "gemini-4",
+                generatedAt: Date(timeIntervalSince1970: 1_700_000_200)
+            ),
+            files: [FileChange(path: "Sources/Other.swift", oldPath: nil, kind: .modified)],
+            selectedGroupID: compareGroup.id,
+            selectedGroupFilePath: "Sources/Other.swift",
+            selectedGroupHunkIndex: 0
+        )
+        let state = PersistedAIGroupState(
+            sessions: [sessionWT, sessionComp],
+            activeSessionID: sessionComp.id
         )
 
         let writer = AIGroupStorage(fileURL: storageFile)
@@ -665,23 +700,55 @@ final class AIHunkGrouperTests: XCTestCase {
         XCTAssertEqual(reader.load(for: linkRepo), state)
         XCTAssertEqual(reader.allKeys().count, 1)
 
-        // Empty-groups guard deletes record and backing file.
-        let emptyState = PersistedAIGroupState(
-            result: AIHunkGroupingResult(
-                groups: [],
-                totalHunks: 0,
-                totalFiles: 0,
-                provider: .codex,
-                model: nil,
-                generatedAt: Date(timeIntervalSince1970: 1_700_000_123)
-            )
-        )
+        // Removing one session keeps the other intact.
+        reader.save(PersistedAIGroupState(sessions: [sessionComp], activeSessionID: sessionComp.id), for: realRepo)
+        let remaining = try XCTUnwrap(reader.load(for: realRepo))
+        XCTAssertEqual(remaining.sessions.count, 1)
+        XCTAssertEqual(remaining.sessions[0].id, sessionComp.id)
+
+        // Empty-sessions guard deletes record and backing file.
+        let emptyState = PersistedAIGroupState(sessions: [], activeSessionID: nil)
         reader.save(emptyState, for: realRepo)
         XCTAssertNil(reader.load(for: realRepo))
         XCTAssertFalse(fm.fileExists(atPath: storageFile.path))
 
-        // Corrupted JSON falls back cleanly without crashing.
+        // Legacy v1 single-session JSON migrates automatically into a `.workingTree` session.
+        let legacyJSON: [String: Any] = [
+            "version": 1,
+            "records": [
+                AIGroupStorage.repoKey(for: realRepo): [
+                    "result": [
+                        "groups": [[
+                            "id": group.id.uuidString,
+                            "name": group.name,
+                            "summary": group.summary,
+                            "files": [["path": "Sources/App.swift", "hunkIndices": [0, 2]]],
+                        ]],
+                        "totalHunks": 2,
+                        "totalFiles": 1,
+                        "provider": "codex",
+                        "model": "gpt-6-luna",
+                        "generatedAt": "2023-11-14T22:15:23Z",
+                    ],
+                    "selectedGroupID": group.id.uuidString,
+                    "selectedGroupFilePath": "Sources/App.swift",
+                    "selectedGroupHunkIndex": 2,
+                    "groupCommitMessages": [group.id.uuidString: "legacy draft"],
+                    "headOID": "deadbeef",
+                ],
+            ],
+        ]
         try fm.createDirectory(at: storageFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONSerialization.data(withJSONObject: legacyJSON, options: []).write(to: storageFile)
+        let migratedReader = AIGroupStorage(fileURL: storageFile)
+        let migrated = try XCTUnwrap(migratedReader.load(for: realRepo))
+        XCTAssertEqual(migrated.sessions.count, 1)
+        XCTAssertEqual(migrated.sessions[0].source, .workingTree)
+        XCTAssertEqual(migrated.sessions[0].result.groups, [group])
+        XCTAssertEqual(migrated.sessions[0].groupCommitMessages[group.id.uuidString], "legacy draft")
+        XCTAssertEqual(migrated.activeSessionID, migrated.sessions[0].id)
+
+        // Corrupted JSON falls back cleanly without crashing.
         try Data("{corrupted-json".utf8).write(to: storageFile)
         let corruptedReader = AIGroupStorage(fileURL: storageFile)
         XCTAssertNil(corruptedReader.load(for: realRepo))
@@ -701,7 +768,7 @@ final class AIHunkGrouperTests: XCTestCase {
             summary: "摘要 B",
             files: [AIHunkGroupFile(path: "b.swift", hunkIndices: [1, 2])]
         )
-        let result = AIHunkGroupingResult(
+        let wtResult = AIHunkGroupingResult(
             groups: [groupA, groupB],
             totalHunks: 4,
             totalFiles: 2,
@@ -709,47 +776,256 @@ final class AIHunkGrouperTests: XCTestCase {
             model: "gemini-4",
             generatedAt: Date(timeIntervalSince1970: 1_700_000_500)
         )
+        let wtSession = AIGroupSession(
+            source: .workingTree,
+            result: wtResult,
+            files: [
+                FileChange(path: "a.swift", oldPath: nil, kind: .modified),
+                FileChange(path: "b.swift", oldPath: nil, kind: .modified),
+            ],
+            selectedGroupID: groupB.id,
+            selectedGroupFilePath: "b.swift",
+            selectedGroupHunkIndex: 2
+        )
+
+        let compGroup = AIHunkGroup(
+            name: "对比分组",
+            summary: "对比提交",
+            files: [AIHunkGroupFile(path: "c.swift", hunkIndices: [0])]
+        )
+        let compSession = AIGroupSession(
+            source: .comparison(.init(
+                title: "main",
+                baseHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                targetRef: "refs/heads/main",
+                forkPoint: false,
+                headTitle: nil,
+                headHash: nil,
+                stashUntrackedHash: nil,
+                isStash: false
+            )),
+            result: AIHunkGroupingResult(
+                groups: [compGroup],
+                totalHunks: 1,
+                totalFiles: 1,
+                provider: .claude,
+                model: "sonnet",
+                generatedAt: Date(timeIntervalSince1970: 1_700_000_600)
+            ),
+            files: [FileChange(path: "c.swift", oldPath: nil, kind: .modified)],
+            selectedGroupID: compGroup.id,
+            selectedGroupFilePath: "c.swift",
+            selectedGroupHunkIndex: 0,
+            groupCommitMessages: [compGroup.id.uuidString: "should be stripped"]
+        )
 
         let sourceProject = Project(url: dir)
-        sourceProject.aiGroupResult = result
-        sourceProject.selectedGroupID = groupB.id
-        sourceProject.selectedGroupFilePath = "b.swift"
+        sourceProject.aiGroupSessions = [wtSession, compSession]
+        sourceProject.activeGroupSessionID = wtSession.id
         sourceProject.selectedGroupRowID = ChangeRow.fileID("b.swift")
-        sourceProject.selectedGroupHunkIndex = 2
         sourceProject.setCommitMessage(AIHunkGrouper.defaultCommitMessage(for: groupA), for: groupA)
         sourceProject.setCommitMessage("custom commit draft B", for: groupB)
         let staleID = UUID()
-        sourceProject.groupCommitMessages[staleID] = "stale draft"
+        sourceProject.mutateAIGroupSession(id: wtSession.id) {
+            $0.groupCommitMessages[staleID.uuidString] = "stale draft"
+        }
 
         let snapshot = try XCTUnwrap(sourceProject.persistedAIGroupState(headOIDOverride: "abc1234"))
-        XCTAssertEqual(snapshot.headOID, "abc1234")
-        XCTAssertEqual(snapshot.groupCommitMessages, [groupB.id.uuidString: "custom commit draft B"])
+        XCTAssertEqual(snapshot.sessions.count, 2)
+        XCTAssertEqual(snapshot.sessions[0].headOID, "abc1234")
+        XCTAssertEqual(snapshot.sessions[0].groupCommitMessages, [groupB.id.uuidString: "custom commit draft B"])
+        XCTAssertTrue(snapshot.sessions[1].groupCommitMessages.isEmpty, "Non-committable sessions must not keep commit drafts")
 
         let restoredProject = Project(url: dir)
         restoredProject.restoreAIGroupState(snapshot)
-        XCTAssertEqual(restoredProject.aiGroupResult, result)
+        XCTAssertEqual(restoredProject.aiGroupSessions.count, 2)
+        XCTAssertEqual(restoredProject.activeGroupSessionID, wtSession.id)
+        XCTAssertEqual(restoredProject.aiGroupResult, wtResult)
         XCTAssertEqual(restoredProject.selectedGroupID, groupB.id)
         XCTAssertEqual(restoredProject.selectedGroupFilePath, "b.swift")
         XCTAssertEqual(restoredProject.selectedGroupRowID, ChangeRow.fileID("b.swift"))
         XCTAssertEqual(restoredProject.selectedGroupHunkIndex, 2)
         XCTAssertEqual(restoredProject.commitMessage(for: groupB), "custom commit draft B")
         XCTAssertEqual(restoredProject.commitMessage(for: groupA), AIHunkGrouper.defaultCommitMessage(for: groupA))
-        XCTAssertNil(restoredProject.groupCommitMessages[staleID])
+        XCTAssertNil(restoredProject.activeAIGroupSession?.groupCommitMessages[staleID.uuidString])
 
-        // Invalid selection fields fall back cleanly to valid group/file/hunk.
-        let invalidSelectionState = PersistedAIGroupState(
-            result: result,
+        // Removing working-tree sessions preserves comparison/commit sessions and updates active selection.
+        restoredProject.removeWorkingTreeAIGroupSessions()
+        XCTAssertEqual(restoredProject.aiGroupSessions.count, 1)
+        XCTAssertEqual(restoredProject.activeGroupSessionID, compSession.id)
+        XCTAssertFalse(restoredProject.activeAIGroupSession?.isCommittable ?? true)
+
+        // Invalid selection fields fall back cleanly to valid session/group/file/hunk.
+        let brokenWT = AIGroupSession(
+            source: .workingTree,
+            result: wtResult,
+            files: wtSession.files,
             selectedGroupID: UUID(),
             selectedGroupFilePath: "missing.swift",
             selectedGroupHunkIndex: 99,
             groupCommitMessages: [groupA.id.uuidString: AIHunkGrouper.defaultCommitMessage(for: groupA)]
         )
+        let invalidSelectionState = PersistedAIGroupState(
+            sessions: [brokenWT],
+            activeSessionID: UUID()
+        )
         let fallbackProject = Project(url: dir)
         fallbackProject.restoreAIGroupState(invalidSelectionState)
+        XCTAssertEqual(fallbackProject.activeGroupSessionID, brokenWT.id)
         XCTAssertEqual(fallbackProject.selectedGroupID, groupA.id)
         XCTAssertEqual(fallbackProject.selectedGroupFilePath, "a.swift")
         XCTAssertEqual(fallbackProject.selectedGroupRowID, ChangeRow.fileID("a.swift"))
         XCTAssertEqual(fallbackProject.selectedGroupHunkIndex, 0)
-        XCTAssertTrue(fallbackProject.groupCommitMessages.isEmpty)
+        XCTAssertTrue(fallbackProject.activeAIGroupSession?.groupCommitMessages.isEmpty ?? false)
+    }
+
+    // MARK: - Comparison & Commit-Log Hunk Collection + DiffLoader Alignment
+
+    func testCollectHunksForComparisonOnCleanWorkingTreeAndCommitPair() async throws {
+        let root = try await makeRepo()
+        try writeFile("file.swift", content: (0..<12).map { "line\($0)" }.joined(separator: "\n") + "\n", in: root)
+        try await runGit(["add", "-A"], in: root)
+        try await runGit(["commit", "-q", "-m", "Base"], in: root)
+        let baseHash = try await runGit(["rev-parse", "HEAD"], in: root).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        try await runGit(["checkout", "-q", "-b", "feature"], in: root)
+        var lines = (0..<12).map { "line\($0)" }
+        lines[1] = "line1_feature"
+        lines[10] = "line10_feature"
+        try writeFile("file.swift", content: lines.joined(separator: "\n") + "\n", in: root)
+        try writeFile("added.swift", content: "let x = 1\n", in: root)
+        try await runGit(["add", "-A"], in: root)
+        try await runGit(["commit", "-q", "-m", "Feature changes"], in: root)
+        let headHash = try await runGit(["rev-parse", "HEAD"], in: root).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Working tree itself is completely clean.
+        let status = try await Git.status(in: root)
+        XCTAssertTrue(status.changes.isEmpty)
+
+        // 1. Branch/commit vs clean working tree comparison
+        let compFiles = try await Git.compareFiles(base: baseHash, head: nil, in: root)
+        let compSource = AIHunkGroupingSource.comparison(.init(
+            title: "main",
+            baseHash: baseHash,
+            targetRef: "main",
+            forkPoint: false,
+            headTitle: nil,
+            headHash: nil,
+            stashUntrackedHash: nil,
+            isStash: false
+        ))
+        XCTAssertFalse(compSource.isCommittable)
+        let compHunks = try await AIHunkGrouper.collectHunks(repoRoot: root, source: compSource, files: compFiles)
+        XCTAssertEqual(compHunks.filter { $0.filePath == "file.swift" }.map(\.hunkIndex), [0, 1])
+        XCTAssertEqual(compHunks.filter { $0.filePath == "added.swift" }.map(\.hunkIndex), [0])
+
+        // 2. Commit vs commit comparison
+        let twoCommitFiles = try await Git.compareFiles(base: baseHash, head: headHash, in: root)
+        let twoCommitSource = AIHunkGroupingSource.comparison(.init(
+            title: String(baseHash.prefix(7)),
+            baseHash: baseHash,
+            targetRef: baseHash,
+            forkPoint: false,
+            headTitle: String(headHash.prefix(7)),
+            headHash: headHash,
+            stashUntrackedHash: nil,
+            isStash: false
+        ))
+        XCTAssertFalse(twoCommitSource.isCommittable)
+        let twoCommitHunks = try await AIHunkGrouper.collectHunks(repoRoot: root, source: twoCommitSource, files: twoCommitFiles)
+        XCTAssertEqual(twoCommitHunks.count, 3)
+    }
+
+    @MainActor
+    func testCollectHunksForContiguousAndNonContiguousCommitsMatchesDiffLoader() async throws {
+        let root = try await makeRepo()
+        let baseLines = (0..<16).map { "row\($0)" }
+        try writeFile("notes.swift", content: baseLines.joined(separator: "\n") + "\n", in: root)
+        try await runGit(["add", "-A"], in: root)
+        try await runGit(["commit", "-q", "-m", "c0 base"], in: root)
+
+        // c1 edits row1
+        var c1Lines = baseLines
+        c1Lines[1] = "row1_c1"
+        try writeFile("notes.swift", content: c1Lines.joined(separator: "\n") + "\n", in: root)
+        try await runGit(["add", "-A"], in: root)
+        try await runGit(["commit", "-q", "-m", "c1 edit top"], in: root)
+
+        // c2 (skipped in non-contiguous selection) edits row7
+        var c2Lines = c1Lines
+        c2Lines[7] = "row7_c2"
+        try writeFile("notes.swift", content: c2Lines.joined(separator: "\n") + "\n", in: root)
+        try await runGit(["add", "-A"], in: root)
+        try await runGit(["commit", "-q", "-m", "c2 edit middle"], in: root)
+
+        // c3 edits row14
+        var c3Lines = c2Lines
+        c3Lines[14] = "row14_c3"
+        try writeFile("notes.swift", content: c3Lines.joined(separator: "\n") + "\n", in: root)
+        try await runGit(["add", "-A"], in: root)
+        try await runGit(["commit", "-q", "-m", "c3 edit bottom"], in: root)
+
+        let commits = try await Git.log(in: root, skip: 0, limit: 10, query: "", allBranches: false)
+        // Newest first: [c3, c2, c1, c0]
+        XCTAssertEqual(commits.count, 4)
+        let c3 = commits[0]
+        let c2 = commits[1]
+        let c1 = commits[2]
+
+        // Contiguous selection [c3, c2, c1]
+        let contigSummary = try await Git.commitSelectionSummary([c3, c2, c1], in: root)
+        XCTAssertFalse(contigSummary.isNonContiguous)
+        let contigSource = AIHunkGroupingSource.commits(.init(
+            commitHashes: [c3.hash, c2.hash, c1.hash],
+            oldestParentHash: c1.parents.first,
+            isNonContiguous: false,
+            primarySubject: nil,
+            skippedMergeCount: 0,
+            fileSteps: [:]
+        ))
+        XCTAssertFalse(contigSource.isCommittable)
+        let contigHunks = try await AIHunkGrouper.collectHunks(repoRoot: root, source: contigSource, files: contigSummary.files)
+        XCTAssertEqual(contigHunks.map(\.hunkIndex), [0, 1, 2])
+
+        // Non-contiguous selection [c3, c1] (skips c2)
+        let nonContigSummary = try await Git.commitSelectionSummary([c3, c1], in: root)
+        XCTAssertTrue(nonContigSummary.isNonContiguous)
+        let nonContigSource = AIHunkGroupingSource.commits(.init(
+            commitHashes: [c3.hash, c1.hash],
+            oldestParentHash: nil,
+            isNonContiguous: true,
+            primarySubject: nil,
+            skippedMergeCount: 0,
+            fileSteps: nonContigSummary.fileSteps
+        ))
+        let nonContigHunks = try await AIHunkGrouper.collectHunks(repoRoot: root, source: nonContigSource, files: nonContigSummary.files)
+        XCTAssertEqual(nonContigHunks.map(\.hunkIndex), [0, 1])
+
+        // Verify DiffLoader builds matching filtered document using Project.diffRequest
+        let project = Project(url: root)
+        let group = AIHunkGroup(
+            name: "Selected",
+            summary: "Non-contiguous hunk #1",
+            files: [AIHunkGroupFile(path: "notes.swift", hunkIndices: [1])]
+        )
+        let session = AIGroupSession(
+            source: nonContigSource,
+            result: AIHunkGroupingResult(
+                groups: [group],
+                totalHunks: 1,
+                totalFiles: 1,
+                provider: .agy,
+                model: nil,
+                generatedAt: Date()
+            ),
+            files: nonContigSummary.files
+        )
+        let req = try XCTUnwrap(project.diffRequest(for: "notes.swift", in: session, ignoreWhitespace: false))
+        let doc = await DiffLoader.load(req, includedGroupHunks: [1])
+        XCTAssertTrue(doc.isGroupFiltered)
+        XCTAssertEqual(doc.hunks.count, 1)
+        XCTAssertEqual(doc.groupHunkIndexMap[1], 0)
+        XCTAssertTrue(doc.right.lines.contains("row14_c3"))
+        XCTAssertFalse(doc.right.lines.contains("row7_c2"))
     }
 }

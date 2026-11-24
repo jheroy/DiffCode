@@ -380,8 +380,8 @@ enum Git {
 
 // MARK: - Status
 
-struct FileChange: Identifiable, Hashable {
-    enum Kind: String, Hashable {
+struct FileChange: Identifiable, Hashable, Codable, Sendable {
+    enum Kind: String, Hashable, Codable, Sendable {
         case modified, added, deleted, renamed, untracked, conflicted
 
         var letter: String {
