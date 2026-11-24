@@ -10,6 +10,10 @@ protocol VimInputSourceControlling: AnyObject {
     func restoreRememberedInputSource()
 }
 
+extension VimInputSourceControlling {
+    func switchToEnglishIfNotEnglish() {}
+}
+
 /// No-op input source controller used in unit tests so tests never mutate system keyboard layout.
 final class NoOpVimInputSourceController: VimInputSourceControlling {
     func switchToEnglishAndRememberCurrent() {}
@@ -36,6 +40,12 @@ final class CarbonVimInputSourceController: VimInputSourceControlling {
             return
         }
         rememberedSourceID = currentID
+        selectInputSource(id: englishID)
+    }
+
+    func switchToEnglishIfNotEnglish() {
+        guard !isTestEnvironment, Thread.isMainThread else { return }
+        guard let currentID = currentInputSourceID(), currentID != englishID else { return }
         selectInputSource(id: englishID)
     }
 
@@ -71,6 +81,7 @@ enum VimMode: Equatable, Sendable {
     case insert
     case visual
     case visualLine
+    case visualBlock
     case commandLine(prefix: String, buffer: String)
 
     var isNormal: Bool {
@@ -85,13 +96,18 @@ enum VimMode: Equatable, Sendable {
 
     var isVisual: Bool {
         switch self {
-        case .visual, .visualLine: return true
+        case .visual, .visualLine, .visualBlock: return true
         default: return false
         }
     }
 
     var isVisualLine: Bool {
         if case .visualLine = self { return true }
+        return false
+    }
+
+    var isVisualBlock: Bool {
+        if case .visualBlock = self { return true }
         return false
     }
 
@@ -106,6 +122,7 @@ enum VimMode: Equatable, Sendable {
         case .insert: return "INSERT"
         case .visual: return "VISUAL"
         case .visualLine: return "V-LINE"
+        case .visualBlock: return "V-BLOCK"
         case .commandLine: return "COMMAND"
         }
     }
@@ -217,6 +234,8 @@ struct VimKey: Equatable, Sendable {
 enum VimAction: Equatable, Sendable {
     // ~/.ideavimrc navigation & IDE actions
     case goToDefinition         // gd
+    case goToTypeDefinition     // gy
+    case goToImplementation     // gi, gu
     case findReferences         // gr, <Space>r
     case goToFile               // <C-p>
     case goToSymbol             // gs
@@ -271,12 +290,17 @@ struct VimVisualRange: Equatable, Sendable {
     var anchor: TextPosition
     var head: TextPosition
     var linewise: Bool
+    var blockwise: Bool = false
+    var blockStartColumn: Int = 0
+    var blockEndColumn: Int = 0
+    var blockExtendToEnd: Bool = false
 }
 
 /// Register storage (unnamed register synced with system clipboard).
 struct VimRegister: Equatable, Sendable {
     var text: String
     var linewise: Bool
+    var blockwise: Bool = false
 }
 
 /// Context passed into `VimEngine.handleKey(_:context:)`.
@@ -384,6 +408,17 @@ final class VimEngine {
         var inserted: String = ""
     }
 
+    private struct BlockInsertSession {
+        var topRow: Int
+        var bottomRow: Int
+        var anchorEditRow: Int
+        var insertColumn: Int
+        var appendToEOL: Bool
+        var padShortLines: Bool
+        var initialPrefix: String
+        var initialSuffix: String
+    }
+
     private struct SelectionFrame: Equatable {
         var anchor: TextPosition
         var head: TextPosition
@@ -402,9 +437,11 @@ final class VimEngine {
     private var pendingOperator: Operator?
     private var pendingPrefix: PendingPrefix = .none
     private var goalColumn: Int?
+    private var visualBlockDollar: Bool = false
     private var selectionStack: [SelectionFrame] = []
     private var lastChange: DotCommand?
     private var activeInsert: ActiveInsertRecording?
+    private var pendingBlockEdit: BlockInsertSession?
 
     private let inputSource: VimInputSourceControlling
     private let readClipboard: () -> String?
@@ -474,10 +511,12 @@ final class VimEngine {
         let wasInsert = mode.isInsert
         mode = .normal
         visualAnchor = nil
+        visualBlockDollar = false
         clearPending()
         goalColumn = nil
         selectionStack.removeAll()
         activeInsert = nil
+        pendingBlockEdit = nil
         if switchInputSource && wasInsert {
             inputSource.switchToEnglishAndRememberCurrent()
         }
@@ -535,7 +574,7 @@ final class VimEngine {
             return handleCommandLineKey(key, context: context)
         case .normal:
             return handleNormalKey(key, context: context)
-        case .visual, .visualLine:
+        case .visual, .visualLine, .visualBlock:
             return handleVisualKey(key, context: context)
         }
     }
@@ -552,11 +591,18 @@ final class VimEngine {
         mode = .normal
         clearPending()
         goalColumn = nil
-        if let rec = activeInsert {
+        let blockSession = pendingBlockEdit
+        pendingBlockEdit = nil
+        let fallbackInserted = activeInsert?.inserted ?? ""
+        if blockSession == nil, let rec = activeInsert {
             lastChange = rec.buildDot(rec.inserted)
-            activeInsert = nil
         }
+        activeInsert = nil
         inputSource.switchToEnglishAndRememberCurrent()
+
+        if let session = blockSession {
+            return finalizeVisualBlockInsert(session, fallbackInserted: fallbackInserted, context: context)
+        }
 
         let clamped = clampPos(context.cursor, in: context.lines, allowPastEnd: true)
         let newCol: Int
@@ -573,19 +619,142 @@ final class VimEngine {
         )
     }
 
+    private func finalizeVisualBlockInsert(_ session: BlockInsertSession, fallbackInserted: String, context: VimContext) -> VimResult {
+        let inserted: String
+        if session.anchorEditRow >= 0 && session.anchorEditRow < context.lines.count {
+            let line = context.lines[session.anchorEditRow]
+            let ns = line as NSString
+            let pLen = (session.initialPrefix as NSString).length
+            let sLen = (session.initialSuffix as NSString).length
+            if line.hasPrefix(session.initialPrefix) && line.hasSuffix(session.initialSuffix) && ns.length >= pLen + sLen {
+                inserted = ns.substring(with: NSRange(location: pLen, length: ns.length - pLen - sLen))
+            } else {
+                inserted = fallbackInserted
+            }
+        } else {
+            inserted = fallbackInserted
+        }
+
+        var edits: [VimTextEdit] = []
+        if !inserted.isEmpty {
+            for r in stride(from: session.bottomRow, through: session.topRow, by: -1) {
+                guard r != session.anchorEditRow, r >= 0 && r < context.lines.count else { continue }
+                let len = lineLength(context.lines, r)
+                if session.appendToEOL {
+                    let pos = TextPosition(row: r, column: len)
+                    edits.append(VimTextEdit(from: pos, to: pos, text: inserted))
+                } else if session.padShortLines {
+                    if len < session.insertColumn {
+                        let pad = String(repeating: " ", count: session.insertColumn - len)
+                        let pos = TextPosition(row: r, column: len)
+                        edits.append(VimTextEdit(from: pos, to: pos, text: pad + inserted))
+                    } else {
+                        let pos = TextPosition(row: r, column: session.insertColumn)
+                        edits.append(VimTextEdit(from: pos, to: pos, text: inserted))
+                    }
+                } else if len >= session.insertColumn {
+                    let pos = TextPosition(row: r, column: session.insertColumn)
+                    edits.append(VimTextEdit(from: pos, to: pos, text: inserted))
+                }
+            }
+        }
+
+        let targetRow = max(0, min(session.topRow, context.lines.count - 1))
+        let topLenBefore = lineLength(context.lines, targetRow)
+        let postTopLen: Int
+        if targetRow == session.anchorEditRow || inserted.isEmpty {
+            postTopLen = topLenBefore
+        } else if session.appendToEOL {
+            postTopLen = topLenBefore + (inserted as NSString).length
+        } else if session.padShortLines {
+            postTopLen = max(topLenBefore, session.insertColumn) + (inserted as NSString).length
+        } else if topLenBefore >= session.insertColumn {
+            postTopLen = topLenBefore + (inserted as NSString).length
+        } else {
+            postTopLen = topLenBefore
+        }
+        let targetCol: Int
+        if postTopLen == 0 {
+            targetCol = 0
+        } else if session.insertColumn >= postTopLen {
+            targetCol = lastCharCol(in: context.lines, row: targetRow)
+        } else {
+            targetCol = session.insertColumn
+        }
+        return VimResult(
+            handled: true,
+            edits: edits,
+            cursor: TextPosition(row: targetRow, column: targetCol),
+            clearVisual: true,
+            exitedInsert: true
+        )
+    }
+
     // MARK: Command-Line Mode
+
+    /// Flattens multi-line clipboard text into a single-line command-line string.
+    static func sanitizeCommandLinePaste(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .newlines)
+        return trimmed
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+    }
+
+    func updateCommandLineBuffer(_ text: String) {
+        guard case .commandLine(let prefix, _) = mode else { return }
+        mode = .commandLine(prefix: prefix, buffer: text)
+    }
+
+    @discardableResult
+    func pasteIntoCommandLine(_ rawText: String) -> Bool {
+        guard case .commandLine(let prefix, var buffer) = mode else { return false }
+        let sanitized = Self.sanitizeCommandLinePaste(rawText)
+        guard !sanitized.isEmpty else { return false }
+        buffer.append(sanitized)
+        mode = .commandLine(prefix: prefix, buffer: buffer)
+        return true
+    }
+
+    func submitCommandLine(_ text: String? = nil, context: VimContext) -> VimResult {
+        guard case .commandLine(_, let current) = mode else { return .ignored }
+        let hadVisual = visualAnchor != nil
+        mode = .normal
+        visualAnchor = nil
+        visualBlockDollar = false
+        selectionStack.removeAll()
+        clearPending()
+        inputSource.switchToEnglishIfNotEnglish()
+        var result = executeCommandLine(text ?? current, context: context)
+        if hadVisual { result.clearVisual = true }
+        return result
+    }
+
+    func cancelCommandLine() -> VimResult {
+        guard case .commandLine = mode else { return .ignored }
+        let hadVisual = visualAnchor != nil
+        mode = .normal
+        visualAnchor = nil
+        visualBlockDollar = false
+        selectionStack.removeAll()
+        clearPending()
+        inputSource.switchToEnglishIfNotEnglish()
+        return VimResult(handled: true, clearVisual: hadVisual)
+    }
 
     private func handleCommandLineKey(_ key: VimKey, context: VimContext) -> VimResult {
         guard case .commandLine(let prefix, var buffer) = mode else { return .ignored }
 
         if key.kind == .escape || (key.control && (key.kind == .character("[") || key.kind == .character("c"))) {
-            mode = .normal
-            clearPending()
+            return cancelCommandLine()
+        }
+        if key.control && key.kind == .character("u") {
+            mode = .commandLine(prefix: prefix, buffer: "")
             return VimResult(handled: true)
         }
         if key.kind == .backspace {
             if buffer.isEmpty {
-                mode = .normal
+                return cancelCommandLine()
             } else {
                 buffer.removeLast()
                 mode = .commandLine(prefix: prefix, buffer: buffer)
@@ -593,9 +762,7 @@ final class VimEngine {
             return VimResult(handled: true)
         }
         if key.kind == .enter {
-            mode = .normal
-            clearPending()
-            return executeCommandLine(buffer, context: context)
+            return submitCommandLine(nil, context: context)
         }
         if !key.control, case .character(let s) = key.kind {
             buffer.append(s)
@@ -793,6 +960,13 @@ final class VimEngine {
                 case "e": return VimResult(handled: true, actions: [.toggleFileTree])
                 case "h": return VimResult(handled: true, actions: [.focusLeftPane])
                 case "l": return VimResult(handled: true, actions: [.focusRightPane])
+                case "v":
+                    selectionStack.removeAll()
+                    mode = .visualBlock
+                    visualAnchor = cursor
+                    visualBlockDollar = false
+                    goalColumn = nil
+                    return VimResult(handled: true, cursor: cursor, visualRange: makeVisualRange(anchor: cursor, head: cursor))
                 default: return .ignored
                 }
             }
@@ -964,13 +1138,15 @@ final class VimEngine {
             selectionStack.removeAll()
             mode = .visual
             visualAnchor = cursor
-            return VimResult(handled: true, cursor: cursor, visualRange: VimVisualRange(anchor: cursor, head: cursor, linewise: false))
+            visualBlockDollar = false
+            return VimResult(handled: true, cursor: cursor, visualRange: makeVisualRange(anchor: cursor, head: cursor))
         case "V":
             clearPending()
             selectionStack.removeAll()
             mode = .visualLine
             visualAnchor = cursor
-            return VimResult(handled: true, cursor: cursor, visualRange: VimVisualRange(anchor: cursor, head: cursor, linewise: true))
+            visualBlockDollar = false
+            return VimResult(handled: true, cursor: cursor, visualRange: makeVisualRange(anchor: cursor, head: cursor))
         case ":":
             clearPending()
             mode = .commandLine(prefix: ":", buffer: "")
@@ -1115,6 +1291,12 @@ final class VimEngine {
             return VimResult(handled: true)
         case "d":
             return VimResult(handled: true, actions: [.goToDefinition])
+        case "y":
+            guard op == nil else { return VimResult(handled: true) }
+            return VimResult(handled: true, actions: [.goToTypeDefinition])
+        case "i", "u":
+            guard op == nil else { return VimResult(handled: true) }
+            return VimResult(handled: true, actions: [.goToImplementation])
         case "r":
             return VimResult(handled: true, actions: [.findReferences])
         case "a":
@@ -1136,17 +1318,67 @@ final class VimEngine {
 
     // MARK: Visual Mode
 
+    private func blockColumnBounds(anchor: TextPosition, head: TextPosition) -> (startCol: Int, endCol: Int, extendToEnd: Bool) {
+        let headCol = visualBlockDollar ? head.column : (goalColumn ?? head.column)
+        return (min(anchor.column, headCol), max(anchor.column, headCol), visualBlockDollar)
+    }
+
+    private func makeVisualRange(anchor: TextPosition, head: TextPosition) -> VimVisualRange {
+        if mode.isVisualBlock {
+            let bounds = blockColumnBounds(anchor: anchor, head: head)
+            return VimVisualRange(
+                anchor: anchor,
+                head: head,
+                linewise: false,
+                blockwise: true,
+                blockStartColumn: bounds.startCol,
+                blockEndColumn: bounds.endCol,
+                blockExtendToEnd: bounds.extendToEnd
+            )
+        }
+        return VimVisualRange(anchor: anchor, head: head, linewise: mode.isVisualLine)
+    }
+
+    private func blockRowRange(row: Int, startCol: Int, endCol: Int, extendToEnd: Bool, lines: [String]) -> Range<Int>? {
+        guard row >= 0 && row < lines.count else { return nil }
+        let ns = lines[row] as NSString
+        let len = ns.length
+        guard len > 0, startCol < len else { return nil }
+        let s = ns.rangeOfComposedCharacterSequence(at: startCol).location
+        let e: Int
+        if extendToEnd {
+            e = len
+        } else {
+            let clampedEnd = min(endCol, len - 1)
+            e = TextEditing.characterBoundary(in: ns, from: clampedEnd, forward: true)
+        }
+        guard s < e else { return nil }
+        return s..<e
+    }
+
     private func handleVisualKey(_ key: VimKey, context: VimContext) -> VimResult {
         let cursor = clampPos(context.cursor, in: context.lines, allowPastEnd: false)
         let anchor = clampPos(visualAnchor ?? cursor, in: context.lines, allowPastEnd: false)
         let isLinewise = mode.isVisualLine
+        let isBlockwise = mode.isVisualBlock
 
         if key.kind == .escape || (key.control && (key.kind == .character("[") || key.kind == .character("c"))) {
             mode = .normal
             visualAnchor = nil
+            visualBlockDollar = false
             clearPending()
+            goalColumn = nil
             selectionStack.removeAll()
             return VimResult(handled: true, cursor: cursor, clearVisual: true)
+        }
+
+        // Pending `r<char>` in Visual mode
+        if case .replaceChar = pendingPrefix {
+            clearPending()
+            guard !key.control, case .character(let ch) = key.kind, !ch.isEmpty else {
+                return VimResult(handled: true)
+            }
+            return applyVisualReplaceChar(ch, anchor: anchor, head: cursor, context: context)
         }
 
         // Pending `S<char>` visual surround
@@ -1163,23 +1395,25 @@ final class VimEngine {
             clearPending()
             if !key.control, case .character(let ch) = key.kind {
                 if let range = textObjectRange(inner: inner, char: ch, cursor: cursor, lines: context.lines) {
+                    visualBlockDollar = false
+                    goalColumn = nil
                     if range.linewise {
                         mode = .visualLine
                         visualAnchor = range.from
                         let head = TextPosition(row: range.to.row, column: max(0, lastCharCol(in: context.lines, row: range.to.row)))
-                        return VimResult(handled: true, cursor: head, visualRange: VimVisualRange(anchor: range.from, head: head, linewise: true))
+                        return VimResult(handled: true, cursor: head, visualRange: makeVisualRange(anchor: range.from, head: head))
                     } else {
                         mode = .visual
                         let inclusiveEnd = inclusiveEndPosition(from: range.from, exclusiveEnd: range.to, in: context.lines)
                         visualAnchor = range.from
-                        return VimResult(handled: true, cursor: inclusiveEnd, visualRange: VimVisualRange(anchor: range.from, head: inclusiveEnd, linewise: false))
+                        return VimResult(handled: true, cursor: inclusiveEnd, visualRange: makeVisualRange(anchor: range.from, head: inclusiveEnd))
                     }
                 }
             }
             return VimResult(handled: true)
         }
 
-        // Pending `g` in visual mode (`gg`, `gc`)
+        // Pending `g` in visual mode (`gg`, `gc`, `gd`, `gi`, `gu`, `gr`)
         if case .g = pendingPrefix {
             let explicit = explicitCount()
             clearPending()
@@ -1190,17 +1424,36 @@ final class VimEngine {
                     let last = max(anchor.row, cursor.row)
                     mode = .normal
                     visualAnchor = nil
+                    visualBlockDollar = false
                     return applyToggleComment(firstRow: first, lastRow: last, context: context, recordDot: false)
                 case "g":
                     let maxRow = max(0, context.lines.count - 1)
                     let row = explicit.map { max(0, min($0 - 1, maxRow)) } ?? 0
-                    let target = TextPosition(row: row, column: firstNonBlank(in: context.lines, row: row))
-                    return VimResult(handled: true, cursor: target, visualRange: VimVisualRange(anchor: anchor, head: target, linewise: isLinewise))
+                    let target: TextPosition
+                    if isBlockwise {
+                        if visualBlockDollar {
+                            goalColumn = nil
+                            target = TextPosition(row: row, column: lastCharCol(in: context.lines, row: row))
+                        } else {
+                            let gCol = goalColumn ?? cursor.column
+                            goalColumn = gCol
+                            target = TextPosition(row: row, column: min(gCol, lastCharCol(in: context.lines, row: row)))
+                        }
+                    } else {
+                        target = TextPosition(row: row, column: firstNonBlank(in: context.lines, row: row))
+                    }
+                    return VimResult(handled: true, cursor: target, visualRange: makeVisualRange(anchor: anchor, head: target))
                 case "d":
-                    mode = .normal; visualAnchor = nil
+                    mode = .normal; visualAnchor = nil; visualBlockDollar = false
                     return VimResult(handled: true, clearVisual: true, actions: [.goToDefinition])
+                case "y":
+                    mode = .normal; visualAnchor = nil; visualBlockDollar = false
+                    return VimResult(handled: true, clearVisual: true, actions: [.goToTypeDefinition])
+                case "i", "u":
+                    mode = .normal; visualAnchor = nil; visualBlockDollar = false
+                    return VimResult(handled: true, clearVisual: true, actions: [.goToImplementation])
                 case "r":
-                    mode = .normal; visualAnchor = nil
+                    mode = .normal; visualAnchor = nil; visualBlockDollar = false
                     return VimResult(handled: true, clearVisual: true, actions: [.findReferences])
                 default:
                     return VimResult(handled: true)
@@ -1216,7 +1469,8 @@ final class VimEngine {
             if !key.control, case .character(let ch) = key.kind, !ch.isEmpty {
                 lastFind = (ch, forward, till)
                 if let outcome = evaluateMotion(.findChar(char: ch, forward: forward, till: till), count: count, from: cursor, in: context.lines, forOperator: false) {
-                    return VimResult(handled: true, cursor: outcome.target, visualRange: VimVisualRange(anchor: anchor, head: outcome.target, linewise: isLinewise))
+                    if isBlockwise { visualBlockDollar = false }
+                    return VimResult(handled: true, cursor: outcome.target, visualRange: makeVisualRange(anchor: anchor, head: outcome.target))
                 }
             }
             return VimResult(handled: true)
@@ -1229,7 +1483,8 @@ final class VimEngine {
             if !key.control, case .character(let ch) = key.kind {
                 let motion: ReplayMotion? = ch == "[" ? .method(next: false) : (ch == "(" ? .enclosing(open: true, curly: false) : (ch == "{" ? .enclosing(open: true, curly: true) : nil))
                 if let motion, let outcome = evaluateMotion(motion, count: count, from: cursor, in: context.lines, forOperator: false) {
-                    return VimResult(handled: true, cursor: outcome.target, visualRange: VimVisualRange(anchor: anchor, head: outcome.target, linewise: isLinewise))
+                    if isBlockwise { visualBlockDollar = false }
+                    return VimResult(handled: true, cursor: outcome.target, visualRange: makeVisualRange(anchor: anchor, head: outcome.target))
                 }
             }
             return VimResult(handled: true)
@@ -1240,7 +1495,8 @@ final class VimEngine {
             if !key.control, case .character(let ch) = key.kind {
                 let motion: ReplayMotion? = ch == "]" ? .method(next: true) : (ch == ")" ? .enclosing(open: false, curly: false) : (ch == "}" ? .enclosing(open: false, curly: true) : nil))
                 if let motion, let outcome = evaluateMotion(motion, count: count, from: cursor, in: context.lines, forOperator: false) {
-                    return VimResult(handled: true, cursor: outcome.target, visualRange: VimVisualRange(anchor: anchor, head: outcome.target, linewise: isLinewise))
+                    if isBlockwise { visualBlockDollar = false }
+                    return VimResult(handled: true, cursor: outcome.target, visualRange: makeVisualRange(anchor: anchor, head: outcome.target))
                 }
             }
             return VimResult(handled: true)
@@ -1251,10 +1507,10 @@ final class VimEngine {
             clearPending()
             if !key.control, case .character(let ch) = key.kind {
                 switch ch {
-                case "r": mode = .normal; visualAnchor = nil; return VimResult(handled: true, clearVisual: true, actions: [.findReferences])
-                case "a": mode = .normal; visualAnchor = nil; return VimResult(handled: true, clearVisual: true, actions: [.searchEverywhere])
-                case "o": mode = .normal; visualAnchor = nil; return VimResult(handled: true, clearVisual: true, actions: [.toggleMaximizeViewer])
-                case "e": mode = .normal; visualAnchor = nil; return VimResult(handled: true, clearVisual: true, actions: [.locateInTree])
+                case "r": mode = .normal; visualAnchor = nil; visualBlockDollar = false; return VimResult(handled: true, clearVisual: true, actions: [.findReferences])
+                case "a": mode = .normal; visualAnchor = nil; visualBlockDollar = false; return VimResult(handled: true, clearVisual: true, actions: [.searchEverywhere])
+                case "o": mode = .normal; visualAnchor = nil; visualBlockDollar = false; return VimResult(handled: true, clearVisual: true, actions: [.toggleMaximizeViewer])
+                case "e": mode = .normal; visualAnchor = nil; visualBlockDollar = false; return VimResult(handled: true, clearVisual: true, actions: [.locateInTree])
                 default: return VimResult(handled: true)
                 }
             }
@@ -1271,6 +1527,20 @@ final class VimEngine {
                 case "f": return scrollAndMoveVisual(down: true, fullPage: true, anchor: anchor, cursor: cursor, linewise: isLinewise, context: context)
                 case "b": return scrollAndMoveVisual(down: false, fullPage: true, anchor: anchor, cursor: cursor, linewise: isLinewise, context: context)
                 case "e": return VimResult(handled: true, actions: [.toggleFileTree])
+                case "v":
+                    if isBlockwise {
+                        mode = .normal
+                        visualAnchor = nil
+                        visualBlockDollar = false
+                        goalColumn = nil
+                        selectionStack.removeAll()
+                        return VimResult(handled: true, cursor: cursor, clearVisual: true)
+                    } else {
+                        mode = .visualBlock
+                        visualBlockDollar = false
+                        goalColumn = nil
+                        return VimResult(handled: true, cursor: cursor, visualRange: makeVisualRange(anchor: anchor, head: cursor))
+                    }
                 default: return .ignored
                 }
             }
@@ -1316,6 +1586,7 @@ final class VimEngine {
 
         let count = effectiveCount()
         let explicit = explicitCount()
+        let isBlockwise = mode.isVisualBlock
 
         // ~/.ideavimrc:64-73 visual surround shortcuts!
         // xmap " S", xmap ' S', xmap ` S`, xmap [ S[, xmap ( S(, xmap { S{, xmap } S}, xmap ] S], xmap ) S)
@@ -1330,32 +1601,64 @@ final class VimEngine {
             clearPending()
             pendingPrefix = .visualSurround
             return VimResult(handled: true)
+        case "r":
+            clearPending()
+            pendingPrefix = .replaceChar
+            return VimResult(handled: true)
         case "v":
             clearPending()
-            if linewise {
-                mode = .visual
-                return VimResult(handled: true, cursor: cursor, visualRange: VimVisualRange(anchor: anchor, head: cursor, linewise: false))
-            } else {
+            visualBlockDollar = false
+            if mode == .visual {
                 mode = .normal
                 visualAnchor = nil
+                goalColumn = nil
                 selectionStack.removeAll()
                 return VimResult(handled: true, cursor: cursor, clearVisual: true)
+            } else {
+                mode = .visual
+                goalColumn = nil
+                return VimResult(handled: true, cursor: cursor, visualRange: makeVisualRange(anchor: anchor, head: cursor))
             }
         case "V":
             clearPending()
-            if !linewise {
-                mode = .visualLine
-                return VimResult(handled: true, cursor: cursor, visualRange: VimVisualRange(anchor: anchor, head: cursor, linewise: true))
-            } else {
+            visualBlockDollar = false
+            if mode == .visualLine {
                 mode = .normal
                 visualAnchor = nil
+                goalColumn = nil
                 selectionStack.removeAll()
                 return VimResult(handled: true, cursor: cursor, clearVisual: true)
+            } else {
+                mode = .visualLine
+                goalColumn = nil
+                return VimResult(handled: true, cursor: cursor, visualRange: makeVisualRange(anchor: anchor, head: cursor))
             }
         case "o":
             clearPending()
             visualAnchor = cursor
-            return VimResult(handled: true, cursor: anchor, visualRange: VimVisualRange(anchor: cursor, head: anchor, linewise: linewise))
+            goalColumn = nil
+            return VimResult(handled: true, cursor: anchor, visualRange: makeVisualRange(anchor: cursor, head: anchor))
+        case "O":
+            clearPending()
+            goalColumn = nil
+            if isBlockwise {
+                visualBlockDollar = false
+                let newAnchor = clampPos(TextPosition(row: anchor.row, column: cursor.column), in: context.lines, allowPastEnd: false)
+                let newHead = clampPos(TextPosition(row: cursor.row, column: anchor.column), in: context.lines, allowPastEnd: false)
+                visualAnchor = newAnchor
+                return VimResult(handled: true, cursor: newHead, visualRange: makeVisualRange(anchor: newAnchor, head: newHead))
+            } else {
+                visualAnchor = cursor
+                return VimResult(handled: true, cursor: anchor, visualRange: makeVisualRange(anchor: cursor, head: anchor))
+            }
+        case "I":
+            clearPending()
+            guard isBlockwise else { return VimResult(handled: true) }
+            return applyVisualBlockInsert(append: false, anchor: anchor, head: cursor, context: context)
+        case "A":
+            clearPending()
+            guard isBlockwise else { return VimResult(handled: true) }
+            return applyVisualBlockInsert(append: true, anchor: anchor, head: cursor, context: context)
         case "i", "a":
             clearPending()
             pendingPrefix = .textObject(inner: ch == "i")
@@ -1381,6 +1684,7 @@ final class VimEngine {
             return VimResult(handled: true)
         case ":":
             clearPending()
+            visualBlockDollar = false
             mode = .commandLine(prefix: ":", buffer: "")
             return VimResult(handled: true)
 
@@ -1388,18 +1692,42 @@ final class VimEngine {
         case "y":
             clearPending()
             return applyVisualYank(anchor: anchor, head: cursor, linewise: linewise, context: context)
+        case "Y":
+            clearPending()
+            return applyVisualYank(anchor: anchor, head: cursor, linewise: true, context: context)
         case "d", "x":
             clearPending()
             return applyVisualDelete(anchor: anchor, head: cursor, linewise: linewise, enterInsert: false, context: context)
+        case "X":
+            clearPending()
+            return applyVisualDelete(anchor: anchor, head: cursor, linewise: true, enterInsert: false, context: context)
+        case "D":
+            clearPending()
+            if isBlockwise {
+                return applyVisualBlockDelete(anchor: anchor, head: cursor, enterInsert: false, toEndOfLine: true, context: context)
+            }
+            return applyVisualDelete(anchor: anchor, head: cursor, linewise: true, enterInsert: false, context: context)
         case "c", "s":
             clearPending()
             return applyVisualDelete(anchor: anchor, head: cursor, linewise: linewise, enterInsert: true, context: context)
+        case "C":
+            clearPending()
+            if isBlockwise {
+                return applyVisualBlockDelete(anchor: anchor, head: cursor, enterInsert: true, toEndOfLine: true, context: context)
+            }
+            return applyVisualDelete(anchor: anchor, head: cursor, linewise: true, enterInsert: true, context: context)
         case ">":
             clearPending()
+            if isBlockwise {
+                return applyVisualBlockIndent(anchor: anchor, head: cursor, outdent: false, context: context)
+            }
             mode = .normal; visualAnchor = nil; selectionStack.removeAll()
             return applyIndent(firstRow: min(anchor.row, cursor.row), lastRow: max(anchor.row, cursor.row), outdent: false, context: context, recordDot: false)
         case "<":
             clearPending()
+            if isBlockwise {
+                return applyVisualBlockIndent(anchor: anchor, head: cursor, outdent: true, context: context)
+            }
             mode = .normal; visualAnchor = nil; selectionStack.removeAll()
             return applyIndent(firstRow: min(anchor.row, cursor.row), lastRow: max(anchor.row, cursor.row), outdent: true, context: context, recordDot: false)
         case "~":
@@ -1423,8 +1751,20 @@ final class VimEngine {
             clearPending()
             let maxRow = max(0, context.lines.count - 1)
             let row = explicit.map { max(0, min($0 - 1, maxRow)) } ?? maxRow
-            let target = TextPosition(row: row, column: firstNonBlank(in: context.lines, row: row))
-            return VimResult(handled: true, cursor: target, visualRange: VimVisualRange(anchor: anchor, head: target, linewise: linewise))
+            let target: TextPosition
+            if isBlockwise {
+                if visualBlockDollar {
+                    goalColumn = nil
+                    target = TextPosition(row: row, column: lastCharCol(in: context.lines, row: row))
+                } else {
+                    let gCol = goalColumn ?? cursor.column
+                    goalColumn = gCol
+                    target = TextPosition(row: row, column: min(gCol, lastCharCol(in: context.lines, row: row)))
+                }
+            } else {
+                target = TextPosition(row: row, column: firstNonBlank(in: context.lines, row: row))
+            }
+            return VimResult(handled: true, cursor: target, visualRange: makeVisualRange(anchor: anchor, head: target))
 
         default:
             clearPending()
@@ -1439,10 +1779,25 @@ final class VimEngine {
         guard let outcome = evaluateMotion(motion, count: count, from: cursor, in: lines, forOperator: false) else {
             return VimResult(handled: true)
         }
+        var target = outcome.target
+        if mode.isVisualBlock {
+            switch motion {
+            case .lineEnd:
+                visualBlockDollar = true
+                goalColumn = nil
+            case .up, .down:
+                if visualBlockDollar {
+                    goalColumn = nil
+                    target = TextPosition(row: target.row, column: lastCharCol(in: lines, row: target.row))
+                }
+            default:
+                visualBlockDollar = false
+            }
+        }
         return VimResult(
             handled: true,
-            cursor: outcome.target,
-            visualRange: VimVisualRange(anchor: anchor, head: outcome.target, linewise: linewise)
+            cursor: target,
+            visualRange: makeVisualRange(anchor: anchor, head: target)
         )
     }
 
@@ -2562,6 +2917,41 @@ final class VimEngine {
         guard !reg.text.isEmpty else { return VimResult(handled: true) }
         if recordDot { lastChange = .put(after: after, count: count) }
 
+        if reg.blockwise {
+            let blockLines = TextEditing.lines(of: reg.text).map { String(repeating: $0, count: count) }
+            guard !blockLines.isEmpty else { return VimResult(handled: true) }
+            let len = lineLength(context.lines, cursor.row)
+            let insertCol = after && len > 0 ? nextCharCol(in: context.lines, row: cursor.row, col: cursor.column) : cursor.column
+            var edits: [VimTextEdit] = []
+
+            let lastExistingRow = context.lines.count - 1
+            let neededLastRow = cursor.row + blockLines.count - 1
+            if neededLastRow > lastExistingRow {
+                let overflowStart = lastExistingRow - cursor.row + 1
+                let pad = String(repeating: " ", count: insertCol)
+                let extra = blockLines[overflowStart...].map { pad + $0 }.joined(separator: "\n")
+                let endPos = TextPosition(row: lastExistingRow, column: lineLength(context.lines, lastExistingRow))
+                edits.append(VimTextEdit(from: endPos, to: endPos, text: "\n" + extra))
+            }
+
+            let existingEnd = min(lastExistingRow, neededLastRow)
+            for r in stride(from: existingEnd, through: cursor.row, by: -1) {
+                let piece = blockLines[r - cursor.row]
+                let rowLen = lineLength(context.lines, r)
+                if rowLen < insertCol {
+                    let pad = String(repeating: " ", count: insertCol - rowLen)
+                    let pos = TextPosition(row: r, column: rowLen)
+                    edits.append(VimTextEdit(from: pos, to: pos, text: pad + piece))
+                } else {
+                    let ns = context.lines[r] as NSString
+                    let col = insertCol < ns.length ? ns.rangeOfComposedCharacterSequence(at: insertCol).location : rowLen
+                    let pos = TextPosition(row: r, column: col)
+                    edits.append(VimTextEdit(from: pos, to: pos, text: piece))
+                }
+            }
+            return VimResult(handled: true, edits: edits, cursor: TextPosition(row: cursor.row, column: insertCol))
+        }
+
         if reg.linewise {
             var body = reg.text
             if body.hasSuffix("\n") { body.removeLast() }
@@ -2758,19 +3148,27 @@ final class VimEngine {
     }
 
     private func applyVisualYank(anchor: TextPosition, head: TextPosition, linewise: Bool, context: VimContext) -> VimResult {
+        if mode.isVisualBlock {
+            return applyVisualBlockYank(anchor: anchor, head: head, context: context)
+        }
         let (from, to) = visualBounds(anchor: anchor, head: head, linewise: linewise, lines: context.lines)
         var text = TextEditing.text(context.lines, from: from, to: to)
         if linewise { text += "\n" }
         setRegister(text, linewise: linewise)
         mode = .normal
         visualAnchor = nil
+        visualBlockDollar = false
         selectionStack.removeAll()
         return VimResult(handled: true, cursor: from, clearVisual: true)
     }
 
     private func applyVisualDelete(anchor: TextPosition, head: TextPosition, linewise: Bool, enterInsert: Bool, context: VimContext) -> VimResult {
+        if mode.isVisualBlock && !linewise {
+            return applyVisualBlockDelete(anchor: anchor, head: head, enterInsert: enterInsert, toEndOfLine: false, context: context)
+        }
         mode = .normal
         visualAnchor = nil
+        visualBlockDollar = false
         selectionStack.removeAll()
         guard context.isEditable else { return VimResult(handled: true, clearVisual: true, actions: [.readOnlyNotice]) }
 
@@ -2793,8 +3191,12 @@ final class VimEngine {
     }
 
     private func applyVisualToggleCase(anchor: TextPosition, head: TextPosition, linewise: Bool, context: VimContext) -> VimResult {
+        if mode.isVisualBlock {
+            return applyVisualBlockToggleCase(anchor: anchor, head: head, context: context)
+        }
         mode = .normal
         visualAnchor = nil
+        visualBlockDollar = false
         selectionStack.removeAll()
         guard context.isEditable else { return VimResult(handled: true, clearVisual: true, actions: [.readOnlyNotice]) }
         let (from, to) = visualBounds(anchor: anchor, head: head, linewise: linewise, lines: context.lines)
@@ -2804,8 +3206,12 @@ final class VimEngine {
     }
 
     private func applyVisualPut(anchor: TextPosition, head: TextPosition, linewise: Bool, context: VimContext) -> VimResult {
+        if mode.isVisualBlock {
+            return applyVisualBlockPut(anchor: anchor, head: head, context: context)
+        }
         mode = .normal
         visualAnchor = nil
+        visualBlockDollar = false
         selectionStack.removeAll()
         guard context.isEditable else { return VimResult(handled: true, clearVisual: true, actions: [.readOnlyNotice]) }
         let reg = currentRegister()
@@ -2831,8 +3237,12 @@ final class VimEngine {
     }
 
     private func applyVisualSurround(pair: (open: String, close: String), anchor: TextPosition, head: TextPosition, linewise: Bool, context: VimContext) -> VimResult {
+        if mode.isVisualBlock {
+            return applyVisualBlockSurround(pair: pair, anchor: anchor, head: head, context: context)
+        }
         mode = .normal
         visualAnchor = nil
+        visualBlockDollar = false
         selectionStack.removeAll()
         guard context.isEditable else { return VimResult(handled: true, clearVisual: true, actions: [.readOnlyNotice]) }
 
@@ -2851,6 +3261,397 @@ final class VimEngine {
             cursor: from,
             clearVisual: true
         )
+    }
+
+    // MARK: Visual Block Operations
+
+    private func composedCharacterCount(in ns: NSString, range: Range<Int>) -> Int {
+        var count = 0
+        var pos = range.lowerBound
+        while pos < range.upperBound {
+            let next = TextEditing.characterBoundary(in: ns, from: pos, forward: true)
+            if next <= pos { break }
+            count += 1
+            pos = next
+        }
+        return count
+    }
+
+    private func applyVisualReplaceChar(_ ch: String, anchor: TextPosition, head: TextPosition, context: VimContext) -> VimResult {
+        let isLinewise = mode.isVisualLine
+        let isBlockwise = mode.isVisualBlock
+        let bounds = isBlockwise ? blockColumnBounds(anchor: anchor, head: head) : nil
+        mode = .normal
+        visualAnchor = nil
+        visualBlockDollar = false
+        selectionStack.removeAll()
+        guard context.isEditable else { return VimResult(handled: true, clearVisual: true, actions: [.readOnlyNotice]) }
+
+        if isBlockwise, let bounds {
+            let firstRow = min(anchor.row, head.row)
+            let lastRow = max(anchor.row, head.row)
+            var edits: [VimTextEdit] = []
+            for r in stride(from: lastRow, through: firstRow, by: -1) {
+                guard let range = blockRowRange(row: r, startCol: bounds.startCol, endCol: bounds.endCol, extendToEnd: bounds.extendToEnd, lines: context.lines) else {
+                    continue
+                }
+                let charCount = composedCharacterCount(in: context.lines[r] as NSString, range: range)
+                guard charCount > 0 else { continue }
+                edits.append(VimTextEdit(
+                    from: TextPosition(row: r, column: range.lowerBound),
+                    to: TextPosition(row: r, column: range.upperBound),
+                    text: String(repeating: ch, count: charCount)
+                ))
+            }
+            let cursorCol = min(bounds.startCol, lastCharCol(in: context.lines, row: firstRow))
+            return VimResult(handled: true, edits: edits, cursor: TextPosition(row: firstRow, column: cursorCol), clearVisual: true)
+        }
+
+        let (from, to) = visualBounds(anchor: anchor, head: head, linewise: isLinewise, lines: context.lines)
+        var edits: [VimTextEdit] = []
+        for r in stride(from: to.row, through: from.row, by: -1) {
+            let len = lineLength(context.lines, r)
+            let startCol = isLinewise ? 0 : (r == from.row ? min(from.column, len) : 0)
+            let endCol = isLinewise ? len : (r == to.row ? min(to.column, len) : len)
+            guard startCol < endCol else { continue }
+            let charCount = composedCharacterCount(in: context.lines[r] as NSString, range: startCol..<endCol)
+            guard charCount > 0 else { continue }
+            edits.append(VimTextEdit(
+                from: TextPosition(row: r, column: startCol),
+                to: TextPosition(row: r, column: endCol),
+                text: String(repeating: ch, count: charCount)
+            ))
+        }
+        return VimResult(handled: true, edits: edits, cursor: from, clearVisual: true)
+    }
+
+    private func applyVisualBlockInsert(append: Bool, anchor: TextPosition, head: TextPosition, context: VimContext) -> VimResult {
+        let bounds = blockColumnBounds(anchor: anchor, head: head)
+        mode = .normal
+        visualAnchor = nil
+        visualBlockDollar = false
+        selectionStack.removeAll()
+        guard context.isEditable else { return VimResult(handled: true, clearVisual: true, actions: [.readOnlyNotice]) }
+
+        let firstRow = min(anchor.row, head.row)
+        let lastRow = max(anchor.row, head.row)
+
+        if !append {
+            let anchorEditRow = (firstRow...lastRow).first { lineLength(context.lines, $0) >= bounds.startCol } ?? firstRow
+            let line = context.lines[anchorEditRow]
+            let ns = line as NSString
+            let rawCol = min(bounds.startCol, ns.length)
+            let insertCol = rawCol < ns.length ? ns.rangeOfComposedCharacterSequence(at: rawCol).location : rawCol
+            pendingBlockEdit = BlockInsertSession(
+                topRow: firstRow,
+                bottomRow: lastRow,
+                anchorEditRow: anchorEditRow,
+                insertColumn: insertCol,
+                appendToEOL: false,
+                padShortLines: false,
+                initialPrefix: ns.substring(to: insertCol),
+                initialSuffix: ns.substring(from: insertCol)
+            )
+            activeInsert = ActiveInsertRecording(buildDot: { .insert(kind: .i, inserted: $0) })
+            mode = .insert
+            inputSource.restoreRememberedInputSource()
+            return VimResult(handled: true, cursor: TextPosition(row: anchorEditRow, column: insertCol), clearVisual: true, enteredInsert: true)
+        }
+
+        if bounds.extendToEnd {
+            let anchorEditRow = firstRow
+            let line = context.lines[anchorEditRow]
+            let eol = (line as NSString).length
+            pendingBlockEdit = BlockInsertSession(
+                topRow: firstRow,
+                bottomRow: lastRow,
+                anchorEditRow: anchorEditRow,
+                insertColumn: eol,
+                appendToEOL: true,
+                padShortLines: false,
+                initialPrefix: line,
+                initialSuffix: ""
+            )
+            activeInsert = ActiveInsertRecording(buildDot: { .insert(kind: .A, inserted: $0) })
+            mode = .insert
+            inputSource.restoreRememberedInputSource()
+            return VimResult(handled: true, cursor: TextPosition(row: anchorEditRow, column: eol), clearVisual: true, enteredInsert: true)
+        }
+
+        let refRow = (firstRow...lastRow).first { bounds.endCol < lineLength(context.lines, $0) }
+        var targetCol = refRow.map { nextCharCol(in: context.lines, row: $0, col: bounds.endCol) } ?? (bounds.endCol + 1)
+        let anchorEditRow = firstRow
+        let firstLine = context.lines[anchorEditRow]
+        let firstNS = firstLine as NSString
+        var edits: [VimTextEdit] = []
+        let initialPrefix: String
+        let initialSuffix: String
+        if firstNS.length < targetCol {
+            let pad = String(repeating: " ", count: targetCol - firstNS.length)
+            let padPos = TextPosition(row: anchorEditRow, column: firstNS.length)
+            edits.append(VimTextEdit(from: padPos, to: padPos, text: pad))
+            initialPrefix = firstLine + pad
+            initialSuffix = ""
+        } else {
+            if targetCol < firstNS.length {
+                targetCol = firstNS.rangeOfComposedCharacterSequence(at: targetCol).location
+            }
+            initialPrefix = firstNS.substring(to: targetCol)
+            initialSuffix = firstNS.substring(from: targetCol)
+        }
+
+        pendingBlockEdit = BlockInsertSession(
+            topRow: firstRow,
+            bottomRow: lastRow,
+            anchorEditRow: anchorEditRow,
+            insertColumn: targetCol,
+            appendToEOL: false,
+            padShortLines: true,
+            initialPrefix: initialPrefix,
+            initialSuffix: initialSuffix
+        )
+        activeInsert = ActiveInsertRecording(buildDot: { .insert(kind: .A, inserted: $0) })
+        mode = .insert
+        inputSource.restoreRememberedInputSource()
+        return VimResult(handled: true, edits: edits, cursor: TextPosition(row: anchorEditRow, column: targetCol), clearVisual: true, enteredInsert: true)
+    }
+
+    private func applyVisualBlockYank(anchor: TextPosition, head: TextPosition, context: VimContext) -> VimResult {
+        let bounds = blockColumnBounds(anchor: anchor, head: head)
+        let firstRow = min(anchor.row, head.row)
+        let lastRow = max(anchor.row, head.row)
+        var slices: [String] = []
+        for r in firstRow...lastRow {
+            if let range = blockRowRange(row: r, startCol: bounds.startCol, endCol: bounds.endCol, extendToEnd: bounds.extendToEnd, lines: context.lines) {
+                slices.append((context.lines[r] as NSString).substring(with: NSRange(location: range.lowerBound, length: range.count)))
+            } else {
+                slices.append("")
+            }
+        }
+        setRegister(slices.joined(separator: "\n"), linewise: false, blockwise: true)
+        mode = .normal
+        visualAnchor = nil
+        visualBlockDollar = false
+        selectionStack.removeAll()
+        return VimResult(handled: true, cursor: TextPosition(row: firstRow, column: min(bounds.startCol, lastCharCol(in: context.lines, row: firstRow))), clearVisual: true)
+    }
+
+    private func applyVisualBlockDelete(anchor: TextPosition, head: TextPosition, enterInsert: Bool, toEndOfLine: Bool, context: VimContext) -> VimResult {
+        let bounds = blockColumnBounds(anchor: anchor, head: head)
+        let extendToEnd = toEndOfLine || bounds.extendToEnd
+        mode = .normal
+        visualAnchor = nil
+        visualBlockDollar = false
+        selectionStack.removeAll()
+        guard context.isEditable else { return VimResult(handled: true, clearVisual: true, actions: [.readOnlyNotice]) }
+
+        let firstRow = min(anchor.row, head.row)
+        let lastRow = max(anchor.row, head.row)
+        var slices: [String] = []
+        for r in firstRow...lastRow {
+            if let range = blockRowRange(row: r, startCol: bounds.startCol, endCol: bounds.endCol, extendToEnd: extendToEnd, lines: context.lines) {
+                slices.append((context.lines[r] as NSString).substring(with: NSRange(location: range.lowerBound, length: range.count)))
+            } else {
+                slices.append("")
+            }
+        }
+        setRegister(slices.joined(separator: "\n"), linewise: false, blockwise: true)
+
+        var edits: [VimTextEdit] = []
+        for r in stride(from: lastRow, through: firstRow, by: -1) {
+            guard let range = blockRowRange(row: r, startCol: bounds.startCol, endCol: bounds.endCol, extendToEnd: extendToEnd, lines: context.lines) else {
+                continue
+            }
+            edits.append(VimTextEdit(
+                from: TextPosition(row: r, column: range.lowerBound),
+                to: TextPosition(row: r, column: range.upperBound),
+                text: ""
+            ))
+        }
+
+        if enterInsert {
+            let anchorEditRow = (firstRow...lastRow).first {
+                blockRowRange(row: $0, startCol: bounds.startCol, endCol: bounds.endCol, extendToEnd: extendToEnd, lines: context.lines) != nil
+            } ?? ((firstRow...lastRow).first { lineLength(context.lines, $0) >= bounds.startCol } ?? firstRow)
+
+            let anchorNS = context.lines[anchorEditRow] as NSString
+            let initialPrefix: String
+            let initialSuffix: String
+            let insertCol: Int
+            if let range = blockRowRange(row: anchorEditRow, startCol: bounds.startCol, endCol: bounds.endCol, extendToEnd: extendToEnd, lines: context.lines) {
+                initialPrefix = anchorNS.substring(to: range.lowerBound)
+                initialSuffix = anchorNS.substring(from: range.upperBound)
+                insertCol = range.lowerBound
+            } else {
+                let rawCol = min(bounds.startCol, anchorNS.length)
+                insertCol = rawCol < anchorNS.length ? anchorNS.rangeOfComposedCharacterSequence(at: rawCol).location : rawCol
+                initialPrefix = anchorNS.substring(to: insertCol)
+                initialSuffix = anchorNS.substring(from: insertCol)
+            }
+            pendingBlockEdit = BlockInsertSession(
+                topRow: firstRow,
+                bottomRow: lastRow,
+                anchorEditRow: anchorEditRow,
+                insertColumn: insertCol,
+                appendToEOL: false,
+                padShortLines: false,
+                initialPrefix: initialPrefix,
+                initialSuffix: initialSuffix
+            )
+            activeInsert = ActiveInsertRecording(buildDot: { .insert(kind: .i, inserted: $0) })
+            mode = .insert
+            inputSource.restoreRememberedInputSource()
+            return VimResult(handled: true, edits: edits, cursor: TextPosition(row: anchorEditRow, column: insertCol), clearVisual: true, enteredInsert: true)
+        }
+
+        let firstLenAfter: Int
+        if let firstRange = blockRowRange(row: firstRow, startCol: bounds.startCol, endCol: bounds.endCol, extendToEnd: extendToEnd, lines: context.lines) {
+            firstLenAfter = lineLength(context.lines, firstRow) - firstRange.count
+        } else {
+            firstLenAfter = lineLength(context.lines, firstRow)
+        }
+        let afterCol = min(bounds.startCol, max(0, firstLenAfter - 1))
+        return VimResult(handled: true, edits: edits, cursor: TextPosition(row: firstRow, column: afterCol), clearVisual: true)
+    }
+
+    private func applyVisualBlockToggleCase(anchor: TextPosition, head: TextPosition, context: VimContext) -> VimResult {
+        let bounds = blockColumnBounds(anchor: anchor, head: head)
+        mode = .normal
+        visualAnchor = nil
+        visualBlockDollar = false
+        selectionStack.removeAll()
+        guard context.isEditable else { return VimResult(handled: true, clearVisual: true, actions: [.readOnlyNotice]) }
+
+        let firstRow = min(anchor.row, head.row)
+        let lastRow = max(anchor.row, head.row)
+        var edits: [VimTextEdit] = []
+        for r in stride(from: lastRow, through: firstRow, by: -1) {
+            guard let range = blockRowRange(row: r, startCol: bounds.startCol, endCol: bounds.endCol, extendToEnd: bounds.extendToEnd, lines: context.lines) else {
+                continue
+            }
+            let original = (context.lines[r] as NSString).substring(with: NSRange(location: range.lowerBound, length: range.count))
+            edits.append(VimTextEdit(
+                from: TextPosition(row: r, column: range.lowerBound),
+                to: TextPosition(row: r, column: range.upperBound),
+                text: toggleCaseString(original)
+            ))
+        }
+        return VimResult(handled: true, edits: edits, cursor: TextPosition(row: firstRow, column: min(bounds.startCol, lastCharCol(in: context.lines, row: firstRow))), clearVisual: true)
+    }
+
+    private func applyVisualBlockPut(anchor: TextPosition, head: TextPosition, context: VimContext) -> VimResult {
+        let bounds = blockColumnBounds(anchor: anchor, head: head)
+        mode = .normal
+        visualAnchor = nil
+        visualBlockDollar = false
+        selectionStack.removeAll()
+        guard context.isEditable else { return VimResult(handled: true, clearVisual: true, actions: [.readOnlyNotice]) }
+
+        let firstRow = min(anchor.row, head.row)
+        let lastRow = max(anchor.row, head.row)
+        let reg = currentRegister()
+        let blockLines = reg.blockwise ? TextEditing.lines(of: reg.text) : []
+
+        var replacedSlices: [String] = []
+        for r in firstRow...lastRow {
+            if let range = blockRowRange(row: r, startCol: bounds.startCol, endCol: bounds.endCol, extendToEnd: bounds.extendToEnd, lines: context.lines) {
+                replacedSlices.append((context.lines[r] as NSString).substring(with: NSRange(location: range.lowerBound, length: range.count)))
+            } else {
+                replacedSlices.append("")
+            }
+        }
+
+        var edits: [VimTextEdit] = []
+        for r in stride(from: lastRow, through: firstRow, by: -1) {
+            let idx = r - firstRow
+            let insertion = reg.blockwise ? (idx < blockLines.count ? blockLines[idx] : "") : reg.text
+            if let range = blockRowRange(row: r, startCol: bounds.startCol, endCol: bounds.endCol, extendToEnd: bounds.extendToEnd, lines: context.lines) {
+                edits.append(VimTextEdit(
+                    from: TextPosition(row: r, column: range.lowerBound),
+                    to: TextPosition(row: r, column: range.upperBound),
+                    text: insertion
+                ))
+            } else if lineLength(context.lines, r) >= bounds.startCol {
+                let pos = TextPosition(row: r, column: bounds.startCol)
+                edits.append(VimTextEdit(from: pos, to: pos, text: insertion))
+            }
+        }
+        setRegister(replacedSlices.joined(separator: "\n"), linewise: false, blockwise: true)
+        return VimResult(handled: true, edits: edits, cursor: TextPosition(row: firstRow, column: min(bounds.startCol, lastCharCol(in: context.lines, row: firstRow))), clearVisual: true)
+    }
+
+    private func applyVisualBlockIndent(anchor: TextPosition, head: TextPosition, outdent: Bool, context: VimContext) -> VimResult {
+        let bounds = blockColumnBounds(anchor: anchor, head: head)
+        let firstRow = min(anchor.row, head.row)
+        let lastRow = max(anchor.row, head.row)
+        mode = .normal
+        visualAnchor = nil
+        visualBlockDollar = false
+        selectionStack.removeAll()
+        if bounds.startCol == 0 {
+            return applyIndent(firstRow: firstRow, lastRow: lastRow, outdent: outdent, context: context, recordDot: false)
+        }
+        guard context.isEditable else { return VimResult(handled: true, clearVisual: true, actions: [.readOnlyNotice]) }
+
+        let unit = context.indentUnit
+        let width = unit == "\t" ? 4 : max(1, unit.utf16.count)
+        var edits: [VimTextEdit] = []
+        for r in stride(from: lastRow, through: firstRow, by: -1) {
+            let ns = context.lines[r] as NSString
+            guard ns.length >= bounds.startCol else { continue }
+            let col = bounds.startCol < ns.length ? ns.rangeOfComposedCharacterSequence(at: bounds.startCol).location : ns.length
+            if outdent {
+                guard col < ns.length else { continue }
+                var remove = 0
+                if ns.character(at: col) == 9 {
+                    remove = 1
+                } else {
+                    while remove < width && col + remove < ns.length && ns.character(at: col + remove) == 32 {
+                        remove += 1
+                    }
+                }
+                guard remove > 0 else { continue }
+                edits.append(VimTextEdit(
+                    from: TextPosition(row: r, column: col),
+                    to: TextPosition(row: r, column: col + remove),
+                    text: ""
+                ))
+            } else {
+                let pos = TextPosition(row: r, column: col)
+                edits.append(VimTextEdit(from: pos, to: pos, text: unit))
+            }
+        }
+        return VimResult(
+            handled: true,
+            edits: edits,
+            cursor: TextPosition(row: firstRow, column: min(bounds.startCol, lastCharCol(in: context.lines, row: firstRow))),
+            clearVisual: true
+        )
+    }
+
+    private func applyVisualBlockSurround(pair: (open: String, close: String), anchor: TextPosition, head: TextPosition, context: VimContext) -> VimResult {
+        let bounds = blockColumnBounds(anchor: anchor, head: head)
+        mode = .normal
+        visualAnchor = nil
+        visualBlockDollar = false
+        selectionStack.removeAll()
+        guard context.isEditable else { return VimResult(handled: true, clearVisual: true, actions: [.readOnlyNotice]) }
+
+        let firstRow = min(anchor.row, head.row)
+        let lastRow = max(anchor.row, head.row)
+        var edits: [VimTextEdit] = []
+        for r in stride(from: lastRow, through: firstRow, by: -1) {
+            guard let range = blockRowRange(row: r, startCol: bounds.startCol, endCol: bounds.endCol, extendToEnd: bounds.extendToEnd, lines: context.lines) else {
+                continue
+            }
+            let slice = (context.lines[r] as NSString).substring(with: NSRange(location: range.lowerBound, length: range.count))
+            edits.append(VimTextEdit(
+                from: TextPosition(row: r, column: range.lowerBound),
+                to: TextPosition(row: r, column: range.upperBound),
+                text: pair.open + slice + pair.close
+            ))
+        }
+        return VimResult(handled: true, edits: edits, cursor: TextPosition(row: firstRow, column: min(bounds.startCol, lastCharCol(in: context.lines, row: firstRow))), clearVisual: true)
     }
 
     // MARK: Expand / Shrink Selection (`<CR>` / `<BS>`)
@@ -2883,8 +3684,9 @@ final class VimEngine {
 
         mode = .visual
         visualAnchor = best.from
+        visualBlockDollar = false
         let head = inclusiveEndPosition(from: best.from, exclusiveEnd: best.to, in: context.lines)
-        return VimResult(handled: true, cursor: head, visualRange: VimVisualRange(anchor: best.from, head: head, linewise: false))
+        return VimResult(handled: true, cursor: head, visualRange: makeVisualRange(anchor: best.from, head: head))
     }
 
     private func performShrinkSelection(in context: VimContext) -> VimResult {
@@ -2892,6 +3694,7 @@ final class VimEngine {
             if mode.isVisual {
                 mode = .normal
                 visualAnchor = nil
+                visualBlockDollar = false
                 return VimResult(handled: true, cursor: context.cursor, clearVisual: true)
             }
             return VimResult(handled: true)
@@ -2899,11 +3702,13 @@ final class VimEngine {
         if prev.wasNormal {
             mode = .normal
             visualAnchor = nil
+            visualBlockDollar = false
             return VimResult(handled: true, cursor: prev.head, clearVisual: true)
         }
         mode = .visual
         visualAnchor = prev.anchor
-        return VimResult(handled: true, cursor: prev.head, visualRange: VimVisualRange(anchor: prev.anchor, head: prev.head, linewise: false))
+        visualBlockDollar = false
+        return VimResult(handled: true, cursor: prev.head, visualRange: makeVisualRange(anchor: prev.anchor, head: prev.head))
     }
 
     private func expansionCandidates(from: TextPosition, to: TextPosition, in lines: [String]) -> [(from: TextPosition, to: TextPosition)] {
@@ -3059,15 +3864,28 @@ final class VimEngine {
         let step = max(1, fullPage ? max(1, context.visibleLineCount - 2) : max(1, context.visibleLineCount / 2))
         let lastRow = max(0, context.lines.count - 1)
         let row = down ? min(lastRow, cursor.row + step) : max(0, cursor.row - step)
-        let target = TextPosition(row: row, column: min(cursor.column, lastCharCol(in: context.lines, row: row)))
+        let col: Int
+        if mode.isVisualBlock {
+            if visualBlockDollar {
+                goalColumn = nil
+                col = lastCharCol(in: context.lines, row: row)
+            } else {
+                let gCol = goalColumn ?? cursor.column
+                goalColumn = gCol
+                col = min(gCol, lastCharCol(in: context.lines, row: row))
+            }
+        } else {
+            col = min(cursor.column, lastCharCol(in: context.lines, row: row))
+        }
+        let target = TextPosition(row: row, column: col)
         let action: VimAction = fullPage ? .scrollFullPage(down: down) : .scrollHalfPage(down: down)
-        return VimResult(handled: true, cursor: target, visualRange: VimVisualRange(anchor: anchor, head: target, linewise: linewise), actions: [action])
+        return VimResult(handled: true, cursor: target, visualRange: makeVisualRange(anchor: anchor, head: target), actions: [action])
     }
 
     // MARK: Register & Clipboard (`set clipboard+=unnamed`)
 
-    private func setRegister(_ text: String, linewise: Bool) {
-        register = VimRegister(text: text, linewise: linewise)
+    private func setRegister(_ text: String, linewise: Bool, blockwise: Bool = false) {
+        register = VimRegister(text: text, linewise: linewise, blockwise: blockwise)
         writeClipboard(text)
     }
 

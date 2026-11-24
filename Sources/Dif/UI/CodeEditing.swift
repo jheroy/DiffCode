@@ -449,6 +449,7 @@ extension CodeCanvasView: @preconcurrency NSTextInputClient {
     // MARK: Clipboard
 
     @objc func cut(_ sender: Any?) {
+        if vimModeEnabled && vimEngine.mode.isCommandLine { NSSound.beep(); return }
         guard editor != nil, let sel = editSelection else { NSSound.beep(); return }
         commitComposition()
         if sel.anchor == sel.head {
@@ -467,10 +468,20 @@ extension CodeCanvasView: @preconcurrency NSTextInputClient {
     }
 
     @objc func paste(_ sender: Any?) {
+        if vimModeEnabled && vimEngine.mode.isCommandLine {
+            guard let text = pasteboard.string(forType: .string), !text.isEmpty else { return }
+            if vimEngine.pasteIntoCommandLine(text) {
+                reportVimStateIfNeeded(force: true)
+            }
+            return
+        }
         guard editor != nil, editSelection != nil else { NSSound.beep(); return }
         guard let text = pasteboard.string(forType: .string), !text.isEmpty else { return }
         commitComposition()
         guard let sel = editSelection else { return }
+        if vimModeEnabled && vimEngine.mode.isInsert {
+            vimEngine.recordInsertedText(text)
+        }
         if let line = lineClipboard, line == text, sel.anchor == sel.head {
             // A line copied whole goes in as a line, above the caret's, and the caret stays on its text.
             let start = TextPosition(row: sel.head.row, column: 0)
@@ -671,6 +682,28 @@ extension CodeCanvasView: @preconcurrency NSTextInputClient {
         applyVimResult(result)
     }
 
+    func vimUpdateCommandLineBuffer(_ text: String) {
+        guard vimModeEnabled else { return }
+        vimEngine.updateCommandLineBuffer(text)
+        reportVimStateIfNeeded()
+    }
+
+    func vimSubmitCommandLine(_ text: String) {
+        guard vimModeEnabled else { return }
+        guard let context = makeVimContext() else {
+            vimCancelCommandLine()
+            return
+        }
+        let result = vimEngine.submitCommandLine(text, context: context)
+        if result.handled { applyVimResult(result) }
+    }
+
+    func vimCancelCommandLine() {
+        guard vimModeEnabled else { return }
+        let result = vimEngine.cancelCommandLine()
+        if result.handled { applyVimResult(result) }
+    }
+
     private func applyVimResult(_ result: VimResult) {
         if let origin = result.jumpOrigin {
             delegate?.canvas(self, recordJumpOrigin: origin)
@@ -704,7 +737,18 @@ extension CodeCanvasView: @preconcurrency NSTextInputClient {
                 let anchor = TextEditing.clamp(vr.anchor, in: lines)
                 let head = TextEditing.clamp(vr.head, in: lines)
                 vimCursor = head
-                if vr.linewise {
+                if vr.blockwise {
+                    selection = TextSelection(
+                        pane: .right,
+                        anchor: rowPosition(anchor),
+                        head: rowPosition(head),
+                        block: TextSelection.Block(
+                            startColumn: vr.blockStartColumn,
+                            endColumn: vr.blockEndColumn,
+                            extendToEnd: vr.blockExtendToEnd
+                        )
+                    )
+                } else if vr.linewise {
                     if head.row >= anchor.row {
                         let startPos = TextPosition(row: anchor.row, column: 0)
                         let endPos = TextPosition(row: head.row, column: lineLength(head.row))
@@ -770,9 +814,16 @@ extension CodeCanvasView: @preconcurrency NSTextInputClient {
 extension CodeCanvasView: NSMenuItemValidation {
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
         switch item.action {
-        case #selector(copy(_:)): return selectedText() != nil || caretLineText() != nil
-        case #selector(cut(_:)): return editSelection != nil
-        case #selector(paste(_:)): return editSelection != nil && pasteboard.availableType(from: [.string]) != nil
+        case #selector(copy(_:)):
+            if vimModeEnabled, case .commandLine(_, let buffer) = vimEngine.mode {
+                return !buffer.isEmpty
+            }
+            return selectedText() != nil || caretLineText() != nil
+        case #selector(cut(_:)):
+            return editSelection != nil && !(vimModeEnabled && vimEngine.mode.isCommandLine)
+        case #selector(paste(_:)):
+            return (editSelection != nil || (vimModeEnabled && vimEngine.mode.isCommandLine))
+                && pasteboard.availableType(from: [.string]) != nil
         default: return true
         }
     }

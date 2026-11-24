@@ -201,6 +201,16 @@ extension AppStore {
                        key: "[", modifiers: .command, separatorBefore: true) { [weak self] in self?.navigateBack() },
             AppCommand(id: "nav.forward", title: L("Navigate Forward", "前进"), symbol: "chevron.right", group: .navigate,
                        key: "]", modifiers: .command) { [weak self] in self?.navigateForward() },
+            AppCommand(id: "nav.implementation", title: L("Go to Implementation", "跳转到实现"), symbol: "arrow.down.right.circle", group: .navigate) { [weak self] in
+                guard let self else { return }
+                let pos = self.viewer.currentCaretPosition()
+                self.goToImplementation(atLine: pos.row, utf16Column: pos.column)
+            },
+            AppCommand(id: "nav.typeDefinition", title: L("Go to Type Definition", "跳转到类型定义"), symbol: "cube", group: .navigate) { [weak self] in
+                guard let self else { return }
+                let pos = self.viewer.currentCaretPosition()
+                self.goToTypeDefinition(atLine: pos.row, utf16Column: pos.column)
+            },
             AppCommand(id: "nav.nextDiff", title: L("Next Difference", "下一处差异"), symbol: "arrow.down", group: .navigate,
                        key: KeyLabel.function(7), separatorBefore: true) { [weak self] in
                 if let merge = self?.mergeSession { merge.stepConflict(1) } else { viewer.stepDifference(1) }
@@ -325,7 +335,7 @@ extension AppStore {
             },
         ]
         .filter { AppEnvironment.hasTerminal || ($0.group != .terminal && $0.id != "view.terminal") }
-        .filter { AppEnvironment.hasLSP || ($0.id != "nav.back" && $0.id != "nav.forward") }
+        .filter { AppEnvironment.hasLSP || ($0.id != "nav.back" && $0.id != "nav.forward" && $0.id != "nav.implementation" && $0.id != "nav.typeDefinition") }
         .filter { !AppEnvironment.isAppStore || $0.id != "view.groups" }
         + editionCommands
     }

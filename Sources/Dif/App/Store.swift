@@ -140,6 +140,7 @@ final class AppStore {
         viewer.onCodeFontChanged = { [weak self] in self?.mergeSession?.applyCodeFont() }
         viewer.onOpenAnnotation = { [weak self] entry in self?.openAnnotation(entry) }
         viewer.onGoToDefinition = { [weak self] line, col in self?.smartLSPNavigate(line: line, character: col) }
+        viewer.onGoToImplementation = { [weak self] line, col in self?.goToImplementation(atLine: line, utf16Column: col) }
         viewer.onVimAction = { [weak self] action, line, col in self?.handleVimAction(action, line: line, column: col) }
         viewer.onRecordJump = { [weak self] line, col in self?.recordJumpOrigin(line0Based: line, column: col) }
         viewer.onWillSwitchFile = { [weak self] previousRequest, line, col in
@@ -159,6 +160,15 @@ final class AppStore {
         fileSymbols.store = self
         selectionHistory.store = self
         restoreCachedAgentModels()
+        applyLSPIdleTimeout()
+    }
+
+    func applyLSPIdleTimeout() {
+        let timeout = settings.lspIdleTimeout.duration
+        let manager = viewer.lspManager
+        Task {
+            await manager.setIdleTimeout(timeout)
+        }
     }
 
     var currentProject: Project? {
@@ -454,10 +464,18 @@ final class AppStore {
                 let folded = ProjectTree.ancestors(of: index, parents: projectParents).map { projects[$0].url.path }
                 if !collapsedProjects.isDisjoint(with: folded) { collapsedProjects.subtract(folded) }
             }
-            openFile(in: file.project, path: file.relativePath, line: file.line, column: file.column)
+            if file.project.isDormant {
+                file.project.isDormant = false
+                file.project.startWatching()
+            }
+            await file.project.refreshAndWait()
+            if let change = file.project.change(forPath: file.relativePath) {
+                showChangeDiff(change, in: file.project, line: file.line, column: file.column)
+            } else {
+                openFile(in: file.project, path: file.relativePath, line: file.line, column: file.column)
+                viewer.focusCanvas()
+            }
             updateDormancy()
-            file.project.refresh()
-            viewer.focusCanvas()
         } else if let ext = landedExternalFile {
             openExternalFile(
                 fileURL: ext.fileURL,
@@ -1318,23 +1336,30 @@ final class AppStore {
         viewer.focusCanvas()
     }
 
-    /// Opens the working-tree diff for `change` (for example from the file tree's context menu).
-    func showChangeDiff(_ change: FileChange, in project: Project) {
+    /// Opens the working-tree diff for `change` (from the file tree's context menu or an external `dif` target).
+    func showChangeDiff(_ change: FileChange, in project: Project, line: Int? = nil, column: Int? = nil) {
         if selectedProjectID != project.id {
             currentProject?.cancelAIGroupGeneration()
+            pendingGroupHunkFocus = nil
             selectedProjectID = project.id
             persistProjects()
         }
         exitExternalFileMode()
         pendingGroupHunkFocus = nil
         project.browsedPath = nil
-        if project.comparison != nil { endComparison(in: project) }
+        if project.comparison != nil { endComparison(in: project, sync: false) }
         if project.tab != .changes { project.tab = .changes }
         for id in ChangeTree.ancestors(of: change.path, in: project.collapsed) { project.collapsed.remove(id) }
         project.selectedChangeID = ChangeRow.fileID(change.path)
         viewer.setBaseStamp(project.status.headOID)
-        show(change, in: project, groupHunks: nil)
+        let request = resolvedRequest(project.request(for: change, ignoreWhitespace: settings.ignoreWhitespace))
+        syncGroupHunkFilter(nil, for: request)
+        if request == viewer.request {
+            viewer.reloadIfStale(base: project.status.headOID)
+        }
+        viewer.open(request, line: line, column: column, preserveScroll: false)
         noteRecent(project, change.path)
+        follow(change.path, in: project)
         viewer.focusCanvas()
     }
 
@@ -1508,6 +1533,10 @@ final class AppStore {
         switch action {
         case .goToDefinition:
             smartLSPNavigate(line: line, character: column)
+        case .goToTypeDefinition:
+            goToTypeDefinition(atLine: line, utf16Column: column)
+        case .goToImplementation:
+            goToImplementation(atLine: line, utf16Column: column)
         case .findReferences:
             findAllReferences(atLine: line, utf16Column: column)
         case .goToFile:
@@ -1698,6 +1727,12 @@ final class AppStore {
            let target = canvas.contextLSPSymbol {
             menu.addItem(ClosureMenuItem(L("Go to Definition", "跳转到声明")) { [weak self] in
                 self?.goToDefinition(atLine: target.line, utf16Column: target.utf16Column)
+            })
+            menu.addItem(ClosureMenuItem(L("Go to Implementation", "跳转到实现")) { [weak self] in
+                self?.goToImplementation(atLine: target.line, utf16Column: target.utf16Column)
+            })
+            menu.addItem(ClosureMenuItem(L("Go to Type Definition", "跳转到类型定义")) { [weak self] in
+                self?.goToTypeDefinition(atLine: target.line, utf16Column: target.utf16Column)
             })
             menu.addItem(ClosureMenuItem(L("Find All References", "查找所有引用")) { [weak self] in
                 self?.findAllReferences(atLine: target.line, utf16Column: target.utf16Column)

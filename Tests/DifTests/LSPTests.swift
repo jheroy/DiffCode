@@ -1151,6 +1151,38 @@ final class LSPTests: XCTestCase {
         ]))
         XCTAssertFalse(capFalse.documentHighlightProvider)
         XCTAssertFalse(LSPServerCapabilities.empty.documentHighlightProvider)
+
+        let implTrue = LSPServerCapabilities.parse(from: .object([
+            "capabilities": .object(["implementationProvider": .bool(true)]),
+        ]))
+        XCTAssertTrue(implTrue.implementationProvider)
+
+        let implObj = LSPServerCapabilities.parse(from: .object([
+            "capabilities": .object(["implementationProvider": .object(["documentSelector": .array([])])]),
+        ]))
+        XCTAssertTrue(implObj.implementationProvider)
+
+        let implFalse = LSPServerCapabilities.parse(from: .object([
+            "capabilities": .object(["implementationProvider": .bool(false)]),
+        ]))
+        XCTAssertFalse(implFalse.implementationProvider)
+        XCTAssertFalse(LSPServerCapabilities.empty.implementationProvider)
+
+        let typeTrue = LSPServerCapabilities.parse(from: .object([
+            "capabilities": .object(["typeDefinitionProvider": .bool(true)]),
+        ]))
+        XCTAssertTrue(typeTrue.typeDefinitionProvider)
+
+        let typeObj = LSPServerCapabilities.parse(from: .object([
+            "capabilities": .object(["typeDefinitionProvider": .object(["documentSelector": .array([])])]),
+        ]))
+        XCTAssertTrue(typeObj.typeDefinitionProvider)
+
+        let typeFalse = LSPServerCapabilities.parse(from: .object([
+            "capabilities": .object(["typeDefinitionProvider": .bool(false)]),
+        ]))
+        XCTAssertFalse(typeFalse.typeDefinitionProvider)
+        XCTAssertFalse(LSPServerCapabilities.empty.typeDefinitionProvider)
     }
 
     func testMockStdioServerDocumentHighlightReturnsRangesAndRespectsCapability() async throws {
@@ -1259,6 +1291,616 @@ final class LSPTests: XCTestCase {
         await manager.setEnabled(false)
         let disabledResult = await manager.documentHighlightResult(fileURL: fileURL, line: 2, character: 2)
         XCTAssertEqual(disabledResult, .unavailable)
+
+        await manager.shutdownAll()
+    }
+
+    // MARK: - 10. textDocument/implementation (Mock Shapes, Capability, Error & Real gopls go.work)
+
+    func testMockStdioServerImplementationShapesDedupCapabilityAndGating() async throws {
+        let dir = try makeTempDir(prefix: "dif-mock-impl")
+        let scriptURL = dir.appendingPathComponent("mock_impl_lsp.py")
+        let ifaceURL = dir.appendingPathComponent("greeter.go")
+        let implAURL = dir.appendingPathComponent("impl_a.go")
+        let implBURL = dir.appendingPathComponent("impl_b.go")
+        try writeFile(ifaceURL, contents: "package demo\ntype Greeter interface { Greet() }\n")
+        try writeFile(implAURL, contents: "package demo\ntype ImplA struct{}\nfunc (ImplA) Greet() {}\n")
+        try writeFile(implBURL, contents: "package demo\ntype ImplB struct{}\nfunc (ImplB) Greet() {}\n")
+
+        let implAURI = LSPURI.uri(from: implAURL)
+        let implBURI = LSPURI.uri(from: implBURL)
+        let implADupURI = "file://" + dir.path + "/./impl_a.go"
+
+        let mockServerScript = """
+        #!/usr/bin/env python3
+        import json, sys
+
+        IMPL_CAP = sys.argv[1] == "1"
+
+        def send(msg):
+            body = json.dumps(msg).encode("utf-8")
+            header = f"Content-Length: {len(body)}\\r\\n\\r\\n".encode("ascii")
+            sys.stdout.buffer.write(header + body)
+            sys.stdout.buffer.flush()
+
+        def read_msg():
+            headers = {}
+            while True:
+                line = sys.stdin.buffer.readline()
+                if not line:
+                    return None
+                if line in (b"\\r\\n", b"\\n"):
+                    break
+                if b":" in line:
+                    k, v = line.decode("ascii").split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+            length = int(headers.get("content-length", "0"))
+            body = sys.stdin.buffer.read(length)
+            return json.loads(body.decode("utf-8")) if body else None
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            method = msg.get("method")
+            req_id = msg.get("id")
+            params = msg.get("params") or {}
+            if method == "initialize":
+                td = (params.get("capabilities") or {}).get("textDocument") or {}
+                impl_cap = td.get("implementation") or {}
+                assert impl_cap.get("linkSupport") is True
+                send({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "capabilities": {
+                            "textDocumentSync": 1,
+                            "implementationProvider": IMPL_CAP,
+                        }
+                    },
+                })
+            elif method == "textDocument/implementation":
+                line = (params.get("position") or {}).get("line", 0)
+                if line == 1:
+                    # Single Location
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "uri": "\(implAURI)",
+                            "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 10}},
+                        },
+                    })
+                elif line == 2:
+                    # [Location] with canonical duplicate
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": [
+                            {"uri": "\(implAURI)", "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 10}}},
+                            {"uri": "\(implADupURI)", "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 10}}},
+                            {"uri": "\(implBURI)", "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 10}}},
+                        ],
+                    })
+                elif line == 3:
+                    # [LocationLink]
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": [{
+                            "originSelectionRange": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 7}},
+                            "targetUri": "\(implBURI)",
+                            "targetRange": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 25}},
+                            "targetSelectionRange": {"start": {"line": 2, "character": 13}, "end": {"line": 2, "character": 18}},
+                        }],
+                    })
+                elif line == 4:
+                    send({"jsonrpc": "2.0", "id": req_id, "result": None})
+                elif line == 5:
+                    send({"jsonrpc": "2.0", "id": req_id, "result": []})
+                elif line == 6:
+                    send({"jsonrpc": "2.0", "id": req_id, "error": {"code": 0, "message": "not a method"}})
+            elif method == "shutdown":
+                send({"jsonrpc": "2.0", "id": req_id, "result": None})
+            elif method == "exit":
+                break
+        """
+        try writeFile(scriptURL, contents: mockServerScript, executable: true)
+
+        let enabledServer = LSPResolvedServer(
+            descriptor: LSPServerRegistry.go,
+            executablePath: "/usr/bin/python3",
+            arguments: [scriptURL.path, "1"],
+            environment: ProcessInfo.processInfo.environment
+        )
+        let manager = LSPManager(isEnabled: true, serverOverrides: [LSPServerRegistry.go.id: enabledServer])
+        let session = await manager.didOpen(fileURL: ifaceURL, text: "package demo\ntype Greeter interface { Greet() }\n", repoRoot: dir)
+        XCTAssertNotNil(session)
+
+        let single = await manager.implementation(fileURL: ifaceURL, line: 1, character: 6)
+        XCTAssertEqual(single.map(\.fileURL), [implAURL])
+
+        let multiple = await manager.implementation(fileURL: ifaceURL, line: 2, character: 6)
+        XCTAssertEqual(multiple.count, 2)
+        XCTAssertEqual(multiple.map(\.fileURL), [implAURL, implBURL])
+
+        let link = await manager.implementation(fileURL: ifaceURL, line: 3, character: 6)
+        XCTAssertEqual(link.map(\.fileURL), [implBURL])
+        XCTAssertEqual(link.first?.range.start, LSPPosition(line: 2, character: 13))
+
+        let nullImpls = await manager.implementation(fileURL: ifaceURL, line: 4, character: 0)
+        XCTAssertTrue(nullImpls.isEmpty)
+        let emptyImpls = await manager.implementation(fileURL: ifaceURL, line: 5, character: 0)
+        XCTAssertTrue(emptyImpls.isEmpty)
+        let errImpls = await manager.implementation(fileURL: ifaceURL, line: 6, character: 0)
+        XCTAssertTrue(errImpls.isEmpty)
+
+        await manager.setEnabled(false)
+        let disabledImpls = await manager.implementation(fileURL: ifaceURL, line: 1, character: 6)
+        XCTAssertTrue(disabledImpls.isEmpty)
+        await manager.shutdownAll()
+
+        // implementationProvider: false -> skips RPC and returns []
+        let noProviderServer = LSPResolvedServer(
+            descriptor: LSPServerRegistry.go,
+            executablePath: "/usr/bin/python3",
+            arguments: [scriptURL.path, "0"],
+            environment: ProcessInfo.processInfo.environment
+        )
+        let noProviderManager = LSPManager(isEnabled: true, serverOverrides: [LSPServerRegistry.go.id: noProviderServer])
+        _ = await noProviderManager.didOpen(fileURL: ifaceURL, text: "package demo\n", repoRoot: dir)
+        let unsupported = await noProviderManager.implementation(fileURL: ifaceURL, line: 1, character: 6)
+        XCTAssertTrue(unsupported.isEmpty)
+        await noProviderManager.shutdownAll()
+    }
+
+    func testRealGoplsGoWorkInterfaceImplementations() async throws {
+        guard LSPServerRegistry.resolveServer(for: LSPServerRegistry.go) != nil,
+              LSPBinaryLocator.resolve(executable: "go") != nil else {
+            throw XCTSkip("gopls or go toolchain not installed in PATH")
+        }
+
+        let root = try makeTempDir(prefix: "dif-real-gopls-impl")
+        let repoA = root.appendingPathComponent("repoA", isDirectory: true)
+        let repoB = root.appendingPathComponent("repoB", isDirectory: true)
+
+        try writeFile(root.appendingPathComponent("go.work"), contents: """
+        go 1.21
+
+        use (
+            ./repoA
+            ./repoB
+        )
+        """)
+
+        try writeFile(repoB.appendingPathComponent("go.mod"), contents: """
+        module example.com/repob
+
+        go 1.21
+        """)
+
+        let greeterURL = repoB.appendingPathComponent("greeter.go")
+        let greeterCode = """
+        package repob
+
+        type Greeter interface {
+        \tGreet(name string) string
+        }
+        """
+        try writeFile(greeterURL, contents: greeterCode)
+
+        try writeFile(repoA.appendingPathComponent("go.mod"), contents: """
+        module example.com/repoa
+
+        go 1.21
+
+        require example.com/repob v0.0.0
+        """)
+
+        let implURL = repoA.appendingPathComponent("impl.go")
+        let implCode = """
+        package main
+
+        import "example.com/repob"
+
+        type FormalGreeter struct{}
+
+        func (FormalGreeter) Greet(name string) string {
+        \treturn "Hello, " + name
+        }
+
+        type CasualGreeter struct{}
+
+        func (CasualGreeter) Greet(name string) string {
+        \treturn "Hi, " + name
+        }
+
+        func Run(g repob.Greeter) string {
+        \treturn g.Greet("world")
+        }
+        """
+        try writeFile(implURL, contents: implCode)
+
+        let manager = LSPManager(isEnabled: true)
+        _ = await manager.didOpen(fileURL: greeterURL, text: greeterCode, repoRoot: repoB)
+        _ = await manager.didOpen(fileURL: implURL, text: implCode, repoRoot: repoA)
+
+        // 1. Interface declaration `Greeter` -> FormalGreeter & CasualGreeter in repoA/impl.go
+        var typeImpls: [LSPLocation] = []
+        for _ in 0..<8 {
+            typeImpls = await manager.implementation(fileURL: greeterURL, line: 2, character: 6, repoRoot: repoB)
+            if typeImpls.count >= 2 { break }
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        XCTAssertTrue(typeImpls.contains { $0.fileURL == implURL && $0.range.start.line == 4 }, "Expected FormalGreeter, got: \(typeImpls)")
+        XCTAssertTrue(typeImpls.contains { $0.fileURL == implURL && $0.range.start.line == 10 }, "Expected CasualGreeter, got: \(typeImpls)")
+
+        // 2. Interface method `Greet` -> both concrete `Greet` methods
+        let ifaceMethodImpls = await manager.implementation(fileURL: greeterURL, line: 3, character: 2, repoRoot: repoB)
+        XCTAssertTrue(ifaceMethodImpls.contains { $0.fileURL == implURL && $0.range.start.line == 6 }, "Expected FormalGreeter.Greet, got: \(ifaceMethodImpls)")
+        XCTAssertTrue(ifaceMethodImpls.contains { $0.fileURL == implURL && $0.range.start.line == 12 }, "Expected CasualGreeter.Greet, got: \(ifaceMethodImpls)")
+
+        // 3. Interface method call `g.Greet("world")` -> both concrete `Greet` methods
+        let callImpls = await manager.implementation(fileURL: implURL, line: 17, character: 11, repoRoot: repoA)
+        XCTAssertTrue(callImpls.contains { $0.fileURL == implURL && $0.range.start.line == 6 }, "Expected FormalGreeter.Greet from call site, got: \(callImpls)")
+        XCTAssertTrue(callImpls.contains { $0.fileURL == implURL && $0.range.start.line == 12 }, "Expected CasualGreeter.Greet from call site, got: \(callImpls)")
+
+        // 4. Concrete struct & method -> interface & interface method in repoB/greeter.go
+        let structIfaces = await manager.implementation(fileURL: implURL, line: 4, character: 6, repoRoot: repoA)
+        XCTAssertTrue(structIfaces.contains { $0.fileURL == greeterURL && $0.range.start.line == 2 }, "Expected Greeter interface, got: \(structIfaces)")
+
+        let methodIfaces = await manager.implementation(fileURL: implURL, line: 6, character: 22, repoRoot: repoA)
+        XCTAssertTrue(methodIfaces.contains { $0.fileURL == greeterURL && $0.range.start.line == 3 }, "Expected Greeter.Greet, got: \(methodIfaces)")
+
+        // 5. Plain function `Run` -> returns [] cleanly instead of propagating RPC error
+        let plainFuncImpls = await manager.implementation(fileURL: implURL, line: 16, character: 6, repoRoot: repoA)
+        XCTAssertTrue(plainFuncImpls.isEmpty)
+
+        await manager.shutdownAll()
+    }
+
+    // MARK: - 11. textDocument/typeDefinition (Mock Shapes, Capability, Error & Real gopls go.work)
+
+    func testMockStdioServerTypeDefinitionShapesDedupCapabilityAndGating() async throws {
+        let dir = try makeTempDir(prefix: "dif-mock-typedef")
+        let scriptURL = dir.appendingPathComponent("mock_typedef_lsp.py")
+        let mainURL = dir.appendingPathComponent("main.go")
+        let userURL = dir.appendingPathComponent("user.go")
+        let adminURL = dir.appendingPathComponent("admin.go")
+        try writeFile(mainURL, contents: "package demo\nfunc run() {}\n")
+        try writeFile(userURL, contents: "package demo\ntype User struct{}\n")
+        try writeFile(adminURL, contents: "package demo\ntype Admin struct{}\n")
+
+        let userURI = LSPURI.uri(from: userURL)
+        let adminURI = LSPURI.uri(from: adminURL)
+        let userDupURI = "file://" + dir.path + "/./user.go"
+
+        let mockServerScript = """
+        #!/usr/bin/env python3
+        import json, sys
+
+        TYPEDEF_CAP = sys.argv[1] == "1"
+
+        def send(msg):
+            body = json.dumps(msg).encode("utf-8")
+            header = f"Content-Length: {len(body)}\\r\\n\\r\\n".encode("ascii")
+            sys.stdout.buffer.write(header + body)
+            sys.stdout.buffer.flush()
+
+        def read_msg():
+            headers = {}
+            while True:
+                line = sys.stdin.buffer.readline()
+                if not line:
+                    return None
+                if line in (b"\\r\\n", b"\\n"):
+                    break
+                if b":" in line:
+                    k, v = line.decode("ascii").split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+            length = int(headers.get("content-length", "0"))
+            body = sys.stdin.buffer.read(length)
+            return json.loads(body.decode("utf-8")) if body else None
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            method = msg.get("method")
+            req_id = msg.get("id")
+            params = msg.get("params") or {}
+            if method == "initialize":
+                td = (params.get("capabilities") or {}).get("textDocument") or {}
+                typedef_cap = td.get("typeDefinition") or {}
+                assert typedef_cap.get("linkSupport") is True
+                send({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {
+                        "capabilities": {
+                            "textDocumentSync": 1,
+                            "typeDefinitionProvider": TYPEDEF_CAP,
+                        }
+                    },
+                })
+            elif method == "textDocument/typeDefinition":
+                line = (params.get("position") or {}).get("line", 0)
+                if line == 1:
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "uri": "\(userURI)",
+                            "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 9}},
+                        },
+                    })
+                elif line == 2:
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": [
+                            {"uri": "\(userURI)", "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 9}}},
+                            {"uri": "\(userDupURI)", "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 9}}},
+                            {"uri": "\(adminURI)", "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 10}}},
+                        ],
+                    })
+                elif line == 3:
+                    send({
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": [{
+                            "originSelectionRange": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 4}},
+                            "targetUri": "\(adminURI)",
+                            "targetRange": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 19}},
+                            "targetSelectionRange": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 10}},
+                        }],
+                    })
+                elif line == 4:
+                    send({"jsonrpc": "2.0", "id": req_id, "result": None})
+                elif line == 5:
+                    send({"jsonrpc": "2.0", "id": req_id, "result": []})
+                elif line == 6:
+                    send({"jsonrpc": "2.0", "id": req_id, "error": {"code": 0, "message": "no type definition for n"}})
+            elif method == "shutdown":
+                send({"jsonrpc": "2.0", "id": req_id, "result": None})
+            elif method == "exit":
+                break
+        """
+        try writeFile(scriptURL, contents: mockServerScript, executable: true)
+
+        let enabledServer = LSPResolvedServer(
+            descriptor: LSPServerRegistry.go,
+            executablePath: "/usr/bin/python3",
+            arguments: [scriptURL.path, "1"],
+            environment: ProcessInfo.processInfo.environment
+        )
+        let manager = LSPManager(isEnabled: true, serverOverrides: [LSPServerRegistry.go.id: enabledServer])
+        let session = await manager.didOpen(fileURL: mainURL, text: "package demo\nfunc run() {}\n", repoRoot: dir)
+        XCTAssertNotNil(session)
+
+        let single = await manager.typeDefinition(fileURL: mainURL, line: 1, character: 5)
+        XCTAssertEqual(single.map(\.fileURL), [userURL])
+
+        let multiple = await manager.typeDefinition(fileURL: mainURL, line: 2, character: 5)
+        XCTAssertEqual(multiple.count, 2)
+        XCTAssertEqual(multiple.map(\.fileURL), [userURL, adminURL])
+
+        let link = await manager.typeDefinition(fileURL: mainURL, line: 3, character: 5)
+        XCTAssertEqual(link.map(\.fileURL), [adminURL])
+        XCTAssertEqual(link.first?.range.start, LSPPosition(line: 1, character: 5))
+
+        let nullTargets = await manager.typeDefinition(fileURL: mainURL, line: 4, character: 0)
+        XCTAssertTrue(nullTargets.isEmpty)
+        let emptyTargets = await manager.typeDefinition(fileURL: mainURL, line: 5, character: 0)
+        XCTAssertTrue(emptyTargets.isEmpty)
+        let errTargets = await manager.typeDefinition(fileURL: mainURL, line: 6, character: 0)
+        XCTAssertTrue(errTargets.isEmpty)
+
+        await manager.setEnabled(false)
+        let disabledTargets = await manager.typeDefinition(fileURL: mainURL, line: 1, character: 5)
+        XCTAssertTrue(disabledTargets.isEmpty)
+        await manager.shutdownAll()
+
+        let noProviderServer = LSPResolvedServer(
+            descriptor: LSPServerRegistry.go,
+            executablePath: "/usr/bin/python3",
+            arguments: [scriptURL.path, "0"],
+            environment: ProcessInfo.processInfo.environment
+        )
+        let noProviderManager = LSPManager(isEnabled: true, serverOverrides: [LSPServerRegistry.go.id: noProviderServer])
+        _ = await noProviderManager.didOpen(fileURL: mainURL, text: "package demo\n", repoRoot: dir)
+        let unsupported = await noProviderManager.typeDefinition(fileURL: mainURL, line: 1, character: 5)
+        XCTAssertTrue(unsupported.isEmpty)
+        await noProviderManager.shutdownAll()
+    }
+
+    func testRealGoplsGoWorkTypeDefinition() async throws {
+        guard LSPServerRegistry.resolveServer(for: LSPServerRegistry.go) != nil,
+              LSPBinaryLocator.resolve(executable: "go") != nil else {
+            throw XCTSkip("gopls or go toolchain not installed in PATH")
+        }
+
+        let root = try makeTempDir(prefix: "dif-real-gopls-typedef")
+        let repoA = root.appendingPathComponent("repoA", isDirectory: true)
+        let repoB = root.appendingPathComponent("repoB", isDirectory: true)
+
+        try writeFile(root.appendingPathComponent("go.work"), contents: """
+        go 1.21
+
+        use (
+            ./repoA
+            ./repoB
+        )
+        """)
+
+        try writeFile(repoB.appendingPathComponent("go.mod"), contents: """
+        module example.com/repob
+
+        go 1.21
+        """)
+
+        let userURL = repoB.appendingPathComponent("user.go")
+        let userCode = """
+        package repob
+
+        type User struct {
+        \tName string
+        }
+        """
+        try writeFile(userURL, contents: userCode)
+
+        try writeFile(repoA.appendingPathComponent("go.mod"), contents: """
+        module example.com/repoa
+
+        go 1.21
+
+        require example.com/repob v0.0.0
+        """)
+
+        let appURL = repoA.appendingPathComponent("app.go")
+        let appCode = """
+        package main
+
+        import "example.com/repob"
+
+        func Demo(u *repob.User) {
+        \tv := repob.User{Name: "alice"}
+        \t_ = v.Name
+        \t_ = u.Name
+        \tn := 42
+        \t_ = n
+        }
+        """
+        try writeFile(appURL, contents: appCode)
+
+        let manager = LSPManager(isEnabled: true)
+        _ = await manager.didOpen(fileURL: userURL, text: userCode, repoRoot: repoB)
+        _ = await manager.didOpen(fileURL: appURL, text: appCode, repoRoot: repoA)
+
+        // 1. Parameter pointer `u` (*repob.User) -> repoB/user.go:User
+        var paramTargets: [LSPLocation] = []
+        for _ in 0..<8 {
+            paramTargets = await manager.typeDefinition(fileURL: appURL, line: 4, character: 10, repoRoot: repoA)
+            if !paramTargets.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        XCTAssertTrue(paramTargets.contains { $0.fileURL == userURL && $0.range.start.line == 2 }, "Expected User struct for param u, got: \(paramTargets)")
+
+        // 2. Local variable `v` (repob.User) -> repoB/user.go:User
+        let localTargets = await manager.typeDefinition(fileURL: appURL, line: 6, character: 5, repoRoot: repoA)
+        XCTAssertTrue(localTargets.contains { $0.fileURL == userURL && $0.range.start.line == 2 }, "Expected User struct for local var v, got: \(localTargets)")
+
+        // 3. Builtin int variable `n` -> returns [] cleanly instead of propagating RPC error
+        let builtinTargets = await manager.typeDefinition(fileURL: appURL, line: 9, character: 5, repoRoot: repoA)
+        XCTAssertTrue(builtinTargets.isEmpty)
+
+        await manager.shutdownAll()
+    }
+
+    func testIdleReaperKeepsPinnedDocumentsWarmRespectsDynamicTimeoutAndReapsEphemeral() async throws {
+        let dir = try makeTempDir(prefix: "dif-idle-pin")
+        let scriptURL = dir.appendingPathComponent("mock_idle_lsp.py")
+        let fileURL = dir.appendingPathComponent("main.go")
+        let source = "package main\nfunc Greet() {}\nfunc main() { Greet() }\n"
+        try writeFile(fileURL, contents: source)
+        let uri = LSPURI.uri(from: fileURL)
+
+        let mockScript = """
+        #!/usr/bin/env python3
+        import json, sys
+
+        def send(msg):
+            body = json.dumps(msg).encode("utf-8")
+            header = f"Content-Length: {len(body)}\\r\\n\\r\\n".encode("ascii")
+            sys.stdout.buffer.write(header + body)
+            sys.stdout.buffer.flush()
+
+        def read_msg():
+            headers = {}
+            while True:
+                line = sys.stdin.buffer.readline()
+                if not line:
+                    return None
+                if line in (b"\\r\\n", b"\\n"):
+                    break
+                if b":" in line:
+                    k, v = line.decode("ascii").split(":", 1)
+                    headers[k.strip().lower()] = v.strip()
+            length = int(headers.get("content-length", "0"))
+            body = sys.stdin.buffer.read(length)
+            return json.loads(body.decode("utf-8")) if body else None
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            method = msg.get("method")
+            req_id = msg.get("id")
+            if method == "initialize":
+                send({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {"capabilities": {"textDocumentSync": 1, "definitionProvider": True}},
+                })
+            elif method == "textDocument/definition":
+                send({
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": [{"uri": "\(uri)", "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 10}}}],
+                })
+            elif method == "shutdown":
+                send({"jsonrpc": "2.0", "id": req_id, "result": None})
+            elif method == "exit":
+                break
+        """
+        try writeFile(scriptURL, contents: mockScript, executable: true)
+
+        let mockResolved = LSPResolvedServer(
+            descriptor: LSPServerRegistry.go,
+            executablePath: "/usr/bin/python3",
+            arguments: [scriptURL.path],
+            environment: ProcessInfo.processInfo.environment
+        )
+        let manager = LSPManager(
+            isEnabled: true,
+            idleTimeout: .milliseconds(200),
+            serverOverrides: [LSPServerRegistry.go.id: mockResolved]
+        )
+
+        // 1. Pinned live document stays warm past idleTimeout
+        let session = await manager.didOpen(fileURL: fileURL, text: source, repoRoot: dir)
+        XCTAssertEqual(session?.isPinned, true)
+        try await Task.sleep(for: .milliseconds(350))
+        let countWhilePinned = await manager.runningServerCount()
+        XCTAssertEqual(countWhilePinned, 1)
+
+        // 2. Closing (switching away) unpins and allows idle reaper to shut down
+        await manager.didClose(fileURL: fileURL)
+        try await Task.sleep(for: .milliseconds(350))
+        let countAfterClose = await manager.runningServerCount()
+        XCTAssertEqual(countAfterClose, 0)
+
+        // 3. setIdleTimeout(nil) ("Never") prevents reaping even after didClose
+        _ = await manager.didOpen(fileURL: fileURL, text: source, repoRoot: dir)
+        await manager.setIdleTimeout(nil)
+        await manager.didClose(fileURL: fileURL)
+        try await Task.sleep(for: .milliseconds(350))
+        let countWithNever = await manager.runningServerCount()
+        XCTAssertEqual(countWithNever, 1)
+
+        // 4. Reducing timeout dynamically reaps already-idle unpinned server immediately
+        await manager.setIdleTimeout(.milliseconds(150))
+        let countAfterTighten = await manager.runningServerCount()
+        XCTAssertEqual(countAfterTighten, 0)
+
+        // 5. Ephemeral one-shot query (e.g. historical commit diff) opens unpinned and still gets reaped
+        let defs = await manager.definition(fileURL: fileURL, line: 2, character: 15, repoRoot: dir)
+        XCTAssertEqual(defs.count, 1)
+        let ephemeralSession = await manager.openSession(forURI: uri)
+        XCTAssertEqual(ephemeralSession?.isPinned, false)
+        try await Task.sleep(for: .milliseconds(350))
+        let countAfterEphemeral = await manager.runningServerCount()
+        XCTAssertEqual(countAfterEphemeral, 0)
 
         await manager.shutdownAll()
     }

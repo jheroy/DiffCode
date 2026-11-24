@@ -459,6 +459,312 @@ struct SearchField: NSViewRepresentable {
     }
 }
 
+/// Field editor for `VimCommandField`: supports IME composition, sanitized paste, and `<C-[>`/`<C-c>`/`<C-u>`.
+final class VimCommandFieldEditor: NSTextView {
+    var pasteboard: NSPasteboard = .general
+    var onMarkedTextChanged: (() -> Void)?
+    var onVimCancel: (() -> Void)?
+
+    override func unmarkText() {
+        super.unmarkText()
+        onMarkedTextChanged?()
+    }
+
+    override func insertText(_ string: Any, replacementRange: NSRange) {
+        super.insertText(string, replacementRange: replacementRange)
+        onMarkedTextChanged?()
+    }
+
+    override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+        onMarkedTextChanged?()
+    }
+
+    override func paste(_ sender: Any?) {
+        pasteSanitizedText()
+    }
+
+    override func pasteAsPlainText(_ sender: Any?) {
+        pasteSanitizedText()
+    }
+
+    override func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(paste(_:)) || menuItem.action == #selector(pasteAsPlainText(_:)) {
+            return isEditable && pasteboard.availableType(from: [.string]) != nil
+        }
+        return super.validateMenuItem(menuItem)
+    }
+
+    private func pasteSanitizedText() {
+        guard isEditable, let raw = pasteboard.string(forType: .string) else { return }
+        let sanitized = VimEngine.sanitizeCommandLinePaste(raw)
+        guard !sanitized.isEmpty else { return }
+        if hasMarkedText() {
+            inputContext?.discardMarkedText()
+            unmarkText()
+        }
+        insertText(sanitized, replacementRange: selectedRange())
+    }
+
+    override func keyDown(with event: NSEvent) {
+        let flags = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if !hasMarkedText(), flags == .control,
+           let raw = event.charactersIgnoringModifiers?.lowercased(), !raw.isEmpty {
+            if raw == "[" || raw == "c" {
+                onVimCancel?()
+                return
+            }
+            if raw == "u" {
+                let caret = min(selectedRange().location, (string as NSString).length)
+                let replaceRange = NSRange(location: 0, length: caret)
+                if shouldChangeText(in: replaceRange, replacementString: "") {
+                    replaceCharacters(in: replaceRange, with: "")
+                    didChangeText()
+                    onMarkedTextChanged?()
+                }
+                return
+            }
+        }
+        super.keyDown(with: event)
+    }
+}
+
+/// `NSTextField` subclass that owns the dedicated `VimCommandFieldEditor` so `VimCommandFieldCell`
+/// holds zero stored properties (protecting against `NSCell.copy(with:)` / `NSCopyObject` ARC corruption).
+final class VimCommandTextField: NSTextField {
+    let customEditor: VimCommandFieldEditor = {
+        let view = VimCommandFieldEditor()
+        view.isFieldEditor = true
+        view.isRichText = false
+        view.allowsUndo = true
+        view.isAutomaticQuoteSubstitutionEnabled = false
+        view.isAutomaticDashSubstitutionEnabled = false
+        view.isAutomaticTextReplacementEnabled = false
+        view.isAutomaticSpellingCorrectionEnabled = false
+        view.isContinuousSpellCheckingEnabled = false
+        return view
+    }()
+}
+
+/// Custom cell supplying `VimCommandTextField`'s dedicated `VimCommandFieldEditor`.
+/// IMPORTANT: Keep ZERO stored properties on `NSCell` subclasses.
+private final class VimCommandFieldCell: NSTextFieldCell {
+    override func fieldEditor(for controlView: NSView) -> NSTextView? {
+        (controlView as? VimCommandTextField)?.customEditor
+    }
+}
+
+/// Single-line AppKit command-line input for Vim `:` mode with full IME composition and paste support.
+struct VimCommandField: NSViewRepresentable {
+    @Binding var text: String
+    var font: NSFont
+    var focusToken: Int
+    var onSubmit: (String) -> Void
+    var onCancel: () -> Void
+    var onEndEditingExternally: () -> Void
+
+    @MainActor
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: VimCommandField
+        var lastToken = Int.min
+        var lastSyncedText: String?
+        var didFinish = false
+        private weak var observedField: NSTextField?
+        private weak var observedEditor: NSTextView?
+
+        init(_ parent: VimCommandField) { self.parent = parent }
+
+        deinit {
+            NotificationCenter.default.removeObserver(self)
+        }
+
+        private func observeEditor(_ editor: NSTextView?, for field: NSTextField) {
+            observedField = field
+            guard editor !== observedEditor else { return }
+            if let previous = observedEditor {
+                NotificationCenter.default.removeObserver(self, name: NSTextView.didChangeSelectionNotification, object: previous)
+            }
+            observedEditor = editor
+            if let editor {
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(editorSelectionDidChange(_:)),
+                    name: NSTextView.didChangeSelectionNotification,
+                    object: editor
+                )
+            }
+        }
+
+        private func stopObservingEditor() {
+            if let previous = observedEditor {
+                NotificationCenter.default.removeObserver(self, name: NSTextView.didChangeSelectionNotification, object: previous)
+            }
+            observedEditor = nil
+            observedField = nil
+        }
+
+        @discardableResult
+        func syncFromField(_ field: NSTextField) -> Bool {
+            if VimCommandField.isComposing(field) { return false }
+            let value = VimCommandField.liveText(field)
+            lastSyncedText = value
+            if parent.text != value {
+                parent.text = value
+                return true
+            }
+            return false
+        }
+
+        @objc private func editorSelectionDidChange(_ notification: Notification) {
+            guard let editor = notification.object as? NSTextView,
+                  editor === observedEditor,
+                  let field = observedField,
+                  field.currentEditor() === editor else { return }
+            syncFromField(field)
+        }
+
+        func controlTextDidBeginEditing(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            let editor = (notification.userInfo?["NSFieldEditor"] as? NSTextView) ?? (field.currentEditor() as? NSTextView)
+            observeEditor(editor, for: field)
+        }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let field = notification.object as? NSTextField else { return }
+            if let editor = field.currentEditor() as? NSTextView {
+                observeEditor(editor, for: field)
+            }
+            syncFromField(field)
+        }
+
+        func controlTextDidEndEditing(_ notification: Notification) {
+            if let field = notification.object as? NSTextField {
+                syncFromField(field)
+            }
+            stopObservingEditor()
+            if !didFinish {
+                parent.onEndEditingExternally()
+            }
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+            switch selector {
+            case #selector(NSResponder.insertNewline(_:)),
+                 #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
+                guard !textView.hasMarkedText() else { return false }
+                let submitted = textView.string
+                didFinish = true
+                parent.onSubmit(submitted)
+                return true
+            case #selector(NSResponder.cancelOperation(_:)):
+                guard !textView.hasMarkedText() else { return false }
+                didFinish = true
+                parent.onCancel()
+                return true
+            case #selector(NSResponder.deleteBackward(_:)),
+                 #selector(NSResponder.deleteBackwardByDecomposingPreviousCharacter(_:)):
+                guard !textView.hasMarkedText(), textView.string.isEmpty else { return false }
+                didFinish = true
+                parent.onCancel()
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    static func makeConfiguredTextField(font: NSFont, coordinator: Coordinator) -> VimCommandTextField {
+        let field = VimCommandTextField()
+        let defaultTextColor = field.textColor
+        let cell = VimCommandFieldCell()
+        cell.usesSingleLineMode = true
+        cell.wraps = false
+        cell.isScrollable = true
+        cell.lineBreakMode = .byTruncatingHead
+        field.customEditor.onMarkedTextChanged = { [weak coordinator, weak field] in
+            guard let coordinator, let field else { return }
+            coordinator.syncFromField(field)
+        }
+        field.customEditor.onVimCancel = { [weak coordinator] in
+            guard let coordinator else { return }
+            coordinator.didFinish = true
+            coordinator.parent.onCancel()
+        }
+        field.cell = cell
+        field.textColor = defaultTextColor
+        field.isEditable = true
+        field.isSelectable = true
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.font = font
+        field.delegate = coordinator
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return field
+    }
+
+    func makeNSView(context: Context) -> VimCommandTextField {
+        Self.makeConfiguredTextField(font: font, coordinator: context.coordinator)
+    }
+
+    static func isComposing(_ field: NSTextField) -> Bool {
+        (field.currentEditor() as? NSTextView)?.hasMarkedText() ?? false
+    }
+
+    static func liveText(_ field: NSTextField) -> String {
+        (field.currentEditor() as? NSTextView)?.string ?? field.stringValue
+    }
+
+    static func applyBindingText(_ text: String, to field: NSTextField, coordinator: Coordinator) {
+        guard !isComposing(field) else { return }
+        let isEditing = field.currentEditor() != nil
+        let programmaticChange = coordinator.lastSyncedText != text
+        if (!isEditing || programmaticChange) && liveText(field) != text {
+            if let editor = field.currentEditor() as? NSTextView {
+                editor.string = text
+                let end = (text as NSString).length
+                editor.setSelectedRange(NSRange(location: end, length: 0))
+            } else {
+                field.stringValue = text
+            }
+            coordinator.lastSyncedText = text
+        } else if coordinator.lastSyncedText == nil {
+            coordinator.lastSyncedText = text
+        }
+    }
+
+    func updateNSView(_ field: VimCommandTextField, context: Context) {
+        context.coordinator.parent = self
+        field.customEditor.onMarkedTextChanged = { [weak coordinator = context.coordinator, weak field] in
+            guard let coordinator, let field else { return }
+            coordinator.syncFromField(field)
+        }
+        field.customEditor.onVimCancel = { [weak coordinator = context.coordinator] in
+            guard let coordinator else { return }
+            coordinator.didFinish = true
+            coordinator.parent.onCancel()
+        }
+        Self.applyBindingText(text, to: field, coordinator: context.coordinator)
+        if !Self.isComposing(field) && field.font != font {
+            field.font = font
+        }
+        if context.coordinator.lastToken != focusToken {
+            context.coordinator.lastToken = focusToken
+            context.coordinator.didFinish = false
+            DispatchQueue.main.async {
+                guard let window = field.window else { return }
+                window.makeFirstResponder(field)
+                if let editor = field.currentEditor() {
+                    let end = (editor.string as NSString).length
+                    editor.selectedRange = NSRange(location: end, length: 0)
+                }
+            }
+        }
+    }
+}
+
 /// Holds the AppKit view that owns keyboard focus for a custom list.
 @MainActor
 final class ListFocus {

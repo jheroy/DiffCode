@@ -67,6 +67,8 @@ extension ViewerModel {
         diffTimer = nil
         diffTask?.cancel()
         diffTask = nil
+        formatTask?.cancel()
+        formatTask = nil
         if let editor {
             container?.canvas.commitComposition()
             let key = Self.historyKey(editor.root, editor.path)
@@ -128,7 +130,7 @@ extension ViewerModel {
             MainActor.assumeIsolated {
                 guard let self, let editor = self.editor else { return }
                 if editor.marked != nil { self.scheduleSave(); return }
-                self.saveEdits()
+                self.saveEdits(formatGo: true, isAutoSave: true)
             }
         }
         RunLoop.main.add(timer, forMode: .common)
@@ -137,20 +139,25 @@ extension ViewerModel {
 
     /// ⌘S: writes now.
     func saveNow() {
-        guard editor != nil else {
+        guard let editor else {
             if let reason = readOnlyReason { onToast?(reason) }
             return
         }
-        saveEdits()
+        let wasDirty = editor.isDirty
+        if saveEdits(formatGo: true), !wasDirty {
+            scheduleGoFormatAfterSave()
+        }
     }
 
     /// Vim `:w`: writes now and gives feedback when read-only.
     func saveFromVim() {
-        guard editor != nil else {
+        guard let editor else {
             onToast?(readOnlyReason ?? L("Read-only file", "只读文件"))
             return
         }
-        if saveEdits() {
+        let wasDirty = editor.isDirty
+        if saveEdits(formatGo: true) {
+            if !wasDirty { scheduleGoFormatAfterSave() }
             onToast?(L("Saved", "已保存"))
         }
     }
@@ -162,9 +169,11 @@ extension ViewerModel {
     /// comes in instead, and ⌘Z brings back what was typed. Written in place, so the file keeps its permissions
     /// and whatever watches it sees an edit.
     @discardableResult
-    func saveEdits() -> Bool {
+    func saveEdits(formatGo: Bool = false, isAutoSave: Bool = false) -> Bool {
         saveTimer?.invalidate()
         saveTimer = nil
+        formatTask?.cancel()
+        formatTask = nil
         guard let editor, let request else { return true }
         container?.canvas.commitComposition()
         guard editor.isDirty else { return true }
@@ -177,6 +186,9 @@ extension ViewerModel {
             // Typed and undone back to what the file holds.
             editor.markSaved()
             updateDirty()
+            if formatGo && !isAutoSave {
+                scheduleGoFormatAfterSave(savedData: data)
+            }
             return true
         }
         guard let current = Self.readFile(editor.url) else {
@@ -188,12 +200,7 @@ extension ViewerModel {
             return false
         }
         do {
-            let handle = try FileHandle(forWritingTo: editor.url)
-            defer { try? handle.close() }
-            // New bytes over the old, then cut to length: at no moment is the file empty.
-            try handle.write(contentsOf: data)
-            try handle.truncate(atOffset: UInt64(data.count))
-            try handle.synchronize()
+            try Self.writeFileInPlace(data, to: editor.url)
         } catch {
             onToast?(L("Not saved: \(error.localizedDescription)", "保存失败：\(error.localizedDescription)"))
             return false
@@ -206,7 +213,102 @@ extension ViewerModel {
         notifyLSPSaved()
         // Who changed what is worked out again from the file as written.
         if annotating { scheduleAnnotations() }
+        if formatGo {
+            scheduleGoFormatAfterSave(savedData: data, isAutoSave: isAutoSave)
+        }
         return true
+    }
+
+    private static func writeFileInPlace(_ data: Data, to url: URL) throws {
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        // New bytes over the old, then cut to length: at no moment is the file empty.
+        try handle.write(contentsOf: data)
+        try handle.truncate(atOffset: UInt64(data.count))
+        try handle.synchronize()
+    }
+
+    /// Runs `go fmt` (`gofmt`) asynchronously after saving a `.go` file and applies any changes back to disk and editor.
+    func scheduleGoFormatAfterSave(savedData: Data? = nil, isAutoSave: Bool = false) {
+        guard !AppEnvironment.isAppStore,
+              settings?.formatGoOnSave ?? true,
+              let editor, let request,
+              GoFormatter.isGoFile(editor.url),
+              !editor.isDirty,
+              editor.marked == nil,
+              let dataToFormat = savedData ?? editor.encoded() else { return }
+
+        if isAutoSave,
+           let caret = container?.canvas.editSelection?.head,
+           editor.buffer.lines.indices.contains(caret.row) {
+            let line = editor.buffer.lines[caret.row]
+            // Avoid stripping auto-indentation out from under the caret if the user merely paused mid-line.
+            if !line.isEmpty, line.trimmingCharacters(in: .whitespaces).isEmpty {
+                return
+            }
+        }
+
+        formatTask?.cancel()
+        let targetEditor = editor
+        let targetURL = editor.url
+        let targetRoot = request.root
+        let targetPath = request.path
+        let savedVersion = editor.version
+        let savedFingerprint = editor.diskFingerprint
+        let formatter = goFormatter
+
+        formatTask = Task { @MainActor [weak self] in
+            guard let formatted = await formatter(dataToFormat, targetURL),
+                  !Task.isCancelled,
+                  formatted != dataToFormat else { return }
+            guard let self,
+                  let editor = self.editor, editor === targetEditor,
+                  let request = self.request, request.root == targetRoot, request.path == targetPath,
+                  !editor.isDirty, editor.version == savedVersion, editor.marked == nil else { return }
+            guard let current = Self.readFile(editor.url),
+                  TextCodec.fingerprint(current) == savedFingerprint else { return }
+            guard formatted.count <= TextEditing.maxEditableBytes,
+                  let formattedText = TextCodec.decodeForEditing(formatted),
+                  !formattedText.lines.contains(where: { $0.utf8.count > TextEditing.maxLineBytes }) else { return }
+
+            do {
+                try Self.writeFileInPlace(formatted, to: editor.url)
+            } catch {
+                return
+            }
+
+            let oldLines = editor.buffer.lines
+            let beforeCaret: EditorSession.Selection = self.container?.canvas.editSelection
+                ?? (TextPosition(row: 0, column: 0), TextPosition(row: 0, column: 0))
+            let afterCaret: EditorSession.Selection = (
+                GoFormatter.mappedPosition(beforeCaret.anchor, from: oldLines, to: formattedText.lines),
+                GoFormatter.mappedPosition(beforeCaret.head, from: oldLines, to: formattedText.lines)
+            )
+
+            if let canvas = self.container?.canvas {
+                canvas.commitComposition()
+                canvas.performEdit(anchorLine: beforeCaret.head.row) {
+                    editor.applyFormattedText(formattedText, data: formatted, selectionBefore: beforeCaret, selectionAfter: afterCaret)
+                }
+                canvas.setSelection(afterCaret)
+                canvas.goalX = nil
+                if canvas.window?.firstResponder === canvas {
+                    canvas.revealCaret()
+                }
+            } else {
+                editor.applyFormattedText(formattedText, data: formatted, selectionBefore: beforeCaret, selectionAfter: afterCaret)
+            }
+
+            self.signature = Self.signature(for: request, base: self.loadedStamp)
+            self.updateDirty()
+            self.refreshConflicts()
+            if let doc = self.document, self.hunkCount != doc.hunks.count { self.hunkCount = doc.hunks.count }
+            if let focused = self.focusedHunk, focused >= self.hunkCount { self.focusedHunk = nil }
+            self.onFileWritten?(request.root)
+            self.notifyLSPSaved()
+            self.scheduleDiff()
+            if self.annotating { self.scheduleAnnotations() }
+        }
     }
 
     /// The file changed underneath unsaved typing: its version replaces the text, as a step ⌘Z takes back.
@@ -243,13 +345,13 @@ extension ViewerModel {
         guard observers.isEmpty else { return }
         let center = NotificationCenter.default
         observers.append(center.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { _ = self?.saveEdits() }
+            MainActor.assumeIsolated { _ = self?.saveEdits(formatGo: true) }
         })
         observers.append(center.addObserver(forName: NSWindow.didResignKeyNotification, object: nil, queue: .main) { [weak self] note in
             let window = note.object as? NSWindow
             MainActor.assumeIsolated {
                 guard let self, let window, window === self.container?.window else { return }
-                self.saveEdits()
+                self.saveEdits(formatGo: true)
             }
         })
     }
@@ -362,7 +464,7 @@ extension ViewerModel {
         updateDirty()
         scheduleDiff()
         refreshConflicts()
-        saveEdits()
+        saveEdits(formatGo: true)
     }
 
     // MARK: Rolling back a change
@@ -408,7 +510,7 @@ extension ViewerModel {
         }
         updateDirty()
         scheduleDiff()
-        return saveEdits()
+        return saveEdits(formatGo: true)
     }
 
     /// Whether the text on screen is, byte for byte, its left side (a change rolled back was the last one).
@@ -421,7 +523,7 @@ extension ViewerModel {
     func undoInEditor() {
         guard let canvas = container?.canvas, editor != nil else { return }
         canvas.undoTyping()
-        saveEdits()
+        saveEdits(formatGo: true)
         focusCanvas()
     }
 }

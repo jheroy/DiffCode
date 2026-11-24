@@ -176,6 +176,69 @@ final class EditorSession {
         return outcome
     }
 
+    /// Applies formatted text (such as `go fmt` output) via minimal line hunks as a single undo step and marks `data` as written.
+    @discardableResult
+    func applyFormattedText(_ text: EditableText, data: Data, selectionBefore: Selection, selectionAfter: Selection) -> [Outcome] {
+        let hunks = GoFormatter.minimalHunks(from: buffer.lines, to: text.lines)
+        var edits: [(from: TextPosition, to: TextPosition, text: String)] = []
+        edits.reserveCapacity(hunks.count)
+        var delta = 0
+        for hunk in hunks {
+            let currentCount = buffer.lines.count + delta
+            let oldStart = hunk.oldRange.lowerBound + delta
+            let oldEnd = hunk.oldRange.upperBound + delta
+            let newRange = hunk.newRange
+            let from: TextPosition
+            let to: TextPosition
+            let replacement: String
+            if !hunk.oldRange.isEmpty && !newRange.isEmpty {
+                let endLen = buffer.lines[hunk.oldRange.upperBound - 1].utf16.count
+                from = TextPosition(row: oldStart, column: 0)
+                to = TextPosition(row: oldEnd - 1, column: endLen)
+                replacement = text.lines[newRange].joined(separator: "\n")
+            } else if !hunk.oldRange.isEmpty {
+                if oldEnd < currentCount {
+                    from = TextPosition(row: oldStart, column: 0)
+                    to = TextPosition(row: oldEnd, column: 0)
+                } else if oldStart > 0 {
+                    let prevLen = buffer.lines[hunk.oldRange.lowerBound - 1].utf16.count
+                    let endLen = buffer.lines[hunk.oldRange.upperBound - 1].utf16.count
+                    from = TextPosition(row: oldStart - 1, column: prevLen)
+                    to = TextPosition(row: oldEnd - 1, column: endLen)
+                } else {
+                    let endLen = buffer.lines[hunk.oldRange.upperBound - 1].utf16.count
+                    from = TextPosition(row: 0, column: 0)
+                    to = TextPosition(row: oldEnd - 1, column: endLen)
+                }
+                replacement = ""
+            } else if !newRange.isEmpty {
+                if oldStart < currentCount {
+                    from = TextPosition(row: oldStart, column: 0)
+                    to = from
+                    replacement = text.lines[newRange].joined(separator: "\n") + "\n"
+                } else {
+                    let last = max(0, currentCount - 1)
+                    let prevLen = hunk.oldRange.lowerBound > 0 ? buffer.lines[hunk.oldRange.lowerBound - 1].utf16.count : 0
+                    from = TextPosition(row: last, column: prevLen)
+                    to = from
+                    replacement = "\n" + text.lines[newRange].joined(separator: "\n")
+                }
+            } else {
+                continue
+            }
+            edits.append((from, to, replacement))
+            delta += newRange.count - hunk.oldRange.count
+        }
+
+        let outcomes = edits.isEmpty ? [] : replace(edits, selection: selectionBefore, after: selectionAfter)
+        setFinalNewline(text.format.finalNewline)
+        format = text.format
+        crlf = text.crlf
+        if crlf != nil, crlf!.count != buffer.lines.count { crlf = nil }
+        didWrite(data)
+        return outcomes
+    }
+
     /// The text was changed by something else, while nothing here was unsaved: it is simply the new text,
     /// and the history (which describes the old one) is dropped.
     func replaceWithoutHistory(_ text: EditableText, data: Data) -> Outcome {

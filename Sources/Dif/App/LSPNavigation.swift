@@ -918,7 +918,11 @@ extension AppStore {
         return true
     }
 
-    private func resolveLSPQueryTarget(line: Int, character: Int) async -> ResolvedLSPQueryTarget? {
+    private func resolveLSPQueryTarget(
+        line: Int,
+        character: Int,
+        emptyToast: String = L("No definition found", "未找到定义")
+    ) async -> ResolvedLSPQueryTarget? {
         guard AppEnvironment.hasLSP,
               viewer.isCurrentDocumentLSPEnabled,
               let request = viewer.request,
@@ -952,7 +956,7 @@ extension AppStore {
         // Historical commit view: resolve against the current working-tree file on disk without
         // sending historical snapshot text via didOpen (which would overwrite live LSP buffers).
         guard let symbol else {
-            showToast(L("No definition found", "未找到定义"))
+            showToast(emptyToast)
             return nil
         }
 
@@ -1182,6 +1186,126 @@ extension AppStore {
         goToDefinition(atLine: line, utf16Column: character)
     }
 
+    /// Explicit "Go to Implementation" (`gi` / `gu` / `⌥⌘+Click` / context menu):
+    /// resolves `textDocument/implementation` (interface <-> concrete implementations).
+    func goToImplementation(atLine line: Int, utf16Column character: Int) {
+        guard AppEnvironment.hasLSP, viewer.isCurrentDocumentLSPEnabled else { return }
+        let lsp = viewer.lspManager
+
+        definitionTask?.cancel()
+        definitionTask = Task { @MainActor [weak self] in
+            guard let self,
+                  let resolved = await self.resolveLSPQueryTarget(
+                      line: line,
+                      character: character,
+                      emptyToast: L("No implementations found", "未找到实现")
+                  ) else { return }
+            let origin = self.makeJumpLocation(
+                from: resolved.request,
+                line1Based: line + 1,
+                column: character
+            )
+            let rawImpls = await lsp.implementation(
+                fileURL: resolved.fileURL,
+                line: resolved.line,
+                character: resolved.character,
+                text: resolved.text,
+                language: resolved.language,
+                repoRoot: resolved.repoRoot
+            )
+            guard !Task.isCancelled, self.isLSPQueryStillValid(for: resolved) else { return }
+
+            let impls = LSPManager.deduplicateLocations(rawImpls).filter { $0.fileURL != nil }
+            guard !impls.isEmpty else {
+                self.showToast(L("No implementations found", "未找到实现"))
+                return
+            }
+
+            if impls.count == 1 {
+                self.navigateToLSPLocation(
+                    impls[0],
+                    origin: origin,
+                    originFileURL: resolved.fileURL,
+                    originRepoRoot: resolved.repoRoot
+                )
+            } else {
+                let name = resolved.symbolName
+                let title = name.isEmpty
+                    ? L("Implementations", "实现列表")
+                    : L("Implementations of \(name)", "实现：\(name)")
+                self.presentReferencesPicker(
+                    symbolName: name,
+                    title: title,
+                    locations: impls,
+                    declarations: [],
+                    origin: origin,
+                    originFileURL: resolved.fileURL,
+                    originRepoRoot: resolved.repoRoot
+                )
+            }
+        }
+    }
+
+    /// Explicit "Go to Type Definition" (`gy` / context menu / Command):
+    /// resolves `textDocument/typeDefinition` (variable, parameter, or field -> its type/struct definition).
+    func goToTypeDefinition(atLine line: Int, utf16Column character: Int) {
+        guard AppEnvironment.hasLSP, viewer.isCurrentDocumentLSPEnabled else { return }
+        let lsp = viewer.lspManager
+
+        definitionTask?.cancel()
+        definitionTask = Task { @MainActor [weak self] in
+            guard let self,
+                  let resolved = await self.resolveLSPQueryTarget(
+                      line: line,
+                      character: character,
+                      emptyToast: L("No type definition found", "未找到类型定义")
+                  ) else { return }
+            let origin = self.makeJumpLocation(
+                from: resolved.request,
+                line1Based: line + 1,
+                column: character
+            )
+            let rawTargets = await lsp.typeDefinition(
+                fileURL: resolved.fileURL,
+                line: resolved.line,
+                character: resolved.character,
+                text: resolved.text,
+                language: resolved.language,
+                repoRoot: resolved.repoRoot
+            )
+            guard !Task.isCancelled, self.isLSPQueryStillValid(for: resolved) else { return }
+
+            let targets = LSPManager.deduplicateLocations(rawTargets).filter { $0.fileURL != nil }
+            guard !targets.isEmpty else {
+                self.showToast(L("No type definition found", "未找到类型定义"))
+                return
+            }
+
+            if targets.count == 1 {
+                self.navigateToLSPLocation(
+                    targets[0],
+                    origin: origin,
+                    originFileURL: resolved.fileURL,
+                    originRepoRoot: resolved.repoRoot
+                )
+            } else {
+                let name = resolved.symbolName
+                let title = name.isEmpty
+                    ? L("Type Definitions", "类型定义列表")
+                    : L("Type Definition of \(name)", "类型定义：\(name)")
+                self.presentReferencesPicker(
+                    symbolName: name,
+                    title: title,
+                    locations: targets,
+                    declarations: [],
+                    origin: origin,
+                    originFileURL: resolved.fileURL,
+                    originRepoRoot: resolved.repoRoot
+                )
+            }
+        }
+    }
+
     /// Explicit "Find All References" (e.g. from context menu): resolves `textDocument/references`
     /// with `includeDeclaration: true` and presents the References Picker Popup with preview.
     func findAllReferences(atLine line: Int, utf16Column character: Int) {
@@ -1190,7 +1314,12 @@ extension AppStore {
 
         definitionTask?.cancel()
         definitionTask = Task { @MainActor [weak self] in
-            guard let self, let resolved = await self.resolveLSPQueryTarget(line: line, character: character) else { return }
+            guard let self,
+                  let resolved = await self.resolveLSPQueryTarget(
+                      line: line,
+                      character: character,
+                      emptyToast: L("No references found", "未找到引用")
+                  ) else { return }
             let origin = self.makeJumpLocation(
                 from: resolved.request,
                 line1Based: line + 1,

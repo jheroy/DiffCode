@@ -24,7 +24,7 @@ actor LSPManager {
     /// Global gating flag. Defaults to `AppEnvironment.hasLSP` (`true` in Direct edition, `false` in App Store edition).
     private(set) var isEnabled: Bool
     private let respectsEdition: Bool
-    private let idleTimeout: Duration
+    private var idleTimeout: Duration?
     private let serverOverrides: [String: LSPResolvedServer]
 
     private struct PendingStart {
@@ -40,7 +40,7 @@ actor LSPManager {
 
     init(
         isEnabled: Bool = AppEnvironment.hasLSP,
-        idleTimeout: Duration = .seconds(300),
+        idleTimeout: Duration? = .seconds(300),
         serverOverrides: [String: LSPResolvedServer] = [:],
         respectsEdition: Bool = false
     ) {
@@ -62,6 +62,24 @@ actor LSPManager {
         isEnabled = enabled
         if !enabled {
             await shutdownAll()
+        }
+    }
+
+    /// Returns the current idle release timeout (`nil` disables automatic shutdown).
+    func currentIdleTimeout() -> Duration? {
+        idleTimeout
+    }
+
+    /// Updates the idle release timeout at runtime (`nil` keeps idle servers alive until quit).
+    func setIdleTimeout(_ timeout: Duration?) async {
+        guard idleTimeout != timeout else { return }
+        idleTimeout = timeout
+        reaperTask?.cancel()
+        reaperTask = nil
+        guard timeout != nil, !servers.isEmpty else { return }
+        let stillHasServers = await reapIdleServers()
+        if stillHasServers {
+            ensureReaperRunning()
         }
     }
 
@@ -137,7 +155,8 @@ actor LSPManager {
         languageId: String,
         version: Int,
         text: String,
-        workspaceRoot: URL? = nil
+        workspaceRoot: URL? = nil,
+        isPinned: Bool = true
     ) async {
         guard isEffectivelyEnabled else { return }
         guard let fileURL = LSPURI.fileURL(from: uri) else { return }
@@ -159,6 +178,9 @@ actor LSPManager {
         if let existingKey = documentToServer[normalizedURI], existingKey == key,
            let existing = servers[key]?.openDocuments[normalizedURI] {
             if existing.languageID == languageId {
+                if isPinned {
+                    servers[key]?.openDocuments[normalizedURI]?.isPinned = true
+                }
                 let monotonicVersion = max(version, existing.version + 1)
                 await didChange(uri: normalizedURI, version: monotonicVersion, text: text)
                 return
@@ -185,7 +207,8 @@ actor LSPManager {
                 fileURL: fileURL,
                 languageID: languageId,
                 version: version,
-                workspaceRoot: workspace.rootURL
+                workspaceRoot: workspace.rootURL,
+                isPinned: isPinned
             )
             servers[key]?.openDocuments[normalizedURI] = session
             servers[key]?.lastActivity = .now
@@ -202,11 +225,12 @@ actor LSPManager {
         text: String,
         version: Int = 1,
         language: LanguageSpec? = nil,
-        repoRoot: URL? = nil
+        repoRoot: URL? = nil,
+        isPinned: Bool = true
     ) async -> LSPDocumentSession? {
         let uri = LSPURI.uri(from: fileURL)
         let langID = LSPServerRegistry.languageID(for: fileURL, language: language)
-        await didOpen(uri: uri, languageId: langID, version: version, text: text, workspaceRoot: repoRoot)
+        await didOpen(uri: uri, languageId: langID, version: version, text: text, workspaceRoot: repoRoot, isPinned: isPinned)
         return openSession(forURI: uri)
     }
 
@@ -296,7 +320,8 @@ actor LSPManager {
             normalizedURI: normalizedURI,
             text: text,
             language: language,
-            workspaceRoot: workspaceRoot
+            workspaceRoot: workspaceRoot,
+            isPinnedOnAutoOpen: true
         ) else { return }
 
         var payload: [String: JSONValue] = [
@@ -328,6 +353,9 @@ actor LSPManager {
     func didClose(uri: String) async {
         let normalizedURI = LSPURI.normalize(uri)
         guard let key = documentToServer.removeValue(forKey: normalizedURI) else { return }
+        // Stamp lastActivity before unpinning and before awaiting notify so a concurrent reaper tick
+        // always starts the idle countdown from the close/switch-away instant.
+        servers[key]?.lastActivity = .now
         servers[key]?.openDocuments.removeValue(forKey: normalizedURI)
         guard let server = servers[key] else { return }
 
@@ -336,6 +364,7 @@ actor LSPManager {
         ])
         try? await server.transport.notify(method: "textDocument/didClose", params: params)
         servers[key]?.lastActivity = .now
+        ensureReaperRunning()
     }
 
     /// Convenience `fileURL` overload for `didClose`.
@@ -387,7 +416,8 @@ actor LSPManager {
         normalizedURI: String,
         text: String?,
         language: LanguageSpec?,
-        workspaceRoot: URL?
+        workspaceRoot: URL?,
+        isPinnedOnAutoOpen: Bool = false
     ) async -> (key: ServerKey, server: ServerInstance)? {
         if let key = documentToServer[normalizedURI],
            let server = servers[key] {
@@ -412,7 +442,8 @@ actor LSPManager {
             languageId: langID,
             version: 1,
             text: resolvedText,
-            workspaceRoot: workspaceRoot
+            workspaceRoot: workspaceRoot,
+            isPinned: isPinnedOnAutoOpen
         )
         guard let key = documentToServer[normalizedURI],
               let server = servers[key] else {
@@ -473,6 +504,136 @@ actor LSPManager {
         repoRoot: URL? = nil
     ) async -> [LSPLocation] {
         await definition(
+            uri: LSPURI.uri(from: fileURL),
+            line: line,
+            character: character,
+            text: text,
+            language: language,
+            workspaceRoot: repoRoot
+        )
+    }
+
+    /// Resolves `textDocument/implementation` at a 0-based `(line, character)` UTF-16 position.
+    func implementation(
+        uri: String,
+        line: Int,
+        character: Int,
+        text: String? = nil,
+        language: LanguageSpec? = nil,
+        workspaceRoot: URL? = nil
+    ) async -> [LSPLocation] {
+        guard isEffectivelyEnabled else { return [] }
+        let normalizedURI = LSPURI.normalize(uri)
+        guard let (key, server) = await ensureDocumentOpen(
+            normalizedURI: normalizedURI,
+            text: text,
+            language: language,
+            workspaceRoot: workspaceRoot
+        ) else {
+            return []
+        }
+        guard server.capabilities.implementationProvider else {
+            return []
+        }
+
+        servers[key]?.lastActivity = .now
+        let params: JSONValue = .object([
+            "textDocument": .object(["uri": .string(normalizedURI)]),
+            "position": .object([
+                "line": .int(line),
+                "character": .int(character),
+            ]),
+        ])
+
+        do {
+            let response = try await server.transport.request(
+                method: "textDocument/implementation",
+                params: params,
+                timeout: .seconds(15)
+            )
+            servers[key]?.lastActivity = .now
+            let decoded = LSPDefinitionDecoder.decode(from: response)
+            return Self.deduplicateLocations(decoded)
+        } catch {
+            return []
+        }
+    }
+
+    /// Convenience `fileURL` overload for `implementation`.
+    func implementation(
+        fileURL: URL,
+        line: Int,
+        character: Int,
+        text: String? = nil,
+        language: LanguageSpec? = nil,
+        repoRoot: URL? = nil
+    ) async -> [LSPLocation] {
+        await implementation(
+            uri: LSPURI.uri(from: fileURL),
+            line: line,
+            character: character,
+            text: text,
+            language: language,
+            workspaceRoot: repoRoot
+        )
+    }
+
+    /// Resolves `textDocument/typeDefinition` at a 0-based `(line, character)` UTF-16 position.
+    func typeDefinition(
+        uri: String,
+        line: Int,
+        character: Int,
+        text: String? = nil,
+        language: LanguageSpec? = nil,
+        workspaceRoot: URL? = nil
+    ) async -> [LSPLocation] {
+        guard isEffectivelyEnabled else { return [] }
+        let normalizedURI = LSPURI.normalize(uri)
+        guard let (key, server) = await ensureDocumentOpen(
+            normalizedURI: normalizedURI,
+            text: text,
+            language: language,
+            workspaceRoot: workspaceRoot
+        ) else {
+            return []
+        }
+        guard server.capabilities.typeDefinitionProvider else {
+            return []
+        }
+
+        servers[key]?.lastActivity = .now
+        let params: JSONValue = .object([
+            "textDocument": .object(["uri": .string(normalizedURI)]),
+            "position": .object([
+                "line": .int(line),
+                "character": .int(character),
+            ]),
+        ])
+
+        do {
+            let response = try await server.transport.request(
+                method: "textDocument/typeDefinition",
+                params: params,
+                timeout: .seconds(10)
+            )
+            servers[key]?.lastActivity = .now
+            let decoded = LSPDefinitionDecoder.decode(from: response)
+            return Self.deduplicateLocations(decoded)
+        } catch {
+            return []
+        }
+    }
+
+    /// Convenience `fileURL` overload for `typeDefinition`.
+    func typeDefinition(
+        fileURL: URL,
+        line: Int,
+        character: Int,
+        text: String? = nil,
+        language: LanguageSpec? = nil,
+        repoRoot: URL? = nil
+    ) async -> [LSPLocation] {
+        await typeDefinition(
             uri: LSPURI.uri(from: fileURL),
             line: line,
             character: character,
@@ -898,6 +1059,14 @@ actor LSPManager {
                         "dynamicRegistration": .bool(false),
                         "linkSupport": .bool(true),
                     ]),
+                    "typeDefinition": .object([
+                        "dynamicRegistration": .bool(false),
+                        "linkSupport": .bool(true),
+                    ]),
+                    "implementation": .object([
+                        "dynamicRegistration": .bool(false),
+                        "linkSupport": .bool(true),
+                    ]),
                     "references": .object([
                         "dynamicRegistration": .bool(false),
                     ]),
@@ -937,7 +1106,7 @@ actor LSPManager {
     }
 
     private func ensureReaperRunning() {
-        guard reaperTask == nil, !servers.isEmpty else { return }
+        guard reaperTask == nil, !servers.isEmpty, let idleTimeout else { return }
         let checkInterval = Self.reaperInterval(for: idleTimeout)
         reaperTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -959,10 +1128,15 @@ actor LSPManager {
     }
 
     private func reapIdleServers() async -> Bool {
+        guard let idleTimeout else {
+            reaperTask = nil
+            return false
+        }
         let now = ContinuousClock.now
         var toShutdown: [ServerInstance] = []
         for (key, instance) in servers {
-            if now - instance.lastActivity >= idleTimeout {
+            let hasPinnedDocument = instance.openDocuments.values.contains(where: \.isPinned)
+            if !hasPinnedDocument, now - instance.lastActivity >= idleTimeout {
                 toShutdown.append(instance)
                 evictServer(key: key)
             }

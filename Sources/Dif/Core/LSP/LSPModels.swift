@@ -584,6 +584,8 @@ enum LSPTextDocumentSyncKind: Int, Sendable, Codable, Equatable, Hashable {
 struct LSPServerCapabilities: Sendable, Equatable, Hashable {
     var textDocumentSync: LSPTextDocumentSyncKind
     var definitionProvider: Bool
+    var typeDefinitionProvider: Bool
+    var implementationProvider: Bool
     var documentHighlightProvider: Bool
     var semanticTokensLegend: LSPSemanticTokensLegend?
     var semanticTokensFull: Bool
@@ -591,12 +593,16 @@ struct LSPServerCapabilities: Sendable, Equatable, Hashable {
     init(
         textDocumentSync: LSPTextDocumentSyncKind,
         definitionProvider: Bool,
+        typeDefinitionProvider: Bool = false,
+        implementationProvider: Bool = false,
         documentHighlightProvider: Bool = false,
         semanticTokensLegend: LSPSemanticTokensLegend?,
         semanticTokensFull: Bool
     ) {
         self.textDocumentSync = textDocumentSync
         self.definitionProvider = definitionProvider
+        self.typeDefinitionProvider = typeDefinitionProvider
+        self.implementationProvider = implementationProvider
         self.documentHighlightProvider = documentHighlightProvider
         self.semanticTokensLegend = semanticTokensLegend
         self.semanticTokensFull = semanticTokensFull
@@ -605,6 +611,8 @@ struct LSPServerCapabilities: Sendable, Equatable, Hashable {
     static let empty = LSPServerCapabilities(
         textDocumentSync: .full,
         definitionProvider: false,
+        typeDefinitionProvider: false,
+        implementationProvider: false,
         documentHighlightProvider: false,
         semanticTokensLegend: nil,
         semanticTokensFull: false
@@ -632,6 +640,26 @@ struct LSPServerCapabilities: Sendable, Equatable, Hashable {
             definitionProvider = true
         } else {
             definitionProvider = false
+        }
+
+        // typeDefinitionProvider can be a boolean or an options object.
+        let typeDefinitionProvider: Bool
+        if let flag = caps["typeDefinitionProvider"]?.boolValue {
+            typeDefinitionProvider = flag
+        } else if caps["typeDefinitionProvider"]?.objectValue != nil {
+            typeDefinitionProvider = true
+        } else {
+            typeDefinitionProvider = false
+        }
+
+        // implementationProvider can be a boolean or an options object.
+        let implementationProvider: Bool
+        if let flag = caps["implementationProvider"]?.boolValue {
+            implementationProvider = flag
+        } else if caps["implementationProvider"]?.objectValue != nil {
+            implementationProvider = true
+        } else {
+            implementationProvider = false
         }
 
         // documentHighlightProvider can be a boolean or an options object.
@@ -665,6 +693,8 @@ struct LSPServerCapabilities: Sendable, Equatable, Hashable {
         return LSPServerCapabilities(
             textDocumentSync: syncKind,
             definitionProvider: definitionProvider,
+            typeDefinitionProvider: typeDefinitionProvider,
+            implementationProvider: implementationProvider,
             documentHighlightProvider: documentHighlightProvider,
             semanticTokensLegend: legend,
             semanticTokensFull: fullSupport && legend != nil
@@ -679,4 +709,5 @@ struct LSPDocumentSession: Sendable, Equatable, Hashable {
     let languageID: String
     var version: Int
     let workspaceRoot: URL
+    var isPinned: Bool = true
 }

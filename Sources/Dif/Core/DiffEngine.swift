@@ -1064,80 +1064,359 @@ enum DiffRefiner {
                 ib += 1
             }
 
-            // Group matched pairs into contiguous diagonal runs and keep only runs containing at least one substantive line.
-            var keptRuns: [(leftStart: Int, rightStart: Int, count: Int)] = []
-            var pIdx = 0
-            while pIdx < pairs.count {
-                let runStartIdx = pIdx
-                var runEndIdx = pIdx + 1
-                while runEndIdx < pairs.count
-                        && pairs[runEndIdx].0 == pairs[runEndIdx - 1].0 + 1
-                        && pairs[runEndIdx].1 == pairs[runEndIdx - 1].1 + 1 {
-                    runEndIdx += 1
-                }
-                if pairs[runStartIdx..<runEndIdx].contains(where: { isSubstantive(normL[$0.0]) }) {
-                    keptRuns.append((
-                        leftStart: pairs[runStartIdx].0,
-                        rightStart: pairs[runStartIdx].1,
-                        count: runEndIdx - runStartIdx
-                    ))
-                }
-                pIdx = runEndIdx
-            }
-
+            let keptRuns = contiguousAnchorRuns(pairs) { isSubstantive(normL[$0.0]) }
             guard !keptRuns.isEmpty else {
                 result.append(h)
                 continue
             }
-
-            var rawSubHunks: [Hunk] = []
-            var curL = 0
-            var curR = 0
-            for run in keptRuns {
-                if run.leftStart > curL || run.rightStart > curR {
-                    rawSubHunks.append(Hunk(
-                        leftStart: h.leftStart + curL,
-                        leftCount: run.leftStart - curL,
-                        rightStart: h.rightStart + curR,
-                        rightCount: run.rightStart - curR
-                    ))
-                }
-                rawSubHunks.append(Hunk(
-                    leftStart: h.leftStart + run.leftStart,
-                    leftCount: run.count,
-                    rightStart: h.rightStart + run.rightStart,
-                    rightCount: run.count
-                ))
-                curL = run.leftStart + run.count
-                curR = run.rightStart + run.count
-            }
-            if h.leftCount > curL || h.rightCount > curR {
-                rawSubHunks.append(Hunk(
-                    leftStart: h.leftStart + curL,
-                    leftCount: h.leftCount - curL,
-                    rightStart: h.rightStart + curR,
-                    rightCount: h.rightCount - curR
-                ))
-            }
-
-            var coalesced: [Hunk] = []
-            for sub in rawSubHunks {
-                if let last = coalesced.last, last.kind == .modified, sub.kind == .modified {
-                    coalesced[coalesced.count - 1].leftCount += sub.leftCount
-                    coalesced[coalesced.count - 1].rightCount += sub.rightCount
-                } else {
-                    coalesced.append(sub)
-                }
-            }
-
-            if coalesced.count > 1 {
-                result.append(contentsOf: coalesced)
-            } else {
-                result.append(h)
-            }
+            result.append(contentsOf: splitModifiedHunk(h, keepingRuns: keptRuns))
         }
 
         return result
+    }
+
+    private struct SimilarityToken {
+        var hash: UInt64
+        var weight: Int
+        var isWord: Bool
+    }
+
+    private struct LineSignature {
+        var stripped: String
+        var isTrivial: Bool
+        var isComment: Bool
+        var isHeader: Bool
+        var tokens: [SimilarityToken]
+        var totalWeight: Int
+        var weightByHash: [UInt64: Int]
+        var wordHashes: Set<UInt64>
+    }
+
+    private static let preprocessorKeywords: Set<String> = [
+        "include", "import", "define", "undef", "if", "ifdef", "ifndef",
+        "elif", "else", "endif", "pragma", "error", "warning", "line", "region", "endregion",
+    ]
+
+    private static func isCommentLine(_ line: String) -> Bool {
+        let trimmed = line.drop(while: { $0 == " " || $0 == "\t" })
+        guard let first = trimmed.first else { return false }
+        if trimmed.hasPrefix("//") || trimmed.hasPrefix("/*") || trimmed.hasPrefix("*/") || trimmed.hasPrefix("--") {
+            return true
+        }
+        if first == "*" {
+            let after = trimmed.dropFirst()
+            return after.isEmpty || after.first == " " || after.first == "\t"
+        }
+        if first == "#" {
+            let after = trimmed.dropFirst()
+            if after.hasPrefix("[") || after.hasPrefix("![") { return false }
+            let directive = after.drop(while: { $0 == " " || $0 == "\t" }).prefix(while: { $0.isLetter })
+            if !directive.isEmpty && preprocessorKeywords.contains(String(directive)) {
+                return false
+            }
+            return true
+        }
+        return false
+    }
+
+    @inline(__always)
+    private static func isCJKWordUnit(_ u: UInt16) -> Bool {
+        (u >= 0x3040 && u <= 0x30FF)
+            || (u >= 0x3400 && u <= 0x4DBF)
+            || (u >= 0x4E00 && u <= 0x9FFF)
+            || (u >= 0xAC00 && u <= 0xD7AF)
+            || (u >= 0xF900 && u <= 0xFAFF)
+    }
+
+    private static func lineSignature(_ line: String) -> LineSignature {
+        let stripped = stripHorizontalWhitespace(line)
+        let isTrivial = stripped.isEmpty || isTrivialDelimiter(stripped)
+        let isComment = !isTrivial && isCommentLine(line)
+        let isHeader = !isTrivial && !isComment && isStructuralHeader(line)
+
+        var tokens: [SimilarityToken] = []
+        var weightByHash: [UInt64: Int] = [:]
+        var wordHashes = Set<UInt64>()
+        var totalWeight = 0
+
+        if !isTrivial {
+            var hash: UInt64 = 0xcbf29ce484222325
+            var cls = -1 // 0 word, 1 space
+            var len = 0
+
+            func appendToken(hash: UInt64, weight: Int, isWord: Bool) {
+                tokens.append(SimilarityToken(hash: hash, weight: weight, isWord: isWord))
+                totalWeight += weight
+                weightByHash[hash, default: 0] += weight
+                if isWord { wordHashes.insert(hash) }
+            }
+
+            func flushWord() {
+                if cls == 0, len > 0 {
+                    appendToken(hash: hash ^ UInt64(len), weight: len, isWord: true)
+                }
+                cls = -1
+                len = 0
+                hash = 0xcbf29ce484222325
+            }
+
+            for unit in line.utf16 {
+                if unit == 32 || unit == 9 || unit == 13 {
+                    flushWord()
+                    continue
+                }
+                let isWordChar = (unit >= 48 && unit <= 57)
+                    || (unit >= 65 && unit <= 90)
+                    || (unit >= 97 && unit <= 122)
+                    || unit == 95
+                    || (unit >= 0x80 && unit < 0x2E80)
+                    || (unit >= 0xDC00 && unit <= 0xDFFF)
+                if isWordChar {
+                    if cls != 0 { flushWord(); cls = 0 }
+                    hash = (hash ^ UInt64(unit)) &* 0x100000001b3
+                    len += 1
+                } else {
+                    flushWord()
+                    if unit >= 0xD800 && unit <= 0xDBFF {
+                        cls = 0
+                        hash = (0xcbf29ce484222325 ^ UInt64(unit)) &* 0x100000001b3
+                        len = 1
+                    } else {
+                        let singleHash = (0xcbf29ce484222325 ^ UInt64(unit)) &* 0x100000001b3
+                        appendToken(hash: singleHash, weight: 1, isWord: isCJKWordUnit(unit))
+                    }
+                }
+            }
+            flushWord()
+        }
+
+        return LineSignature(
+            stripped: stripped,
+            isTrivial: isTrivial,
+            isComment: isComment,
+            isHeader: isHeader,
+            tokens: tokens,
+            totalWeight: totalWeight,
+            weightByHash: weightByHash,
+            wordHashes: wordHashes
+        )
+    }
+
+    private static func lineAlignmentScore(_ a: LineSignature, _ b: LineSignature) -> Int64? {
+        guard !a.isTrivial, !b.isTrivial, a.isComment == b.isComment else { return nil }
+        let totalWeight = a.totalWeight + b.totalWeight
+        guard totalWeight > 0 else { return nil }
+
+        let bothHeaders = a.isHeader && b.isHeader
+        if a.stripped == b.stripped {
+            return Int64(a.totalWeight) * 1000 + (bothHeaders ? 20_000 : 0)
+        }
+
+        if !a.wordHashes.isEmpty, !b.wordHashes.isEmpty, a.wordHashes.isDisjoint(with: b.wordHashes) {
+            return nil
+        }
+
+        let threshold = bothHeaders ? 0.50 : 0.60
+        let minWeight = min(a.totalWeight, b.totalWeight)
+        guard Double(2 * minWeight) / Double(totalWeight) >= threshold else { return nil }
+
+        let smaller = a.weightByHash.count <= b.weightByHash.count ? a.weightByHash : b.weightByHash
+        let larger = a.weightByHash.count <= b.weightByHash.count ? b.weightByHash : a.weightByHash
+        var multisetShared = 0
+        for (h, w) in smaller {
+            if let lw = larger[h] {
+                multisetShared += min(w, lw)
+            }
+        }
+        guard Double(2 * multisetShared) / Double(totalWeight) >= threshold else { return nil }
+
+        let matchedWeight: Int
+        if a.tokens.count <= 160 && b.tokens.count <= 160 {
+            let m = b.tokens.count
+            var prev = [Int](repeating: 0, count: m + 1)
+            var curr = [Int](repeating: 0, count: m + 1)
+            for ta in a.tokens {
+                for j in 0..<m {
+                    let tb = b.tokens[j]
+                    if ta.hash == tb.hash && ta.isWord == tb.isWord {
+                        curr[j + 1] = prev[j] + ta.weight
+                    } else {
+                        curr[j + 1] = max(prev[j + 1], curr[j])
+                    }
+                }
+                swap(&prev, &curr)
+            }
+            matchedWeight = prev[m]
+        } else {
+            matchedWeight = multisetShared
+        }
+
+        let sim = Double(2 * matchedWeight) / Double(totalWeight)
+        guard sim >= threshold else { return nil }
+        return Int64((sim * Double(matchedWeight) * 1000.0).rounded()) + (bothHeaders ? 20_000 : 0)
+    }
+
+    /// Splits `.modified` hunks when high-similarity modified lines (such as edited function headers
+    /// or conditionals) are mixed with added comments or deleted body lines, keeping each side
+    /// properly aligned instead of shifting lines across pure insertions/deletions.
+    static func splitSimilarAlignedHunks(_ hunks: [Hunk], oldLines: [String], newLines: [String]) -> [Hunk] {
+        var result: [Hunk] = []
+        result.reserveCapacity(hunks.count)
+
+        for h in hunks {
+            guard h.kind == .modified,
+                  h.leftCount + h.rightCount >= 3,
+                  h.leftCount <= 200, h.rightCount <= 200,
+                  isValidHunk(h, oldCount: oldLines.count, newCount: newLines.count) else {
+                result.append(h)
+                continue
+            }
+
+            let sigL = (h.leftStart..<(h.leftStart + h.leftCount)).map { lineSignature(oldLines[$0]) }
+            let sigR = (h.rightStart..<(h.rightStart + h.rightCount)).map { lineSignature(newLines[$0]) }
+
+            let n = sigL.count
+            let m = sigR.count
+            let stride = m + 1
+            var dp = [Int64](repeating: 0, count: (n + 1) * stride)
+            var choice = [UInt8](repeating: 0, count: (n + 1) * stride) // 0 skip L, 1 skip R, 2 match
+            var prevMatched = [Bool](repeating: false, count: (n + 1) * stride)
+            var hasAnyMatch = false
+
+            for i in 1...n {
+                for j in 1...m {
+                    let idx = i * stride + j
+                    var best = dp[(i - 1) * stride + j]
+                    var bestChoice: UInt8 = 0
+                    var bestMatched = false
+
+                    let skipR = dp[i * stride + (j - 1)]
+                    if skipR > best {
+                        best = skipR
+                        bestChoice = 1
+                    }
+
+                    if let pairScore = lineAlignmentScore(sigL[i - 1], sigR[j - 1]) {
+                        hasAnyMatch = true
+                        let prevIdx = (i - 1) * stride + (j - 1)
+                        let contigBonus: Int64 = prevMatched[prevIdx] ? 250 : 0
+                        let cand = dp[prevIdx] + pairScore + contigBonus
+                        if cand > best {
+                            best = cand
+                            bestChoice = 2
+                            bestMatched = true
+                        }
+                    }
+
+                    dp[idx] = best
+                    choice[idx] = bestChoice
+                    prevMatched[idx] = bestMatched
+                }
+            }
+
+            guard hasAnyMatch else {
+                result.append(h)
+                continue
+            }
+
+            var pairs: [(Int, Int)] = []
+            var bi = n
+            var bj = m
+            while bi > 0 && bj > 0 {
+                switch choice[bi * stride + bj] {
+                case 2:
+                    pairs.append((bi - 1, bj - 1))
+                    bi -= 1
+                    bj -= 1
+                case 0:
+                    bi -= 1
+                default:
+                    bj -= 1
+                }
+            }
+            pairs.reverse()
+
+            let keptRuns = contiguousAnchorRuns(pairs) { _ in true }
+            guard !keptRuns.isEmpty else {
+                result.append(h)
+                continue
+            }
+            result.append(contentsOf: splitModifiedHunk(h, keepingRuns: keptRuns))
+        }
+
+        return result
+    }
+
+    private static func contiguousAnchorRuns(
+        _ pairs: [(Int, Int)],
+        shouldKeep: ((Int, Int)) -> Bool
+    ) -> [(leftStart: Int, rightStart: Int, count: Int)] {
+        var keptRuns: [(leftStart: Int, rightStart: Int, count: Int)] = []
+        var pIdx = 0
+        while pIdx < pairs.count {
+            let runStartIdx = pIdx
+            var runEndIdx = pIdx + 1
+            while runEndIdx < pairs.count
+                    && pairs[runEndIdx].0 == pairs[runEndIdx - 1].0 + 1
+                    && pairs[runEndIdx].1 == pairs[runEndIdx - 1].1 + 1 {
+                runEndIdx += 1
+            }
+            if pairs[runStartIdx..<runEndIdx].contains(where: shouldKeep) {
+                keptRuns.append((
+                    leftStart: pairs[runStartIdx].0,
+                    rightStart: pairs[runStartIdx].1,
+                    count: runEndIdx - runStartIdx
+                ))
+            }
+            pIdx = runEndIdx
+        }
+        return keptRuns
+    }
+
+    private static func splitModifiedHunk(
+        _ h: Hunk,
+        keepingRuns keptRuns: [(leftStart: Int, rightStart: Int, count: Int)]
+    ) -> [Hunk] {
+        var rawSubHunks: [Hunk] = []
+        var curL = 0
+        var curR = 0
+        for run in keptRuns {
+            if run.leftStart > curL || run.rightStart > curR {
+                rawSubHunks.append(Hunk(
+                    leftStart: h.leftStart + curL,
+                    leftCount: run.leftStart - curL,
+                    rightStart: h.rightStart + curR,
+                    rightCount: run.rightStart - curR
+                ))
+            }
+            rawSubHunks.append(Hunk(
+                leftStart: h.leftStart + run.leftStart,
+                leftCount: run.count,
+                rightStart: h.rightStart + run.rightStart,
+                rightCount: run.count
+            ))
+            curL = run.leftStart + run.count
+            curR = run.rightStart + run.count
+        }
+        if h.leftCount > curL || h.rightCount > curR {
+            rawSubHunks.append(Hunk(
+                leftStart: h.leftStart + curL,
+                leftCount: h.leftCount - curL,
+                rightStart: h.rightStart + curR,
+                rightCount: h.rightCount - curR
+            ))
+        }
+
+        var coalesced: [Hunk] = []
+        for sub in rawSubHunks {
+            if let last = coalesced.last, last.kind == .modified, sub.kind == .modified {
+                coalesced[coalesced.count - 1].leftCount += sub.leftCount
+                coalesced[coalesced.count - 1].rightCount += sub.rightCount
+            } else {
+                coalesced.append(sub)
+            }
+        }
+        return coalesced.count > 1 ? coalesced : [h]
     }
 }
 
@@ -2483,6 +2762,7 @@ enum DiffLoader {
         if !ignoreWhitespace {
             hunks = DiffRefiner.splitWhitespaceAlignedHunks(hunks, oldLines: oldLines, newLines: newLines)
         }
+        hunks = DiffRefiner.splitSimilarAlignedHunks(hunks, oldLines: oldLines, newLines: newLines)
         return hunks
     }
 

@@ -1028,19 +1028,23 @@ final class LSPIntegrationTests: XCTestCase {
 
         let target = CodeCanvasView.LSPHoverTarget(row: 1, line: 1, column: 6, range: 5..<10)
 
-        // Direct edition + eligible symbol -> prepends Go to Definition & Find All References
+        // Direct edition + eligible symbol -> prepends Go to Definition, Go to Implementation, Go to Type Definition & Find All References
         AppEnvironment.edition = .direct
         container.canvas.noteContextLSPSymbol(target)
         let directMenu = try XCTUnwrap(store.viewerContextMenu())
-        XCTAssertGreaterThanOrEqual(directMenu.items.count, 3)
+        XCTAssertGreaterThanOrEqual(directMenu.items.count, 5)
         XCTAssertEqual(directMenu.items[0].title, L("Go to Definition", "跳转到声明"))
-        XCTAssertEqual(directMenu.items[1].title, L("Find All References", "查找所有引用"))
-        XCTAssertTrue(directMenu.items[2].isSeparatorItem)
+        XCTAssertEqual(directMenu.items[1].title, L("Go to Implementation", "跳转到实现"))
+        XCTAssertEqual(directMenu.items[2].title, L("Go to Type Definition", "跳转到类型定义"))
+        XCTAssertEqual(directMenu.items[3].title, L("Find All References", "查找所有引用"))
+        XCTAssertTrue(directMenu.items[4].isSeparatorItem)
 
         // No symbol under pointer -> LSP items omitted
         container.canvas.noteContextLSPSymbol(nil)
         let noSymbolMenu = try XCTUnwrap(store.viewerContextMenu())
         XCTAssertFalse(noSymbolMenu.items.contains { $0.title == L("Go to Definition", "跳转到声明") })
+        XCTAssertFalse(noSymbolMenu.items.contains { $0.title == L("Go to Implementation", "跳转到实现") })
+        XCTAssertFalse(noSymbolMenu.items.contains { $0.title == L("Go to Type Definition", "跳转到类型定义") })
         XCTAssertFalse(noSymbolMenu.items.contains { $0.title == L("Find All References", "查找所有引用") })
 
         // App Store edition -> LSP items never shown even if target is set
@@ -1048,6 +1052,8 @@ final class LSPIntegrationTests: XCTestCase {
         container.canvas.noteContextLSPSymbol(target)
         let appStoreMenu = try XCTUnwrap(store.viewerContextMenu())
         XCTAssertFalse(appStoreMenu.items.contains { $0.title == L("Go to Definition", "跳转到声明") })
+        XCTAssertFalse(appStoreMenu.items.contains { $0.title == L("Go to Implementation", "跳转到实现") })
+        XCTAssertFalse(appStoreMenu.items.contains { $0.title == L("Go to Type Definition", "跳转到类型定义") })
         XCTAssertFalse(appStoreMenu.items.contains { $0.title == L("Find All References", "查找所有引用") })
     }
 
@@ -1201,6 +1207,361 @@ final class LSPIntegrationTests: XCTestCase {
         XCTAssertTrue(store.jumpHistory.canGoBack)
         XCTAssertEqual(store.jumpHistory.backStack.last?.fileURL, mainFile)
         XCTAssertEqual(store.jumpHistory.backStack.last?.line, 2)
+
+        await manager.shutdownAll()
+    }
+
+    @MainActor
+    func testGoToImplementationSingleJumpMultiplePickerEmptyToastAndVimDispatch() async throws {
+        let originalEdition = AppEnvironment.edition
+        AppEnvironment.edition = .direct
+        defer { AppEnvironment.edition = originalEdition }
+
+        let dir = try makeTempDir(prefix: "dif-impl-nav")
+        let repo = dir.appendingPathComponent("repo", isDirectory: true)
+        let ifaceFile = repo.appendingPathComponent("greeter.go")
+        let implAFile = repo.appendingPathComponent("impl_a.go")
+        let implBFile = repo.appendingPathComponent("impl_b.go")
+        try writeFile(repo.appendingPathComponent("go.mod"), contents: "module example.com/repo\ngo 1.22\n")
+        try writeFile(ifaceFile, contents: """
+        package repo
+        type Single interface { One() }
+        type Multi interface { Two() }
+        type None interface { Three() }
+        """)
+        try writeFile(implAFile, contents: "package repo\ntype ImplA struct{}\nfunc (ImplA) One() {}\nfunc (ImplA) Two() {}\n")
+        try writeFile(implBFile, contents: "package repo\ntype ImplB struct{}\nfunc (ImplB) Two() {}\n")
+
+        let implAURI = LSPURI.uri(from: implAFile)
+        let implBURI = LSPURI.uri(from: implBFile)
+        let script = dir.appendingPathComponent("mock-impl-nav.py")
+        let source = """
+        #!/usr/bin/env python3
+        import json, sys
+
+        def read_msg():
+            headers = {}
+            while True:
+                line = sys.stdin.buffer.readline()
+                if not line:
+                    return None
+                if line in (b"\\r\\n", b"\\n"):
+                    break
+                k, _, v = line.decode("utf-8", "replace").partition(":")
+                headers[k.strip().lower()] = v.strip()
+            n = int(headers.get("content-length", "0"))
+            return json.loads(sys.stdin.buffer.read(n).decode("utf-8")) if n > 0 else None
+
+        def send_msg(obj):
+            raw = json.dumps(obj).encode("utf-8")
+            sys.stdout.buffer.write(f"Content-Length: {len(raw)}\\r\\n\\r\\n".encode("ascii") + raw)
+            sys.stdout.buffer.flush()
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            method = msg.get("method")
+            msg_id = msg.get("id")
+            params = msg.get("params") or {}
+            if method == "initialize":
+                send_msg({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "capabilities": {
+                            "textDocumentSync": 1,
+                            "definitionProvider": True,
+                            "implementationProvider": True,
+                        }
+                    },
+                })
+            elif method == "textDocument/implementation":
+                line = (params.get("position") or {}).get("line", 0)
+                if line == 1:
+                    send_msg({
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": [{
+                            "uri": "\(implAURI)",
+                            "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 10}},
+                        }],
+                    })
+                elif line == 2:
+                    send_msg({
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": [
+                            {"uri": "\(implAURI)", "range": {"start": {"line": 3, "character": 13}, "end": {"line": 3, "character": 16}}},
+                            {"uri": "\(implBURI)", "range": {"start": {"line": 2, "character": 13}, "end": {"line": 2, "character": 16}}},
+                        ],
+                    })
+                else:
+                    send_msg({"jsonrpc": "2.0", "id": msg_id, "result": []})
+            elif method == "shutdown":
+                send_msg({"jsonrpc": "2.0", "id": msg_id, "result": None})
+            elif method == "exit":
+                break
+        """
+        try writeFile(script, contents: source)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let server = LSPResolvedServer(
+            descriptor: LSPServerRegistry.go,
+            executablePath: "/usr/bin/python3",
+            arguments: [script.path],
+            environment: AppEnvironment.childEnvironment
+        )
+        let manager = LSPManager(isEnabled: true, serverOverrides: [LSPServerRegistry.go.id: server])
+
+        let store = AppStore.shared
+        let prevManager = store.viewer.lspManager
+        let prevReq = store.viewer.request
+        let prevDoc = store.viewer.document
+        let prevLSPDoc = store.viewer.lspDocument
+        let prevPopup = store.popup
+        let prevExternal = store.externalRequest
+        let prevHistory = store.jumpHistory
+        let prevToast = store.toast
+        defer {
+            store.definitionTask?.cancel()
+            store.dismissPopup(restoreFocus: false)
+            store.dismissToast()
+            store.viewer.lspManager = prevManager
+            store.viewer.request = prevReq
+            store.viewer.document = prevDoc
+            store.viewer.lspDocument = prevLSPDoc
+            store.popup = prevPopup
+            store.externalRequest = prevExternal
+            store.jumpHistory = prevHistory
+            store.toast = prevToast
+        }
+
+        store.viewer.lspManager = manager
+        store.jumpHistory.clear()
+        store.dismissToast()
+
+        func openIface() async {
+            let req = DiffRequest(root: repo, path: "greeter.go", oldPath: nil, kind: nil, source: .file)
+            let doc = await DiffLoader.load(req)
+            store.externalRequest = nil
+            store.viewer.request = req
+            store.viewer.document = doc
+            store.viewer.syncLSPForCurrentDocument()
+            await store.viewer.lspTask?.value
+        }
+
+        // 1. Single implementation via Vim action -> jumps directly & records jump history
+        await openIface()
+        store.handleVimAction(.goToImplementation, line: 1, column: 6)
+        await store.definitionTask?.value
+        XCTAssertNil(store.popup)
+        XCTAssertEqual(store.externalRequest?.fileURL, implAFile)
+        XCTAssertTrue(store.jumpHistory.canGoBack)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.fileURL, ifaceFile)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.line, 2)
+
+        store.navigateBack()
+        XCTAssertEqual(store.viewer.request?.fileURL, ifaceFile)
+
+        // 2. Multiple implementations -> opens picker popup with Implementations title and jumps on activate
+        await openIface()
+        store.goToImplementation(atLine: 2, utf16Column: 6)
+        await store.definitionTask?.value
+        XCTAssertEqual(store.popup, .references)
+        XCTAssertEqual(store.references.symbolName, "Multi")
+        XCTAssertTrue(store.references.title.contains("Multi"))
+        XCTAssertEqual(store.references.items.count, 2)
+        XCTAssertTrue(store.references.items.allSatisfy { !$0.isDeclaration })
+
+        store.references.activate(1)
+        XCTAssertNil(store.popup)
+        XCTAssertEqual(store.externalRequest?.fileURL, implBFile)
+
+        // 3. Empty result -> stays on current file, no popup, shows friendly toast
+        await openIface()
+        store.goToImplementation(atLine: 3, utf16Column: 6)
+        await store.definitionTask?.value
+        XCTAssertNil(store.popup)
+        XCTAssertEqual(store.toast, L("No implementations found", "未找到实现"))
+
+        await manager.shutdownAll()
+    }
+
+    @MainActor
+    func testGoToTypeDefinitionSingleJumpMultiplePickerEmptyToastAndVimDispatch() async throws {
+        let originalEdition = AppEnvironment.edition
+        AppEnvironment.edition = .direct
+        defer { AppEnvironment.edition = originalEdition }
+
+        let dir = try makeTempDir(prefix: "dif-typedef-nav")
+        let repo = dir.appendingPathComponent("repo", isDirectory: true)
+        let appFile = repo.appendingPathComponent("app.go")
+        let userFile = repo.appendingPathComponent("user.go")
+        let adminFile = repo.appendingPathComponent("admin.go")
+        try writeFile(repo.appendingPathComponent("go.mod"), contents: "module example.com/repo\ngo 1.22\n")
+        try writeFile(appFile, contents: """
+        package repo
+        func single(u User) {}
+        func multi(m Any) {}
+        func none(n int) {}
+        """)
+        try writeFile(userFile, contents: "package repo\ntype User struct{}\n")
+        try writeFile(adminFile, contents: "package repo\ntype Admin struct{}\n")
+
+        let userURI = LSPURI.uri(from: userFile)
+        let adminURI = LSPURI.uri(from: adminFile)
+        let script = dir.appendingPathComponent("mock-typedef-nav.py")
+        let source = """
+        #!/usr/bin/env python3
+        import json, sys
+
+        def read_msg():
+            headers = {}
+            while True:
+                line = sys.stdin.buffer.readline()
+                if not line:
+                    return None
+                if line in (b"\\r\\n", b"\\n"):
+                    break
+                k, _, v = line.decode("utf-8", "replace").partition(":")
+                headers[k.strip().lower()] = v.strip()
+            n = int(headers.get("content-length", "0"))
+            return json.loads(sys.stdin.buffer.read(n).decode("utf-8")) if n > 0 else None
+
+        def send_msg(obj):
+            raw = json.dumps(obj).encode("utf-8")
+            sys.stdout.buffer.write(f"Content-Length: {len(raw)}\\r\\n\\r\\n".encode("ascii") + raw)
+            sys.stdout.buffer.flush()
+
+        while True:
+            msg = read_msg()
+            if msg is None:
+                break
+            method = msg.get("method")
+            msg_id = msg.get("id")
+            params = msg.get("params") or {}
+            if method == "initialize":
+                send_msg({
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "capabilities": {
+                            "textDocumentSync": 1,
+                            "definitionProvider": True,
+                            "typeDefinitionProvider": True,
+                        }
+                    },
+                })
+            elif method == "textDocument/typeDefinition":
+                line = (params.get("position") or {}).get("line", 0)
+                if line == 1:
+                    send_msg({
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": [{
+                            "uri": "\(userURI)",
+                            "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 9}},
+                        }],
+                    })
+                elif line == 2:
+                    send_msg({
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": [
+                            {"uri": "\(userURI)", "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 9}}},
+                            {"uri": "\(adminURI)", "range": {"start": {"line": 1, "character": 5}, "end": {"line": 1, "character": 10}}},
+                        ],
+                    })
+                else:
+                    send_msg({"jsonrpc": "2.0", "id": msg_id, "result": []})
+            elif method == "shutdown":
+                send_msg({"jsonrpc": "2.0", "id": msg_id, "result": None})
+            elif method == "exit":
+                break
+        """
+        try writeFile(script, contents: source)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+        let server = LSPResolvedServer(
+            descriptor: LSPServerRegistry.go,
+            executablePath: "/usr/bin/python3",
+            arguments: [script.path],
+            environment: AppEnvironment.childEnvironment
+        )
+        let manager = LSPManager(isEnabled: true, serverOverrides: [LSPServerRegistry.go.id: server])
+
+        let store = AppStore.shared
+        let prevManager = store.viewer.lspManager
+        let prevReq = store.viewer.request
+        let prevDoc = store.viewer.document
+        let prevLSPDoc = store.viewer.lspDocument
+        let prevPopup = store.popup
+        let prevExternal = store.externalRequest
+        let prevHistory = store.jumpHistory
+        let prevToast = store.toast
+        defer {
+            store.definitionTask?.cancel()
+            store.dismissPopup(restoreFocus: false)
+            store.dismissToast()
+            store.viewer.lspManager = prevManager
+            store.viewer.request = prevReq
+            store.viewer.document = prevDoc
+            store.viewer.lspDocument = prevLSPDoc
+            store.popup = prevPopup
+            store.externalRequest = prevExternal
+            store.jumpHistory = prevHistory
+            store.toast = prevToast
+        }
+
+        store.viewer.lspManager = manager
+        store.jumpHistory.clear()
+        store.dismissToast()
+
+        func openApp() async {
+            let req = DiffRequest(root: repo, path: "app.go", oldPath: nil, kind: nil, source: .file)
+            let doc = await DiffLoader.load(req)
+            store.externalRequest = nil
+            store.viewer.request = req
+            store.viewer.document = doc
+            store.viewer.syncLSPForCurrentDocument()
+            await store.viewer.lspTask?.value
+        }
+
+        // 1. Single type definition via Vim action `gy` -> jumps directly & records jump history
+        await openApp()
+        store.handleVimAction(.goToTypeDefinition, line: 1, column: 12)
+        await store.definitionTask?.value
+        XCTAssertNil(store.popup)
+        XCTAssertEqual(store.externalRequest?.fileURL, userFile)
+        XCTAssertTrue(store.jumpHistory.canGoBack)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.fileURL, appFile)
+        XCTAssertEqual(store.jumpHistory.backStack.last?.line, 2)
+
+        store.navigateBack()
+        XCTAssertEqual(store.viewer.request?.fileURL, appFile)
+
+        // 2. Multiple type definitions -> opens picker popup with Type Definition title and jumps on activate
+        await openApp()
+        store.goToTypeDefinition(atLine: 2, utf16Column: 11)
+        await store.definitionTask?.value
+        XCTAssertEqual(store.popup, .references)
+        XCTAssertEqual(store.references.symbolName, "m")
+        XCTAssertTrue(store.references.title.contains("m"))
+        XCTAssertEqual(store.references.items.count, 2)
+        XCTAssertEqual(store.references.items.map(\.fileURL), [adminFile, userFile])
+        XCTAssertTrue(store.references.items.allSatisfy { !$0.isDeclaration })
+
+        store.references.activate(0)
+        XCTAssertNil(store.popup)
+        XCTAssertEqual(store.externalRequest?.fileURL, adminFile)
+
+        // 3. Empty result -> stays on current file, no popup, shows friendly toast
+        await openApp()
+        store.goToTypeDefinition(atLine: 3, utf16Column: 10)
+        await store.definitionTask?.value
+        XCTAssertNil(store.popup)
+        XCTAssertEqual(store.toast, L("No type definition found", "未找到类型定义"))
 
         await manager.shutdownAll()
     }
@@ -1751,10 +2112,12 @@ final class LSPIntegrationTests: XCTestCase {
         XCTAssertTrue(container.canvas.isLSPEnabled)
         XCTAssertNil(store.viewer.lspDocument, "Historical commit diff must never open a live LSP buffer")
 
-        // Verify right-click context menu shows Go to Definition & Find All References on commit diff.
+        // Verify right-click context menu shows Go to Definition, Go to Implementation, Go to Type Definition & Find All References on commit diff.
         container.canvas.noteContextLSPSymbol(CodeCanvasView.LSPHoverTarget(row: 2, line: 2, column: 15, range: 14..<20))
         let menuTitles = store.viewerContextMenu()?.items.map(\.title) ?? []
         XCTAssertTrue(menuTitles.contains("跳转到声明") || menuTitles.contains("Go to Definition"))
+        XCTAssertTrue(menuTitles.contains("跳转到实现") || menuTitles.contains("Go to Implementation"))
+        XCTAssertTrue(menuTitles.contains("跳转到类型定义") || menuTitles.contains("Go to Type Definition"))
         XCTAssertTrue(menuTitles.contains("查找所有引用") || menuTitles.contains("Find All References"))
 
         // Click `Helper` at line 2, col 15 in the commit diff -> maps to line 4 in working tree on disk!

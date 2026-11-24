@@ -509,7 +509,7 @@ extension AppStore {
     }
 
     /// Back to the local changes.
-    func endComparison(in project: Project? = nil) {
+    func endComparison(in project: Project? = nil, sync: Bool = true) {
         exitExternalFileMode()
         guard let project = project ?? currentProject, project.comparison != nil else { return }
         project.comparison = nil
@@ -517,7 +517,7 @@ extension AppStore {
         project.compareSelectedID = nil
         project.compareError = nil
         project.loadComparison()
-        syncViewer()
+        if sync { syncViewer() }
     }
 
     /// Picks a branch or tag (or types a commit) to compare the working tree with.

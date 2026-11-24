@@ -36,6 +36,28 @@ final class KeymapTests: XCTestCase {
     }
 
     @MainActor
+    func testLSPIdleTimeoutDefaultsAndPersistence() throws {
+        let suiteName = "KeymapTests.LSPIdle.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let initial = Settings(defaults: defaults)
+        XCTAssertEqual(initial.lspIdleTimeout, .minutes15)
+        XCTAssertEqual(Settings.LSPIdleTimeout.minutes5.duration, .seconds(300))
+        XCTAssertEqual(Settings.LSPIdleTimeout.minutes15.duration, .seconds(900))
+        XCTAssertEqual(Settings.LSPIdleTimeout.minutes30.duration, .seconds(1800))
+        XCTAssertEqual(Settings.LSPIdleTimeout.hour1.duration, .seconds(3600))
+        XCTAssertNil(Settings.LSPIdleTimeout.never.duration)
+
+        for option in Settings.LSPIdleTimeout.allCases {
+            initial.lspIdleTimeout = option
+            initial.save()
+            let reloaded = Settings(defaults: defaults)
+            XCTAssertEqual(reloaded.lspIdleTimeout, option)
+        }
+    }
+
+    @MainActor
     func testGoLandKeymapBindingsMatchMacOSCopy() {
         let commands = AppStore.shared.commands
         func command(_ id: String) -> AppCommand? {

@@ -149,6 +149,8 @@ final class Settings {
     var stickyLines: Bool
     /// Maximum number of sticky header lines pinned simultaneously.
     var stickyLinesMaxCount: Int
+    /// Automatically run `go fmt` (`gofmt`) after saving a Go file.
+    var formatGoOnSave: Bool
     /// Show the Beyond Compare-style bottom inline line diff bar under the code viewer.
     var showLineDiffBar: Bool
     /// Automatically open the 3-way merge window whenever Git stops at merge/rebase/cherry-pick/stash conflicts.
@@ -169,6 +171,32 @@ final class Settings {
 
     /// Whether cross-file LSP jumps open changed target files as plain file content or as a diff.
     var lspJumpOpenMode: LSPJumpOpenMode
+
+    /// How long an LSP server stays warm after switching away from its workspace before automatic shutdown.
+    enum LSPIdleTimeout: Int, CaseIterable, Sendable {
+        case minutes5 = 300
+        case minutes15 = 900
+        case minutes30 = 1800
+        case hour1 = 3600
+        case never = 0
+
+        var duration: Duration? {
+            rawValue > 0 ? .seconds(rawValue) : nil
+        }
+
+        var title: String {
+            switch self {
+            case .minutes5: return L("5 min", "5 分钟")
+            case .minutes15: return L("15 min", "15 分钟")
+            case .minutes30: return L("30 min", "30 分钟")
+            case .hour1: return L("1 hour", "1 小时")
+            case .never: return L("Never", "永不")
+            }
+        }
+    }
+
+    /// Idle release delay after leaving an LSP workspace (`never` keeps servers warm until quit).
+    var lspIdleTimeout: LSPIdleTimeout
     /// Distinct local AI task roles that can independently select their provider and model.
     enum AITask: String, CaseIterable, Sendable {
         case commit
@@ -309,9 +337,16 @@ final class Settings {
         stickyLines = defaults.object(forKey: "stickyLines") as? Bool ?? true
         let maxSticky = defaults.object(forKey: "stickyLinesMaxCount") as? Int ?? StickyLinesEngine.defaultMaxLines
         stickyLinesMaxCount = min(Self.stickyLinesRange.upperBound, max(Self.stickyLinesRange.lowerBound, maxSticky))
+        formatGoOnSave = defaults.object(forKey: "formatGoOnSave") as? Bool ?? true
         showLineDiffBar = defaults.object(forKey: "showLineDiffBar") as? Bool ?? true
         autoOpenThreeWayMerge = defaults.object(forKey: "autoOpenThreeWayMerge") as? Bool ?? true
         lspJumpOpenMode = LSPJumpOpenMode(rawValue: defaults.string(forKey: "lspJumpOpenMode") ?? "") ?? .file
+        if let rawTimeout = defaults.object(forKey: "lspIdleTimeoutSeconds") as? Int,
+           let parsedTimeout = LSPIdleTimeout(rawValue: rawTimeout) {
+            lspIdleTimeout = parsedTimeout
+        } else {
+            lspIdleTimeout = .minutes15
+        }
         let legacyProvider = AgentProvider(rawValue: defaults.string(forKey: "aiAgentProvider") ?? "") ?? .agy
         let legacyModels = defaults.dictionary(forKey: "aiAgentModels") as? [String: String] ?? [:]
         aiCommitProvider = AgentProvider(rawValue: defaults.string(forKey: "aiCommitProvider") ?? "") ?? legacyProvider
@@ -359,9 +394,11 @@ final class Settings {
         defaults.set(NSColor.normalizedHexColor(vimCursorColorHex), forKey: "vimCursorColor")
         defaults.set(stickyLines, forKey: "stickyLines")
         defaults.set(stickyLinesMaxCount, forKey: "stickyLinesMaxCount")
+        defaults.set(formatGoOnSave, forKey: "formatGoOnSave")
         defaults.set(showLineDiffBar, forKey: "showLineDiffBar")
         defaults.set(autoOpenThreeWayMerge, forKey: "autoOpenThreeWayMerge")
         defaults.set(lspJumpOpenMode.rawValue, forKey: "lspJumpOpenMode")
+        defaults.set(lspIdleTimeout.rawValue, forKey: "lspIdleTimeoutSeconds")
         defaults.set(aiCommitProvider.rawValue, forKey: "aiCommitProvider")
         defaults.set(aiCommitModels, forKey: "aiCommitModels")
         defaults.set(aiGroupingProvider.rawValue, forKey: "aiGroupingProvider")

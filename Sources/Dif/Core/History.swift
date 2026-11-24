@@ -606,7 +606,7 @@ struct LineHistoryEntry: Identifiable, Equatable, Sendable {
         leftBuffer.spans = Highlighter.highlight(leftLines, language: language)
         let rightBuffer = TextBuffer(lines: rightLines)
         rightBuffer.spans = Highlighter.highlight(rightLines, language: language)
-        var resolvedHunks = hunks
+        var resolvedHunks = DiffRefiner.splitSimilarAlignedHunks(hunks, oldLines: leftLines, newLines: rightLines)
         DiffLoader.addInlineHighlights(&resolvedHunks, left: leftLines, right: rightLines)
 
         let doc = DiffDocument(left: leftBuffer, right: rightBuffer, hunks: resolvedHunks, language: language)

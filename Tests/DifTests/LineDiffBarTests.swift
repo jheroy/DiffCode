@@ -401,4 +401,35 @@ final class LineDiffBarTests: XCTestCase {
         viewer.refreshLineDiff()
         XCTAssertNil(viewer.lineDiffSnapshot)
     }
+
+    func testEqualCountShiftedHunkAlignsFuncHeaderInsteadOfPairingWithAddedComment() throws {
+        let oldLines = [
+            "func processOrder(id int64, amount int) {",
+            "    oldHelperCall()",
+        ]
+        let newLines = [
+            "// processOrder handles the order",
+            "func processOrder(id int64, total int64) {",
+        ]
+        var hunks = DiffRefiner.splitSimilarAlignedHunks(
+            [Hunk(leftStart: 0, leftCount: 2, rightStart: 0, rightCount: 2)],
+            oldLines: oldLines,
+            newLines: newLines
+        )
+        XCTAssertEqual(hunks.map(\.kind), [.added, .modified, .deleted])
+        DiffLoader.addInlineHighlights(&hunks, left: oldLines, right: newLines)
+        let doc = DiffDocument(
+            left: TextBuffer(lines: oldLines),
+            right: TextBuffer(lines: newLines),
+            hunks: hunks,
+            language: .go
+        )
+
+        let snap = try XCTUnwrap(LineDiffExtractor.extract(from: doc, side: .right, line: 1))
+        XCTAssertEqual(snap.hunkKind, .modified)
+        XCTAssertEqual(snap.left.lineNumber, 1)
+        XCTAssertEqual(snap.right.lineNumber, 2)
+        XCTAssertEqual(snap.left.text, oldLines[0])
+        XCTAssertEqual(snap.right.text, newLines[1])
+    }
 }

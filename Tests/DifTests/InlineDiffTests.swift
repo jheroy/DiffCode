@@ -400,4 +400,76 @@ extension InlineDiffTests {
         XCTAssertEqual(emojiSnap.right.highlightRanges, [0..<3])
         XCTAssertEqual(utf16Substring("🚀_🚀_a", range: emojiSnap.right.highlightRanges[0]), "🚀_")
     }
+
+    func testSimilarLineSplittingAlignsEditedFuncHeaderPastAddedCommentAndDeletedBody() async throws {
+        let oldText = """
+        func buildFactionDailyRobotLootTarget(table gamedata.TableManager, role *datastruct.StRole, targetTid int64, chainId int32, now time.Time) (datastruct.FactionDailyEntrust, bool) {
+        \tctx := worldmap.NewMapContext(table, now, worldmap.CurrentGlobalMap)
+        \tdefer ctx.End()
+
+        \ttarget, ok := getLockedFactionDailyRobotTroop(ctx, targetTid)
+        \tif !ok || target.ChainId != chainId || !target.IsRobot {
+        \t\treturn datastruct.FactionDailyEntrust{}, false
+        \t}
+        }
+        """
+        let newText = """
+        // buildFactionDailyRobotLootTarget 构造机器人掠夺目标快照（调用方必须已持有 role 与 target 锁）。
+        func buildFactionDailyRobotLootTarget(table gamedata.TableManager, role *datastruct.StRole, target *datastruct.StTroopFactionDaily, chainId int32, now time.Time) (datastruct.FactionDailyEntrust, bool) {
+        \tif target == nil || target.ChainId != chainId || !target.IsRobot {
+        \t\treturn datastruct.FactionDailyEntrust{}, false
+        \t}
+        }
+        """
+        let oldData = Data((oldText + "\n").utf8)
+        let newData = Data((newText + "\n").utf8)
+        let oldLines = TextCodec.splitLines(oldText)
+        let newLines = TextCodec.splitLines(newText)
+
+        for ignoreWS in [false, true] {
+            var hunks = try XCTUnwrap(await DiffLoader.computeHunks(old: oldData, new: newData, ignoreWhitespace: ignoreWS))
+            XCTAssertEqual(hunks.map(\.kind), [.added, .modified, .deleted, .modified])
+            XCTAssertEqual(hunks[0], Hunk(leftStart: 0, leftCount: 0, rightStart: 0, rightCount: 1))
+            XCTAssertEqual(hunks[1], Hunk(leftStart: 0, leftCount: 1, rightStart: 1, rightCount: 1))
+            XCTAssertEqual(hunks[2], Hunk(leftStart: 1, leftCount: 4, rightStart: 2, rightCount: 0))
+            XCTAssertEqual(hunks[3], Hunk(leftStart: 5, leftCount: 1, rightStart: 2, rightCount: 1))
+
+            DiffLoader.addInlineHighlights(&hunks, left: oldLines, right: newLines)
+            let doc = DiffDocument(left: TextBuffer(lines: oldLines), right: TextBuffer(lines: newLines), hunks: hunks, language: .go)
+
+            let commentSnap = try XCTUnwrap(LineDiffExtractor.extract(from: doc, side: .right, line: 0))
+            XCTAssertEqual(commentSnap.hunkKind, .added)
+            XCTAssertEqual(commentSnap.left, .empty)
+            XCTAssertTrue(commentSnap.right.text.hasPrefix("// buildFactionDailyRobotLootTarget"))
+
+            let funcSnap = try XCTUnwrap(LineDiffExtractor.extract(from: doc, side: .right, line: 1))
+            XCTAssertEqual(funcSnap.hunkKind, .modified)
+            XCTAssertEqual(funcSnap.left.lineNumber, 1)
+            XCTAssertEqual(funcSnap.right.lineNumber, 2)
+            XCTAssertTrue(funcSnap.left.text.contains("targetTid int64"))
+            XCTAssertTrue(funcSnap.right.text.contains("target *datastruct.StTroopFactionDaily"))
+
+            let deletedSnap = try XCTUnwrap(LineDiffExtractor.extract(from: doc, side: .left, line: 1))
+            XCTAssertEqual(deletedSnap.hunkKind, .deleted)
+            XCTAssertEqual(deletedSnap.right, .empty)
+            XCTAssertTrue(deletedSnap.left.text.contains("NewMapContext"))
+
+            let ifSnap = try XCTUnwrap(LineDiffExtractor.extract(from: doc, side: .right, line: 2))
+            XCTAssertEqual(ifSnap.hunkKind, .modified)
+            XCTAssertEqual(ifSnap.left.lineNumber, 6)
+            XCTAssertEqual(ifSnap.right.lineNumber, 3)
+            XCTAssertTrue(ifSnap.left.text.contains("!ok"))
+            XCTAssertTrue(ifSnap.right.text.contains("target == nil"))
+        }
+
+        // Unrelated rewritten blocks remain a single modified hunk without spurious splitting.
+        let unrelatedOld = ["let alpha = computeAlpha(input)", "saveToCache(alpha)"]
+        let unrelatedNew = ["let beta = fetchBeta(request)", "return beta"]
+        let unsplit = DiffRefiner.splitSimilarAlignedHunks(
+            [Hunk(leftStart: 0, leftCount: 2, rightStart: 0, rightCount: 2)],
+            oldLines: unrelatedOld,
+            newLines: unrelatedNew
+        )
+        XCTAssertEqual(unsplit, [Hunk(leftStart: 0, leftCount: 2, rightStart: 0, rightCount: 2)])
+    }
 }

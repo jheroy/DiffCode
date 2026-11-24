@@ -242,6 +242,26 @@ final class ViewerModel: CodeCanvasDelegate {
     var vimPendingKeys = ""
     var vimCursorLine = 1
     var vimCursorColumn = 1
+    var vimCommandFocusToken = 0
+
+    var vimCommandBuffer: String {
+        if case .commandLine(_, let buffer) = vimMode { return buffer }
+        return ""
+    }
+
+    func updateVimCommandBuffer(_ text: String) {
+        container?.canvas.vimUpdateCommandLineBuffer(text)
+    }
+
+    func submitVimCommand(_ text: String) {
+        focusCanvas()
+        container?.canvas.vimSubmitCommandLine(text)
+    }
+
+    func cancelVimCommand(restoreFocus: Bool) {
+        if restoreFocus { focusCanvas() }
+        container?.canvas.vimCancelCommandLine()
+    }
 
     @ObservationIgnored weak var container: CodeScrollContainer?
     @ObservationIgnored var settings: Settings! {
@@ -286,6 +306,10 @@ final class ViewerModel: CodeCanvasDelegate {
     @ObservationIgnored var saveTimer: Timer?
     @ObservationIgnored var diffTimer: Timer?
     @ObservationIgnored var diffTask: Task<Void, Never>?
+    @ObservationIgnored var formatTask: Task<Void, Never>?
+    @ObservationIgnored var goFormatter: @Sendable (Data, URL) async -> Data? = { data, url in
+        await GoFormatter.format(data, fileURL: url)
+    }
     /// Undo histories of files edited earlier, most recent last, so ⌘Z still works after coming back to one.
     @ObservationIgnored var histories: [(key: String, history: EditorSession.History)] = []
     /// Typing that could not be written when its file was left (the disk full, say), kept until the file is opened again.
@@ -319,6 +343,8 @@ final class ViewerModel: CodeCanvasDelegate {
     @ObservationIgnored var lspDebounceTimer: Timer?
     /// ⌘+Click on a symbol in an LSP-enabled pane (`line` is 0-based, `character` is 0-based UTF-16).
     @ObservationIgnored var onGoToDefinition: ((Int, Int) -> Void)?
+    /// ⌥⌘+Click on a symbol in an LSP-enabled pane (`line` is 0-based, `character` is 0-based UTF-16).
+    @ObservationIgnored var onGoToImplementation: ((Int, Int) -> Void)?
     @ObservationIgnored var symbolHighlightTask: Task<Void, Never>?
     @ObservationIgnored private var symbolHighlightGeneration: UInt64 = 0
     @ObservationIgnored private var symbolOccurrenceCache: (docID: ObjectIdentifier, diffRevision: Int, side: Side, symbolName: String, isSemantic: Bool, matches: [SearchMatch])?
@@ -783,7 +809,7 @@ final class ViewerModel: CodeCanvasDelegate {
                 }
             }
         }
-        if preserveScroll {
+        if preserveScroll && pendingLine == nil {
             if let previousFocus, previousFocus < doc.hunks.count {
                 focusedHunk = previousFocus
                 container?.canvas.focusedHunk = previousFocus
@@ -1663,8 +1689,16 @@ final class ViewerModel: CodeCanvasDelegate {
         onGoToDefinition?(line, character)
     }
 
+    func canvas(_ canvas: CodeCanvasView, goToImplementationAt line: Int, character: Int) {
+        onGoToImplementation?(line, character)
+    }
+
     func canvas(_ canvas: CodeCanvasView, didUpdateVimState state: VimUIState) {
+        let wasCommandLine = vimMode.isCommandLine
         if vimMode != state.mode { vimMode = state.mode }
+        if !wasCommandLine && state.mode.isCommandLine {
+            vimCommandFocusToken &+= 1
+        }
         if vimPendingKeys != state.pendingKeys { vimPendingKeys = state.pendingKeys }
         if vimCursorLine != state.cursorLine { vimCursorLine = state.cursorLine }
         if vimCursorColumn != state.cursorColumn { vimCursorColumn = state.cursorColumn }
@@ -1742,7 +1776,7 @@ final class ViewerModel: CodeCanvasDelegate {
             canvas.redoTyping()
         case .readOnlyNotice:
             onToast?(readOnlyReason ?? L("Read-only file", "只读文件"))
-        case .goToDefinition, .findReferences, .goToFile, .goToSymbol, .searchEverywhere, .findAction,
+        case .goToDefinition, .goToTypeDefinition, .goToImplementation, .findReferences, .goToFile, .goToSymbol, .searchEverywhere, .findAction,
              .gitPull, .gitPush, .toggleGitGraph, .toggleMaximizeViewer, .locateInTree,
              .toggleFileTree, .navigateBack, .navigateForward, .focusLeftPane, .focusRightPane, .quit:
             onVimAction?(action, line, column)

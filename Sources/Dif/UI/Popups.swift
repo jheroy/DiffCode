@@ -1993,6 +1993,7 @@ struct KeymapView: View {
             if AppEnvironment.hasLSP {
                 shortcutRow(L("Navigate Back / Forward", "后退 / 前进"), "⌥⌘← / ⌥⌘→")
                 shortcutRow(L("Go to Definition / References", "跳转到声明 / 查看引用"), "⌘+Click")
+                shortcutRow(L("Go to Implementation", "跳转到实现"), "⌥⌘+Click")
             }
             if AppEnvironment.hasTerminal {
                 shortcutRow(L("Toggle Terminal (Secondary)", "开关终端（备用）"), "⌥F12")
@@ -2007,6 +2008,8 @@ struct KeymapView: View {
             SectionLabel(text: "Vim (~/.ideavimrc)")
             shortcutRow(L("Leader Key", "前导键 (Leader)"), "Space")
             shortcutRow(L("Go to Definition / References", "定义 / 引用"), "gd / gr · Space r")
+            shortcutRow(L("Go to Implementation / Interfaces", "跳转实现 / 接口"), "gi / gu")
+            shortcutRow(L("Go to Type Definition", "跳转类型定义"), "gy")
             shortcutRow(L("Go to File / Everywhere / Action", "文件 / 随处 / 操作"), "⌘P / ⌃P · Space a · ga")
             shortcutRow(L("Go to Symbol", "查找符号"), "gs")
             shortcutRow(L("Git Pull / Push / Graph", "拉取 / 推送 / 分支树"), "gl / gp / gb")
@@ -2016,6 +2019,7 @@ struct KeymapView: View {
             shortcutRow(L("Function Text Objects", "函数文本对象"), "vif / vaf")
             shortcutRow(L("Expand / Shrink Selection", "扩大 / 缩小选区"), "↩ / ⌫")
             shortcutRow(L("Toggle Comment", "切换注释"), "gcc / gc")
+            shortcutRow(L("Visual Block Mode", "列选模式 (Visual Block)"), "⌃V")
             shortcutRow(L("Visual Surround", "可视化包围"), "\" ' ( { [")
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2191,6 +2195,10 @@ struct SettingsView: View {
         .onChange(of: settings.lspJumpOpenMode) { _, _ in
             settings.save()
         }
+        .onChange(of: settings.lspIdleTimeout) { _, _ in
+            settings.save()
+            store.applyLSPIdleTimeout()
+        }
         .onChange(of: settings.vimMode) { _, enabled in
             settings.save()
             store.viewer.setVimMode(enabled)
@@ -2210,6 +2218,9 @@ struct SettingsView: View {
         .onChange(of: settings.stickyLinesMaxCount) { _, count in
             settings.save()
             store.viewer.setStickyLinesMaxCount(count)
+        }
+        .onChange(of: settings.formatGoOnSave) { _, _ in
+            settings.save()
         }
         .onDisappear {
             if NSColorPanel.sharedColorPanelExists && NSColorPanel.shared.isVisible {
@@ -2425,6 +2436,24 @@ struct SettingsView: View {
             }
         }
         .padding(.top, 4)
+        if !AppEnvironment.isAppStore {
+            VStack(alignment: .leading, spacing: 10) {
+                sectionHeader(L("Formatting", "格式化"))
+                VStack(alignment: .leading, spacing: 4) {
+                    row(L("Format Go files on save (go fmt)", "保存 Go 文件时自动执行 go fmt")) {
+                        Toggle("", isOn: $settings.formatGoOnSave)
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                            .labelsHidden()
+                    }
+                    Text(L("Automatically runs gofmt on the current .go file after saving.",
+                           "保存 .go 文件后自动对当前文件执行 go fmt 格式化。"))
+                        .font(.ui(size: 11.5))
+                        .foregroundStyle(Color.difText3)
+                }
+            }
+            .padding(.top, 4)
+        }
     }
 
     @ViewBuilder
@@ -2461,6 +2490,19 @@ struct SettingsView: View {
                 }
                 Text(L("Applies to cross-file LSP jumps to modified files. Same-file jumps stay in the current view.",
                        "用于跨文件 LSP 跳转到有变更的文件；当前文件内跳转始终保持在当前视图。"))
+                    .font(.ui(size: 11.5))
+                    .foregroundStyle(Color.difText3)
+                    .fixedSize(horizontal: false, vertical: true)
+                row(L("Release idle LSP server after", "切走后释放空闲 LSP 服务")) {
+                    Picker("", selection: $settings.lspIdleTimeout) {
+                        ForEach(Settings.LSPIdleTimeout.allCases, id: \.self) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .frame(width: UI.s(240))
+                }
+                Text(L("Open files keep their language server warm. After switching to another workspace or non-LSP file, idle servers shut down automatically after this delay.",
+                       "当前打开的文件会保持语言服务常驻；切换到其他项目或非 LSP 文件后，超过该时长自动释放内存。"))
                     .font(.ui(size: 11.5))
                     .foregroundStyle(Color.difText3)
                     .fixedSize(horizontal: false, vertical: true)

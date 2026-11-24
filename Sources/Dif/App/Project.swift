@@ -748,6 +748,19 @@ final class Project: Identifiable {
         }
     }
 
+    /// Refreshes git status immediately and awaits completion so external-open callers inspect up-to-date `changes`.
+    func refreshAndWait() async {
+        guard !needsAccess, !isDormant else { return }
+        if let running = refreshTask {
+            await running.value
+        }
+        refreshQueued = false
+        refresh()
+        if let running = refreshTask {
+            await running.value
+        }
+    }
+
     // MARK: Requests
 
     func request(for change: FileChange, ignoreWhitespace: Bool) -> DiffRequest {

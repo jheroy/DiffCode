@@ -713,9 +713,17 @@ private struct VimStatusBar: View {
         switch viewer.vimMode {
         case .normal: return Color.difAccent
         case .insert: return Color.difAdded
-        case .visual, .visualLine: return Color.purple
+        case .visual, .visualLine, .visualBlock: return Color.purple
         case .commandLine: return Color.orange
         }
+    }
+
+    private var commandNSFont: NSFont {
+        let scaled = 11.5 * UI.scale
+        if let family = Settings.shared.codeFontFamily, let font = MonospaceFonts.regular(family, size: scaled) {
+            return font
+        }
+        return NSFont(name: "JetBrainsMono-Regular", size: scaled) ?? .monospacedSystemFont(ofSize: scaled, weight: .regular)
     }
 
     var body: some View {
@@ -728,19 +736,29 @@ private struct VimStatusBar: View {
                 .background(RoundedRectangle(cornerRadius: 3.5, style: .continuous).fill(pillColor))
                 .fixedSize()
 
-            if case .commandLine(let prefix, let buffer) = viewer.vimMode {
-                HStack(spacing: 0) {
-                    Text(prefix + buffer)
+            if case .commandLine(let prefix, _) = viewer.vimMode {
+                HStack(spacing: 1) {
+                    Text(prefix)
                         .font(.code(11.5))
                         .foregroundStyle(Color.difText)
-                    Rectangle()
-                        .fill(Color.difText.opacity(0.75))
-                        .frame(width: 6, height: UI.s(12))
+                        .fixedSize()
+                    VimCommandField(
+                        text: Binding(
+                            get: { viewer.vimCommandBuffer },
+                            set: { viewer.updateVimCommandBuffer($0) }
+                        ),
+                        font: commandNSFont,
+                        focusToken: viewer.vimCommandFocusToken,
+                        onSubmit: { viewer.submitVimCommand($0) },
+                        onCancel: { viewer.cancelVimCommand(restoreFocus: true) },
+                        onEndEditingExternally: { viewer.cancelVimCommand(restoreFocus: false) }
+                    )
+                    .frame(maxWidth: .infinity)
+                    .frame(height: UI.s(16))
                 }
-                .lineLimit(1)
+            } else {
+                Spacer(minLength: 8)
             }
-
-            Spacer(minLength: 8)
 
             if !viewer.vimPendingKeys.isEmpty {
                 Text(viewer.vimPendingKeys)

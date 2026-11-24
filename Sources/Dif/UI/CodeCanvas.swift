@@ -12,13 +12,20 @@ struct TextPosition: Comparable, Sendable {
 }
 
 struct TextSelection: Equatable {
+    struct Block: Equatable {
+        var startColumn: Int
+        var endColumn: Int
+        var extendToEnd: Bool = false
+    }
+
     var pane: Side
     var anchor: TextPosition
     var head: TextPosition
+    var block: Block? = nil
 
     var lower: TextPosition { min(anchor, head) }
     var upper: TextPosition { max(anchor, head) }
-    var isEmpty: Bool { anchor == head }
+    var isEmpty: Bool { block == nil && anchor == head }
 }
 
 struct SearchMatch: Equatable {
@@ -60,6 +67,8 @@ protocol CodeCanvasDelegate: AnyObject {
     func canvas(_ canvas: CodeCanvasView, openAnnotation entry: LineAnnotations.Entry)
     /// ⌘+Click on a symbol in an LSP-enabled pane (`line` is 0-based buffer line, `character` is 0-based UTF-16 offset).
     func canvas(_ canvas: CodeCanvasView, goToDefinitionAt line: Int, character: Int)
+    /// ⌥⌘+Click on a symbol in an LSP-enabled pane (`line` is 0-based buffer line, `character` is 0-based UTF-16 offset).
+    func canvas(_ canvas: CodeCanvasView, goToImplementationAt line: Int, character: Int)
     /// Vim modal state, pending keys, or cursor position changed.
     func canvas(_ canvas: CodeCanvasView, didUpdateVimState state: VimUIState)
     /// A Vim command triggered an IDE / viewer action (`line` is 0-based, `column` is 0-based UTF-16).
@@ -2172,7 +2181,8 @@ final class CodeCanvasView: NSView {
     private func updateCaret() {
         guard let doc = document, case .text = doc.content, !doc.right.lines.isEmpty,
               editor != nil || vimModeEnabled,
-              let window, window.isKeyWindow || Self.assumeKeyWindow, window.firstResponder === self else {
+              let window, window.isKeyWindow || Self.assumeKeyWindow,
+              window.firstResponder === self || (vimModeEnabled && vimEngine.mode.isCommandLine && window.firstResponder is VimCommandFieldEditor) else {
             caretLayer.isHidden = true
             caretLayer.removeAllAnimations()
             caretFrame = .null
@@ -2254,7 +2264,7 @@ final class CodeCanvasView: NSView {
                 color = baseColor.copy(alpha: baseColor.alpha * 0.42) ?? baseColor
                 cornerRadius = 1
                 shouldBlink = false
-            case .visual, .visualLine:
+            case .visual, .visualLine, .visualBlock:
                 // guicursor=v:hor10 -> underline caret indicator alongside selection highlight
                 let h = max(2, (lh * 0.14).rounded())
                 frame = CGRect(x: pixelRound(blockX), y: CGFloat(headPos.row) * lh + lh - h,
@@ -2875,30 +2885,70 @@ final class CodeCanvasView: NSView {
         if let first = start { add(first..<lines.upperBound) }
     }
 
-    private func rebuildSelection(_ pane: Pane, rows: Range<Int>) {
+    private func selectionRects(for pane: Pane, rows: Range<Int>) -> [CGRect] {
         var rects: [CGRect] = []
-        if let sel = selection, !sel.isEmpty, mode != .sideBySide || sel.pane == pane.side, !rows.isEmpty {
-            let lower = sel.lower, upper = sel.upper
-            let lh = codeFont.lineHeight
-            let first = max(rows.lowerBound, lower.row), last = min(rows.upperBound - 1, upper.row)
-            if first <= last {
-                for row in first...last {
-                    guard let src = source(pane: pane.side, row: row) else { continue }
-                    let layout = ctLine(src.side, src.line)
-                    let x0 = row == lower.row ? CTLineGetOffsetForStringIndex(layout, lower.column, nil) : 0
-                    var x1: CGFloat
-                    if row == upper.row {
-                        x1 = CTLineGetOffsetForStringIndex(layout, upper.column, nil)
-                    } else {
-                        // Reaches one cell past the end, standing in for the line break.
-                        x1 = CGFloat(CTLineGetTypographicBounds(layout, nil, nil, nil)) + codeFont.charWidth
+        guard let sel = selection, !sel.isEmpty, mode != .sideBySide || sel.pane == pane.side, !rows.isEmpty else {
+            return rects
+        }
+        let lh = codeFont.lineHeight
+        if let block = sel.block {
+            let firstRow = min(sel.anchor.row, sel.head.row)
+            let lastRow = max(sel.anchor.row, sel.head.row)
+            let first = max(rows.lowerBound, firstRow)
+            let last = min(rows.upperBound - 1, lastRow)
+            guard first <= last else { return rects }
+            for row in first...last {
+                guard let src = source(pane: pane.side, row: row) else { continue }
+                if mode == .unified && src.side != .right { continue }
+                let text = rowText(pane: pane.side, row: row)
+                let layout = ctLine(src.side, src.line)
+                if block.startColumn >= text.length {
+                    if text.length == 0 && block.startColumn == 0 {
+                        rects.append(CGRect(x: textInset, y: CGFloat(row) * lh, width: codeFont.charWidth, height: lh))
                     }
-                    x1 = max(x1, x0)
+                    continue
+                }
+                let sCol = text.rangeOfComposedCharacterSequence(at: block.startColumn).location
+                let eCol = block.extendToEnd
+                    ? text.length
+                    : TextEditing.characterBoundary(in: text, from: min(block.endColumn, text.length - 1), forward: true)
+                let x0 = CTLineGetOffsetForStringIndex(layout, sCol, nil)
+                let x1 = max(x0, CTLineGetOffsetForStringIndex(layout, eCol, nil))
+                if x1 > x0 {
                     rects.append(CGRect(x: textInset + x0, y: CGFloat(row) * lh, width: x1 - x0, height: lh))
                 }
             }
+            return rects
         }
-        pane.selection.set(rects, color: theme.selection)
+
+        let lower = sel.lower, upper = sel.upper
+        let first = max(rows.lowerBound, lower.row), last = min(rows.upperBound - 1, upper.row)
+        if first <= last {
+            for row in first...last {
+                guard let src = source(pane: pane.side, row: row) else { continue }
+                let layout = ctLine(src.side, src.line)
+                let x0 = row == lower.row ? CTLineGetOffsetForStringIndex(layout, lower.column, nil) : 0
+                var x1: CGFloat
+                if row == upper.row {
+                    x1 = CTLineGetOffsetForStringIndex(layout, upper.column, nil)
+                } else {
+                    // Reaches one cell past the end, standing in for the line break.
+                    x1 = CGFloat(CTLineGetTypographicBounds(layout, nil, nil, nil)) + codeFont.charWidth
+                }
+                x1 = max(x1, x0)
+                rects.append(CGRect(x: textInset + x0, y: CGFloat(row) * lh, width: x1 - x0, height: lh))
+            }
+        }
+        return rects
+    }
+
+    func activeSelectionRects() -> [CGRect] {
+        let pane = panes.first { $0.side == (selection?.pane ?? .right) } ?? panes[1]
+        return selectionRects(for: pane, rows: 0..<paneRowCount(pane.side))
+    }
+
+    private func rebuildSelection(_ pane: Pane, rows: Range<Int>) {
+        pane.selection.set(selectionRects(for: pane, rows: rows), color: theme.selection)
     }
 
     /// The curved ribbons joining each change across the divider, plus SemanticDiff-style
@@ -4537,9 +4587,9 @@ final class CodeCanvasView: NSView {
             ? point.flatMap(moveConnectorHit(at:))
             : nil
         if moveConnector?.pairID != hoveredMoveConnector { hoveredMoveConnector = moveConnector?.pairID }
-        let commandOnly = event.map { Self.isCommandOnly($0.modifierFlags) } ?? false
+        let lspHoverModifiers = event.map { Self.isLSPHoverModifiers($0.modifierFlags) } ?? false
         let buttonHit = hit != nil || tick != nil || conflict != nil || moveBadge != nil || foldHit != nil || moveConnector != nil || line != nil
-        if let point, commandOnly, !buttonHit {
+        if let point, lspHoverModifiers, !buttonHit {
             updateLSPHover(at: point)
         } else {
             clearLSPHover()
@@ -4584,12 +4634,12 @@ final class CodeCanvasView: NSView {
             NSCursor.pointingHand.set()
             return
         }
-        let commandOnly = Self.isCommandOnly(event.modifierFlags)
+        let lspHoverModifiers = Self.isLSPHoverModifiers(event.modifierFlags)
         let overControl = revertHit(at: point) != nil || tickHit(at: point) != nil
             || conflictHit(at: point) != nil || moveBadgeHit(at: point) != nil
             || moveConnectorHit(at: point) != nil
             || foldBarHit(at: point) != nil || annotatedLine(at: point) != nil
-        if commandOnly && !overControl {
+        if lspHoverModifiers && !overControl {
             updateLSPHover(at: point)
         } else {
             clearLSPHover()
@@ -4607,6 +4657,14 @@ final class CodeCanvasView: NSView {
 
     private static func isCommandOnly(_ flags: NSEvent.ModifierFlags) -> Bool {
         flags.intersection([.command, .option, .control, .shift]) == .command
+    }
+
+    private static func isCommandOptionOnly(_ flags: NSEvent.ModifierFlags) -> Bool {
+        flags.intersection([.command, .option, .control, .shift]) == [.command, .option]
+    }
+
+    private static func isLSPHoverModifiers(_ flags: NSEvent.ModifierFlags) -> Bool {
+        isCommandOnly(flags) || isCommandOptionOnly(flags)
     }
 
     private func updateLSPHover(at point: CGPoint) {
@@ -4848,11 +4906,15 @@ final class CodeCanvasView: NSView {
             }
             return
         }
-        if isLSPEnabled, event.clickCount == 1, Self.isCommandOnly(event.modifierFlags),
+        if isLSPEnabled, event.clickCount == 1, Self.isLSPHoverModifiers(event.modifierFlags),
            let target = lspSymbolTarget(at: point) {
             clearLSPHover()
             dragSelecting = false
-            delegate?.canvas(self, goToDefinitionAt: target.line, character: target.column)
+            if Self.isCommandOptionOnly(event.modifierFlags) {
+                delegate?.canvas(self, goToImplementationAt: target.line, character: target.column)
+            } else {
+                delegate?.canvas(self, goToDefinitionAt: target.line, character: target.column)
+            }
             return
         }
         if let clickedHunk = hunkIndex(at: point) {
@@ -5003,6 +5065,25 @@ final class CodeCanvasView: NSView {
 
     func selectedText() -> String? {
         guard let sel = selection, !sel.isEmpty else { return nil }
+        if let block = sel.block {
+            let firstRow = min(sel.anchor.row, sel.head.row)
+            let lastRow = max(sel.anchor.row, sel.head.row)
+            var parts: [String] = []
+            for row in firstRow...lastRow {
+                if mode == .unified, source(pane: sel.pane, row: row)?.side != .right { continue }
+                let text = rowText(pane: sel.pane, row: row)
+                if block.startColumn >= text.length {
+                    parts.append("")
+                    continue
+                }
+                let sCol = text.rangeOfComposedCharacterSequence(at: block.startColumn).location
+                let eCol = block.extendToEnd
+                    ? text.length
+                    : TextEditing.characterBoundary(in: text, from: min(block.endColumn, text.length - 1), forward: true)
+                parts.append(text.substring(with: NSRange(location: sCol, length: max(0, eCol - sCol))))
+            }
+            return parts.joined(separator: "\n")
+        }
         let lower = sel.lower, upper = sel.upper
         var parts: [String] = []
         for row in lower.row...upper.row {
@@ -5165,6 +5246,14 @@ final class CodeCanvasView: NSView {
     }
 
     @objc func copy(_ sender: Any?) {
+        if vimModeEnabled, case .commandLine(_, let buffer) = vimEngine.mode {
+            if !buffer.isEmpty {
+                pasteboard.clearContents()
+                pasteboard.setString(buffer, forType: .string)
+                lineClipboard = nil
+            }
+            return
+        }
         guard let text = selectedText() else {
             // As in the IDE: with nothing selected in the text being edited, ⌘C copies the whole line.
             if let line = caretLineText() {
