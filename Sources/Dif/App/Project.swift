@@ -99,12 +99,21 @@ final class Project: Identifiable {
     /// What was in the message box before Amend filled in the last commit's message, and that message.
     @ObservationIgnored var amendDraft: (before: String, filled: String)?
 
+    /// Branch and remote target waiting for a push once auto-pull conflicts are resolved in 3-way merge.
+    struct PendingPushAfterPull: Equatable, Sendable {
+        var branch: String
+        var target: String
+        var remote: String?
+    }
+
     // Branches and remotes
     /// What is running against the repository's branches or remotes, shown by the branch: "Pushing…".
     var activity: String?
     /// A network operation, which can be stopped; a checkout runs to its end.
     var activityCancellable = false
     @ObservationIgnored var activityTask: Task<Void, Never>?
+    /// Set when an auto-pull before push stopped on conflicts; cleared or resumed once conflicts are resolved.
+    @ObservationIgnored var pendingPushAfterPull: PendingPushAfterPull?
     /// `.git`, or a linked worktree's own directory, where git keeps the marker of a merge in progress.
     @ObservationIgnored private(set) var gitDirectory: URL?
     /// What the left side shows for a file in conflict.

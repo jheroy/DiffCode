@@ -399,6 +399,7 @@ enum DebugHooks {
             store.currentProject?.commitMessage = argument.replacingOccurrences(of: "\\n", with: "\n")
         case "focuscommit": store.focusCommitMessage()
         case "docommit": store.commitCurrent()
+        case "docommitpush": store.commitCurrent(thenPush: true)
         case "amend":
             // "amend:on", "amend:off"
             store.setAmend(argument != "off")

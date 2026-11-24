@@ -1,7 +1,7 @@
 import Foundation
 
 /// What git is in the middle of: a merge, rebase, cherry-pick or revert that stopped for the user to resolve conflicts.
-enum RepoOperation: String, Equatable {
+enum RepoOperation: String, Equatable, Sendable {
     case merge, rebase, cherryPick, revert
 
     /// "Merging", for the banner over the Changes list.
@@ -26,7 +26,7 @@ enum RepoOperation: String, Equatable {
 }
 
 /// How a pull joins the branch with what came in, when they have both moved on.
-enum PullMode: Equatable {
+enum PullMode: Equatable, Sendable {
     /// Whatever the user's git settings say (`pull.rebase`, `pull.ff`).
     case configured
     case merge
@@ -135,7 +135,7 @@ extension Git {
         var args = ["pull", "--quiet"]
         switch mode {
         case .configured: break
-        case .merge: args.append("--no-rebase")
+        case .merge: args += ["--no-rebase", "--ff"]
         case .rebase: args.append("--rebase")
         }
         // A merge commit takes git's own message; there is no editor to ask.
@@ -168,6 +168,124 @@ extension Git {
     /// Why a push was turned away, in git's words: the remote has commits the branch does not.
     static func isRejectedAsBehind(_ message: String) -> Bool {
         message.contains("[rejected]") && (message.contains("non-fast-forward") || message.contains("fetch first"))
+    }
+
+    /// Unmerged (conflicted) paths in the working tree, sorted for deterministic display.
+    static func conflictedPaths(in dir: URL) async -> [String] {
+        let out = (try? await runString(["diff", "--name-only", "--diff-filter=U", "-z"], in: dir)) ?? ""
+        return out.split(separator: "\0", omittingEmptySubsequences: true)
+            .map(String.init)
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
+    /// Resolves the pull strategy to use during automatic push reconciliation, honoring `branch.<name>.rebase`
+    /// and `pull.rebase`, and defaulting to explicit merge when unset so Git 2.27+ never aborts on divergent branches.
+    static func autoPullMode(for branch: String, in dir: URL) async -> PullMode {
+        func configValue(_ key: String) async -> String? {
+            guard let raw = try? await runString(["config", "--get", key], in: dir) else { return nil }
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        let resolved: String
+        if let branchSetting = await configValue("branch.\(branch).rebase") {
+            resolved = branchSetting.lowercased()
+        } else {
+            resolved = (await configValue("pull.rebase") ?? "").lowercased()
+        }
+        switch resolved {
+        case "true", "yes", "on", "1", "merges", "preserve", "interactive":
+            return .rebase
+        default:
+            return .merge
+        }
+    }
+
+    enum PushAutoPullPhase: Sendable {
+        case pushing
+        case pulling
+    }
+
+    enum PushAutoPullError: Error, Sendable {
+        case pullFailed(Error)
+        case pushFailed(Error)
+    }
+
+    enum PushAutoPullResult: Equatable, Sendable {
+        case pushed(didAutoPull: Bool, pulledCommits: Int)
+        case conflicts(operation: RepoOperation?, paths: [String], autostashClash: Bool)
+        case emptyOperationStop(operation: RepoOperation, message: String)
+        case rejectedAsBehind(message: String)
+    }
+
+    /// Pushes `branch`, automatically pulling (`--autostash`) and retrying when the remote has new commits.
+    /// Stops and reports `.conflicts` when pulling or restoring autostashed local changes hits conflicts.
+    static func pushWithAutoPull(
+        branch: String,
+        setUpstreamTo remote: String?,
+        allowAutoPull: Bool,
+        pullFirst: Bool = false,
+        maxPullRetries: Int = 2,
+        in dir: URL,
+        onPhase: (@MainActor @Sendable (PushAutoPullPhase) async -> Void)? = nil
+    ) async throws -> PushAutoPullResult {
+        let canAutoPull = allowAutoPull && remote == nil
+        var pullsDone = 0
+        var totalPulledCommits = 0
+        var needPullNow = canAutoPull && pullFirst
+
+        while true {
+            if needPullNow {
+                needPullNow = false
+                pullsDone += 1
+                await onPhase?(.pulling)
+                let before = await resolveCommit("HEAD", in: dir)
+                let mode = await autoPullMode(for: branch, in: dir)
+                do {
+                    try await pull(mode: mode, autostash: true, in: dir)
+                    if let before, let after = await resolveCommit("HEAD", in: dir), before != after,
+                       let out = try? await runString(["rev-list", "--count", "\(before)..@{upstream}"], in: dir),
+                       let count = Int(out.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                        totalPulledCommits += count
+                    }
+                    let clashes = await conflictedPaths(in: dir)
+                    if !clashes.isEmpty {
+                        return .conflicts(operation: nil, paths: clashes, autostashClash: true)
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    let gitDir = await gitDirectory(in: dir)
+                    let activeOp = gitDir.flatMap { operation(in: $0) }
+                    let clashes = await conflictedPaths(in: dir)
+                    if let activeOp {
+                        if !clashes.isEmpty {
+                            return .conflicts(operation: activeOp, paths: clashes, autostashClash: false)
+                        }
+                        return .emptyOperationStop(operation: activeOp, message: error.localizedDescription)
+                    }
+                    if !clashes.isEmpty {
+                        return .conflicts(operation: nil, paths: clashes, autostashClash: true)
+                    }
+                    throw PushAutoPullError.pullFailed(error)
+                }
+            }
+
+            await onPhase?(.pushing)
+            do {
+                try await push(branch: branch, setUpstreamTo: remote, in: dir)
+                return .pushed(didAutoPull: pullsDone > 0, pulledCommits: totalPulledCommits)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let failure as Failure where isRejectedAsBehind(failure.message) {
+                if canAutoPull, pullsDone < maxPullRetries {
+                    needPullNow = true
+                    continue
+                }
+                return .rejectedAsBehind(message: failure.message)
+            } catch {
+                throw PushAutoPullError.pushFailed(error)
+            }
+        }
     }
 
     // MARK: Interrupted operations

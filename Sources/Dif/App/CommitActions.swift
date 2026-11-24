@@ -111,6 +111,7 @@ extension AppStore {
                     ? try await WorkingTree.commit(message: message, changes: targets, amend: amend, in: project.url)
                     : try await WorkingTree.commit(message: message, whole: whole, partial: partial, amend: amend, in: project.url)
                 project.lastCommit = result
+                let wasAmendPushed = amend && !project.amendPushedTo.isEmpty
                 let draft = project.amendDraft
                 if amend {
                     project.amend = false
@@ -143,7 +144,7 @@ extension AppStore {
                     self.showToast(L("Committed \(files)\(part) · \(result.shortHash)", "已提交 \(files)\(part) · \(result.shortHash)"),
                                    action: ToastAction(title: L("Undo Commit", "撤销提交")) { [weak self] in self?.undoLastCommit() })
                 }
-                if thenPush { self.push(in: project) }
+                if thenPush { self.push(in: project, autoReconcile: !wasAmendPushed) }
             } catch {
                 project.refresh()
                 self.showFailure(L("Commit failed", "提交失败"), error, note: self.sandboxNote(for: error))
@@ -168,6 +169,7 @@ extension AppStore {
             defer { project.isCommitting = false }
             do {
                 let result = try await WorkingTree.commitMerge(message: message, adding: targets, in: project.url)
+                project.pendingPushAfterPull = nil
                 // Undoing a merge commit would not bring the merge back, only its changes: not offered.
                 project.lastCommit = nil
                 // Lines picked before the merge were picked against the old HEAD.
@@ -176,9 +178,23 @@ extension AppStore {
                 if project.aiGroupResult != nil {
                     self.clearAIGroups(for: project)
                 }
+                let clashes = await Git.conflictedPaths(in: project.url)
+                if !clashes.isEmpty {
+                    await project.refreshAndWait()
+                    self.afterHistoryChanged(project)
+                    if thenPush, let branch = project.status.branch, let upstream = project.status.upstream {
+                        project.pendingPushAfterPull = Project.PendingPushAfterPull(branch: branch, target: upstream, remote: nil)
+                    }
+                    self.handleConflictsDetected(
+                        in: project,
+                        title: L("Merge committed · your local changes clash with what came in", "合并已提交 · 本地改动与合并后的内容冲突"),
+                        note: L("Your changes also stay in git's stash until you drop it.", "你的改动也仍保存在 git 的 stash 里，直到你删除它。")
+                    )
+                    return
+                }
                 self.afterHistoryChanged(project)
                 self.showToast(L("Merge committed · \(result.shortHash)", "合并已提交 · \(result.shortHash)"))
-                if thenPush { self.push(in: project) }
+                if thenPush { self.push(in: project, autoReconcile: true) }
             } catch {
                 project.refresh()
                 self.showFailure(L("Commit failed", "提交失败"), error, note: self.sandboxNote(for: error))

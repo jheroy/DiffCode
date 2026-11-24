@@ -480,7 +480,12 @@ final class ThreeWayMergeSession: MergeCanvasDelegate {
 
         // All conflicted files in this session have been resolved.
         let operation = project.status.operation
+        let shouldResumePush = project.pendingPushAfterPull != nil
         store?.closeMergeSession(rememberDismissal: false)
+        if shouldResumePush {
+            store?.resumePendingPushAfterConflictsResolved(in: project)
+            return
+        }
         if let operation, operation != .merge {
             store?.showToast(
                 L("All conflicts resolved · continue \(operation.command)", "所有冲突已解决 · 可以继续 \(operation.command)"),

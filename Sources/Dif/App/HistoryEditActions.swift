@@ -116,6 +116,7 @@ extension AppStore {
             do {
                 try await Git.skipOperation(operation, in: project.url)
                 guard let self else { return }
+                project.pendingPushAfterPull = nil
                 self.afterBranchesChanged(project)
                 self.showToast(L("Skipped · the \(operation.command) is done", "已跳过 · \(operation.command) 已完成"))
             } catch {

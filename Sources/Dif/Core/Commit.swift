@@ -193,13 +193,36 @@ extension WorkingTree {
             paths.append(change.path)
             if change.kind == .renamed, let old = change.oldPath { paths.append(old) }
         }
-        let directory = try makeBackupDirectory()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let messageFile = directory.appendingPathComponent("message")
-        try Data((text + "\n").utf8).write(to: messageFile)
-        // `-A` also takes a ticked file's deletion.
         try await git(["add", "-A"], paths: paths, in: root)
-        _ = try await Git.run(["commit", "--quiet", "--file=\(messageFile.path)"], in: root)
+        let gitDir = await Git.gitDirectory(in: root)
+        let hasAutoStash: Bool
+        if let gitDir {
+            let fileExists = FileManager.default.fileExists(atPath: gitDir.appendingPathComponent("MERGE_AUTOSTASH").path)
+            if fileExists {
+                hasAutoStash = true
+            } else {
+                hasAutoStash = (try? await Git.run(["rev-parse", "--verify", "--quiet", "MERGE_AUTOSTASH"], in: root)) != nil
+            }
+        } else {
+            hasAutoStash = false
+        }
+        if let gitDir, hasAutoStash {
+            // `git commit` leaves MERGE_AUTOSTASH behind; `git merge --continue` commits the merge and restores it.
+            try Data((text + "\n").utf8).write(to: gitDir.appendingPathComponent("MERGE_MSG"))
+            do {
+                _ = try await Git.run(["merge", "--continue"], in: root, environment: ["GIT_EDITOR": "true"])
+            } catch {
+                if Git.operation(in: gitDir) == .merge {
+                    throw error
+                }
+            }
+        } else {
+            let directory = try makeBackupDirectory()
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let messageFile = directory.appendingPathComponent("message")
+            try Data((text + "\n").utf8).write(to: messageFile)
+            _ = try await Git.run(["commit", "--quiet", "--file=\(messageFile.path)"], in: root)
+        }
         let hash = try await Git.runString(["rev-parse", "HEAD"], in: root).trimmingCharacters(in: .whitespacesAndNewlines)
         return CommitResult(hash: hash, isRoot: false, fileCount: changes.count, message: text)
     }

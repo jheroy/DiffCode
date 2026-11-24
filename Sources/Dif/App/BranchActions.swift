@@ -148,6 +148,7 @@ extension AppStore {
             do {
                 try await attempt()
                 guard let self else { return }
+                project.pendingPushAfterPull = nil
                 self.afterBranchesChanged(project)
                 self.showToast(L("Checked out \(title)", "已检出 \(title)"))
             } catch {
@@ -334,7 +335,9 @@ extension AppStore {
     }
 
     /// ⇧⌘K: lists the commits a push would send, and pushes them on ↩.
-    func push(in project: Project? = nil) {
+    /// - Parameter autoReconcile: when true (Commit & Push), automatically pulls & integrates incoming commits
+    ///   instead of halting on the divergent-branches dialog.
+    func push(in project: Project? = nil, autoReconcile: Bool = false) {
         guard let project = project ?? currentProject else { return }
         guard let branch = project.status.branch else {
             showToast(L("No branch is checked out (detached HEAD) · nothing to push", "当前不在任何分支上（游离 HEAD）· 无法推送"))
@@ -353,19 +356,22 @@ extension AppStore {
             }
             let commits = await Git.outgoingCommits(upstream: upstream, remote: remote, in: project.url)
             let target = upstream ?? "\(remote ?? "origin")/\(branch)"
+            var incoming: [Commit] = []
             if let upstream {
-                // The upstream has commits the branch does not: pull them, or, when the branch was rewritten, force.
-                let incoming = await Git.incomingCommits(in: project.url)
+                // The upstream has commits the branch does not: auto-pull on Commit & Push, or offer Pull & Push / Force Push.
+                incoming = await Git.incomingCommits(in: project.url)
                 if !incoming.isEmpty {
                     if commits.isEmpty {
                         self.showToast(L("Nothing to push · \(upstream) has commits to pull", "没有要推送的提交 · \(upstream) 有可拉取的提交"))
-                    } else {
+                        return
+                    }
+                    if !autoReconcile {
                         let protected = await Git.upstreamTarget(of: branch, in: project.url).map { Git.protectedBranches.contains($0.branch) } ?? true
                         let expected = await Git.resolveCommit("@{upstream}", in: project.url)
-                        self.offerReconcile(branch: branch, upstream: upstream, incoming: incoming,
+                        self.offerReconcile(branch: branch, upstream: upstream, target: target, outgoingCount: commits.count, incoming: incoming,
                                             forceTo: protected || Git.protectedBranches.contains(branch) ? nil : expected, in: project)
+                        return
                     }
-                    return
                 }
             }
             guard !commits.isEmpty || upstream == nil else {
@@ -386,11 +392,20 @@ extension AppStore {
                         "将在远程已有的提交上创建 \(target)，此后 \(branch) 跟踪它。")
                     : L("\(target) does not exist yet: it is created, and \(branch) follows it from now on.",
                         "\(target) 还不存在：将创建它，此后 \(branch) 跟踪它。")
+            } else if !incoming.isEmpty {
+                request.confirmTitle = L("Pull & Push", "拉取并推送")
+                request.message = incoming.count == 1
+                    ? L("\(target) has 1 new commit. Pushing will automatically pull and integrate it first.",
+                        "\(target) 有 1 个新提交，推送前将自动拉取并合并。")
+                    : L("\(target) has \(incoming.count) new commits. Pushing will automatically pull and integrate them first.",
+                        "\(target) 有 \(incoming.count) 个新提交，推送前将自动拉取并合并。")
             }
             request.items = commits.prefix(6).map { DialogRequest.Item(title: $0.subject, detail: $0.shortHash, symbol: "smallcircle.filled.circle") }
             request.hiddenCount = max(0, commits.count - 6)
+            let pullFirst = !incoming.isEmpty
             request.onConfirm = { [weak self] in
-                self?.performPush(branch: branch, remote: remote, target: target, count: commits.count, in: project)
+                self?.performPush(branch: branch, remote: remote, target: target, count: commits.count,
+                                  allowAutoPull: remote == nil, pullFirst: pullFirst, in: project)
             }
             self.ask(request)
         }
@@ -399,18 +414,20 @@ extension AppStore {
     /// The branch and its upstream have both moved on. Pulling is the way, unless the branch was rewritten on
     /// purpose (amend, rebase, reset): then Force Push replaces the upstream's commits.
     /// - Parameter forceTo: the upstream's commit a force push may replace; nil where force is not offered (main, master).
-    private func offerReconcile(branch: String, upstream: String, incoming: [Commit], forceTo: String?, in project: Project) {
+    private func offerReconcile(branch: String, upstream: String, target: String, outgoingCount: Int, incoming: [Commit], forceTo: String?, in project: Project) {
         var request = DialogRequest(style: .caution, symbol: "arrow.triangle.branch",
                                     title: L("\(branch) and \(upstream) have both moved on", "\(branch) 与 \(upstream) 各自有了新提交"),
                                     message: forceTo == nil
-                                        ? L("\(upstream) has the commits below, which \(branch) does not. Pull them first, then push.",
-                                            "\(upstream) 有下面这些 \(branch) 没有的提交。请先拉取，再推送。")
-                                        : L("\(upstream) has the commits below, which \(branch) does not. Pull them first, then push. If \(branch) was rewritten on purpose (amend, rebase, reset), Force Push replaces them on the remote instead.",
-                                            "\(upstream) 有下面这些 \(branch) 没有的提交。请先拉取，再推送。如果 \(branch) 是有意改写的（修改提交、变基、重置），可以用“强制推送”在远程替换掉它们。"),
-                                    confirmTitle: L("Pull", "拉取"))
+                                        ? L("\(upstream) has the commits below, which \(branch) does not. Pull & Push integrates them first, then pushes.",
+                                            "\(upstream) 有下面这些 \(branch) 没有的提交。拉取并推送会先拉取合并它们，然后再推送。")
+                                        : L("\(upstream) has the commits below, which \(branch) does not. Pull & Push integrates them first, then pushes. If \(branch) was rewritten on purpose (amend, rebase, reset), Force Push replaces them on the remote instead.",
+                                            "\(upstream) 有下面这些 \(branch) 没有的提交。拉取并推送会先拉取合并它们，然后再推送。如果 \(branch) 是有意改写的（修改提交、变基、重置），可以用“强制推送”在远程替换掉它们。"),
+                                    confirmTitle: L("Pull & Push", "拉取并推送"))
         request.items = incoming.prefix(5).map { DialogRequest.Item(title: $0.subject, detail: $0.shortHash, symbol: "smallcircle.filled.circle") }
         request.hiddenCount = max(0, incoming.count - 5)
-        request.onConfirm = { [weak self] in self?.pull(in: project) }
+        request.onConfirm = { [weak self] in
+            self?.performPush(branch: branch, remote: nil, target: target, count: outgoingCount, allowAutoPull: true, pullFirst: true, in: project)
+        }
         if let forceTo {
             request.alternateTitle = L("Force Push…", "强制推送…")
             request.onAlternate = { [weak self] in
@@ -451,34 +468,231 @@ extension AppStore {
         ask(request)
     }
 
-    private func performPush(branch: String, remote: String?, target: String, count: Int, in project: Project) {
-        runActivity(L("Pushing…", "正在推送…"), cancellable: true, in: project) { [weak self] in
-            do {
-                try await Git.push(branch: branch, setUpstreamTo: remote, in: project.url)
-                guard let self else { return }
-                self.afterBranchesChanged(project)
-                if count == 0 {
-                    self.showToast(L("Pushed \(branch) to \(target)", "已推送 \(branch) 到 \(target)"))
-                } else {
-                    self.showToast(count == 1 ? L("Pushed 1 commit to \(target)", "已推送 1 个提交到 \(target)")
-                                              : L("Pushed \(count) commits to \(target)", "已推送 \(count) 个提交到 \(target)"))
-                }
-            } catch is CancellationError {
-                self?.afterBranchesChanged(project)
-            } catch {
-                guard let self else { return }
-                if let failure = error as? Git.Failure, Git.isRejectedAsBehind(failure.message) {
-                    var request = DialogRequest(style: .caution, symbol: "arrow.down.circle",
-                                                title: L("Push rejected: \(target) has commits you don't have", "推送被拒绝：\(target) 有你本地没有的提交"),
-                                                message: L("Pull them first, then push again.", "请先拉取，再推送。"),
-                                                confirmTitle: L("Pull", "拉取"))
-                    request.output = failure.message
-                    request.onConfirm = { [weak self] in self?.pull(in: project) }
-                    self.ask(request)
-                } else {
-                    self.showFailure(L("Push failed", "推送失败"), error, note: self.remoteNote(error))
+    private func performPush(branch: String, remote: String?, target: String, count: Int,
+                             allowAutoPull: Bool = false, pullFirst: Bool = false, in project: Project) {
+        let initialTitle = pullFirst ? L("Pulling remote commits…", "正在自动拉取远端提交…") : L("Pushing…", "正在推送…")
+        runActivity(initialTitle, cancellable: true, in: project) { [weak self] in
+            guard let self else { return }
+            await self.runPushWithAutoPull(
+                branch: branch,
+                remote: remote,
+                target: target,
+                count: count,
+                allowAutoPull: allowAutoPull,
+                pullFirst: pullFirst,
+                afterConflictResolution: false,
+                in: project
+            )
+        }
+    }
+
+    private func runPushWithAutoPull(
+        branch: String,
+        remote: String?,
+        target: String,
+        count: Int,
+        allowAutoPull: Bool,
+        pullFirst: Bool,
+        afterConflictResolution: Bool,
+        in project: Project
+    ) async {
+        do {
+            let outcome = try await Git.pushWithAutoPull(
+                branch: branch,
+                setUpstreamTo: remote,
+                allowAutoPull: allowAutoPull,
+                pullFirst: pullFirst,
+                in: project.url
+            ) { @MainActor [weak project] phase in
+                switch phase {
+                case .pushing:
+                    project?.activity = L("Pushing…", "正在推送…")
+                case .pulling:
+                    project?.activity = L("Pulling remote commits…", "正在自动拉取远端提交…")
                 }
             }
+            switch outcome {
+            case .pushed(let didAutoPull, let pulledCommits):
+                project.pendingPushAfterPull = nil
+                afterBranchesChanged(project)
+                if afterConflictResolution {
+                    showToast(L("Resolved conflicts and pushed to \(target)", "冲突已解决并推送到 \(target)"))
+                } else if didAutoPull {
+                    if pulledCommits > 0 {
+                        let pulledText = pulledCommits == 1 ? L("1 commit", "1 个提交") : L("\(pulledCommits) commits", "\(pulledCommits) 个提交")
+                        showToast(L("Pulled \(pulledText) and pushed to \(target)", "已自动拉取 \(pulledText)并推送到 \(target)"))
+                    } else {
+                        showToast(L("Auto-pulled and pushed to \(target)", "已自动拉取并推送到 \(target)"))
+                    }
+                } else if count == 0 {
+                    showToast(L("Pushed \(branch) to \(target)", "已推送 \(branch) 到 \(target)"))
+                } else {
+                    showToast(count == 1 ? L("Pushed 1 commit to \(target)", "已推送 1 个提交到 \(target)")
+                                         : L("Pushed \(count) commits to \(target)", "已推送 \(count) 个提交到 \(target)"))
+                }
+            case .conflicts(let operation, _, let autostashClash):
+                project.pendingPushAfterPull = Project.PendingPushAfterPull(branch: branch, target: target, remote: remote)
+                await project.refreshAndWait()
+                afterBranchesChanged(project)
+                if autostashClash || operation == nil {
+                    handleConflictsDetected(
+                        in: project,
+                        title: L("Pulled · your local changes clash with what came in", "已拉取 · 本地改动与拉下来的内容冲突"),
+                        note: L("Your changes also stay in git's stash until you drop it.", "你的改动也仍保存在 git 的 stash 里，直到你删除它。")
+                    )
+                } else {
+                    handleConflictsDetected(
+                        in: project,
+                        title: L("Auto-pull hit conflicts · resolve to finish pushing", "自动拉取遇到冲突 · 解决后将继续推送"),
+                        note: nil
+                    )
+                }
+            case .emptyOperationStop(_, let message):
+                project.pendingPushAfterPull = nil
+                await project.refreshAndWait()
+                afterBranchesChanged(project)
+                var request = DialogRequest(
+                    style: .caution,
+                    symbol: "exclamationmark.triangle",
+                    title: L("A commit brings in nothing new", "有个提交没有带来新的改动"),
+                    message: L("Its changes are already in the branch. Skip it above the list to go on, or Abort to go back to the start.",
+                               "它的改动分支里已经有了。点列表上方的“跳过”继续，或“中止”回到开始之前。"),
+                    confirmTitle: L("OK", "好"),
+                    cancelTitle: nil
+                )
+                request.output = message
+                ask(request)
+            case .rejectedAsBehind(let message):
+                project.pendingPushAfterPull = nil
+                afterBranchesChanged(project)
+                var request = DialogRequest(
+                    style: .caution,
+                    symbol: "arrow.down.circle",
+                    title: L("Push rejected: \(target) has commits you don't have", "推送被拒绝：\(target) 有你本地没有的提交"),
+                    message: L("Pull them first, then push again.", "请先拉取，再推送。"),
+                    confirmTitle: L("Pull", "拉取")
+                )
+                request.output = message
+                request.onConfirm = { [weak self] in self?.pull(in: project) }
+                ask(request)
+            }
+        } catch is CancellationError {
+            project.pendingPushAfterPull = nil
+            afterBranchesChanged(project)
+        } catch let error as Git.PushAutoPullError {
+            project.pendingPushAfterPull = nil
+            afterBranchesChanged(project)
+            switch error {
+            case .pullFailed(let inner):
+                showFailure(L("Pull failed", "拉取失败"), inner, note: remoteNote(inner))
+            case .pushFailed(let inner):
+                showFailure(L("Push failed", "推送失败"), inner, note: remoteNote(inner))
+            }
+        } catch {
+            project.pendingPushAfterPull = nil
+            afterBranchesChanged(project)
+            showFailure(L("Push failed", "推送失败"), error, note: remoteNote(error))
+        }
+    }
+
+    /// Finishes the interrupted merge/rebase and completes the pending push after all conflicts were resolved in 3-way merge.
+    func resumePendingPushAfterConflictsResolved(in project: Project) {
+        guard let pending = project.pendingPushAfterPull else { return }
+        guard viewer.saveEdits() else { return }
+        runActivity(L("Finishing merge and pushing…", "正在完成合并并推送…"), cancellable: true, in: project) { [weak self] in
+            guard let self else { return }
+            await project.refreshAndWait()
+            let remaining = await Git.conflictedPaths(in: project.url)
+            if !remaining.isEmpty {
+                self.afterBranchesChanged(project)
+                self.handleConflictsDetected(
+                    in: project,
+                    title: L("Conflicts remain · resolve to finish pushing", "仍有冲突未解决 · 解决后将继续推送"),
+                    note: nil
+                )
+                return
+            }
+            guard project.status.branch == pending.branch else {
+                project.pendingPushAfterPull = nil
+                return
+            }
+            let gitDir: URL?
+            if let existingGitDir = project.gitDirectory {
+                gitDir = existingGitDir
+            } else {
+                gitDir = await Git.gitDirectory(in: project.url)
+            }
+            let activeOp = gitDir.flatMap { Git.operation(in: $0) }
+            if activeOp == .merge || activeOp == .rebase, let op = activeOp {
+                project.activity = op == .merge
+                    ? L("Committing merge and pushing…", "正在提交合并并推送…")
+                    : L("Continuing rebase and pushing…", "正在继续变基并推送…")
+                do {
+                    try await Git.continueOperation(op, in: project.url)
+                } catch is CancellationError {
+                    project.pendingPushAfterPull = nil
+                    self.afterBranchesChanged(project)
+                    return
+                } catch {
+                    await project.refreshAndWait()
+                    self.afterBranchesChanged(project)
+                    let newOp = gitDir.flatMap { Git.operation(in: $0) }
+                    let clashes = await Git.conflictedPaths(in: project.url)
+                    if newOp != nil, !clashes.isEmpty {
+                        self.handleConflictsDetected(
+                            in: project,
+                            title: L("More conflicts · resolve to finish pushing", "又遇到新的冲突 · 解决后将继续推送"),
+                            note: nil
+                        )
+                        return
+                    }
+                    if newOp == nil, !clashes.isEmpty {
+                        self.handleConflictsDetected(
+                            in: project,
+                            title: L("Pulled · your local changes clash with what came in", "已拉取 · 本地改动与拉下来的内容冲突"),
+                            note: L("Your changes also stay in git's stash until you drop it.", "你的改动也仍保存在 git 的 stash 里，直到你删除它。")
+                        )
+                        return
+                    }
+                    project.pendingPushAfterPull = nil
+                    self.showFailure(L("Could not continue the \(op.command)", "无法继续 \(op.command)"), error)
+                    return
+                }
+                if op == .merge {
+                    project.lastCommit = nil
+                    if !project.excludedLines.isEmpty { project.excludedLines = [:] }
+                    if project.aiGroupResult != nil {
+                        self.clearAIGroups(for: project)
+                    }
+                }
+                let postClashes = await Git.conflictedPaths(in: project.url)
+                if !postClashes.isEmpty {
+                    await project.refreshAndWait()
+                    self.afterBranchesChanged(project)
+                    self.handleConflictsDetected(
+                        in: project,
+                        title: L("Pulled · your local changes clash with what came in", "已拉取 · 本地改动与拉下来的内容冲突"),
+                        note: L("Your changes also stay in git's stash until you drop it.", "你的改动也仍保存在 git 的 stash 里，直到你删除它。")
+                    )
+                    return
+                }
+            } else if activeOp != nil {
+                project.pendingPushAfterPull = nil
+                return
+            }
+
+            await project.refreshAndWait()
+            let outgoing = await Git.outgoingCommits(upstream: project.status.upstream, remote: pending.remote, in: project.url)
+            await self.runPushWithAutoPull(
+                branch: pending.branch,
+                remote: pending.remote,
+                target: pending.target,
+                count: outgoing.count,
+                allowAutoPull: pending.remote == nil,
+                pullFirst: false,
+                afterConflictResolution: true,
+                in: project
+            )
         }
     }
 
@@ -491,6 +705,7 @@ extension AppStore {
             showToast(L("Resolve the conflicts first", "请先解决冲突"))
             return
         }
+        project.pendingPushAfterPull = nil
         if operation == .merge {
             focusCommitMessage()
             commitCurrent()
@@ -529,6 +744,7 @@ extension AppStore {
             self?.runActivity(L("Aborting…", "正在中止…"), in: project) { [weak self] in
                 do {
                     try await Git.abortOperation(operation, in: project.url)
+                    project.pendingPushAfterPull = nil
                     self?.afterBranchesChanged(project)
                     self?.showToast(L("Aborted · back to where you were", "已中止 · 回到了开始之前"))
                 } catch {

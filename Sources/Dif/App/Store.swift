@@ -747,6 +747,15 @@ final class AppStore {
         if mergeSession?.project.id == project.id {
             mergeSession?.refreshFromProjectStatus()
         }
+        if let pending = project.pendingPushAfterPull,
+           project.activity == nil,
+           mergeSession?.project.id != project.id {
+            let stillWaiting = project.status.branch == pending.branch
+                && (project.status.operation == .merge || project.status.operation == .rebase || project.status.conflictCount > 0)
+            if !stillWaiting {
+                project.pendingPushAfterPull = nil
+            }
+        }
         if project.hasLoaded,
            project.errorMessage == nil,
            project.aiGroupResult != nil,
