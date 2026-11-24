@@ -286,4 +286,9 @@ final class TerminalContainerView: NSView {
 
     override func mouseEntered(with event: NSEvent) { session.view.setScrollerVisible(true) }
     override func mouseExited(with event: NSEvent) { session.view.setScrollerVisible(false) }
+
+    /// The margin around the terminal scrolls it too.
+    override func scrollWheel(with event: NSEvent) {
+        if session.view.superview === self { session.view.scrollWheel(with: event) } else { super.scrollWheel(with: event) }
+    }
 }

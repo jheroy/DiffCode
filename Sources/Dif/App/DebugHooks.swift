@@ -9,6 +9,10 @@ import AppKit
 ///     DIF_SNAPSHOT_SCREEN=1                           …as composited on screen rather than re-rendered
 ///     DIF_BENCH=1                                     print scroll timings and quit
 ///     DIF_SIZE=1400x860  DIF_DELAY=1.2                window size / seconds before the first action
+/// Where in its window a synthesized event happened; a CoreGraphics call with no public header, for test runs only.
+@_silgen_name("CGEventSetWindowLocation")
+private func CGEventSetWindowLocation(_ event: CGEvent, _ location: CGPoint)
+
 /// Holds a one-shot notification observer so its own handler can remove it.
 private final class MenuObserver: @unchecked Sendable {
     var token: NSObjectProtocol?
@@ -200,6 +204,33 @@ enum DebugHooks {
                 FileHandle.standardError.write(Data("termline \(line) marked=\(session.view.hasMarkedText())\n".utf8))
             } else {
                 FileHandle.standardError.write(Data("termline none (\(store.terminals.sessions.count) sessions)\n".utf8))
+            }
+        case "termwheel":
+            // "termwheel:<notches>" a mouse wheel over the focused terminal, up positive; "termwheel:<points>|px" a
+            // trackpad's. It goes the way a real wheel's does: event monitors first, then the view under it.
+            guard let session = store.terminals.sessions.first(where: { $0.id == store.terminals.focusedID }) ?? store.terminals.sessions.first,
+                  let window = store.window else { break }
+            let values = argument.split(separator: "|")
+            let pixels = values.count > 1
+            let view = session.view
+            let inWindow = view.convert(NSPoint(x: view.bounds.midX, y: view.bounds.midY), to: nil)
+            guard let cg = CGEvent(scrollWheelEvent2Source: nil, units: pixels ? .pixel : .line, wheelCount: 1,
+                                   wheel1: Int32(Double(values.first ?? "") ?? 0), wheel2: 0, wheel3: 0) else { break }
+            // The window it is for (CoreGraphics' window-number field) and where in it, from the top-left: without
+            // them AppKit makes an event with no window, which the terminal rightly leaves alone.
+            if let field = CGEventField(rawValue: 51) { cg.setIntegerValueField(field, value: Int64(window.windowNumber)) }
+            CGEventSetWindowLocation(cg, CGPoint(x: inWindow.x, y: window.frame.height - inWindow.y))
+            if let event = NSEvent(cgEvent: cg) {
+                FileHandle.standardError.write(Data("termwheel at=\(event.locationInWindow) precise=\(event.hasPreciseScrollingDeltas) dy=\(event.scrollingDeltaY)\n".utf8))
+                NSApp.postEvent(event, atStart: false)
+            }
+        case "termscreen":
+            // The focused terminal's screen as the program drew it, and the modes that decide what the wheel does.
+            if let session = store.terminals.sessions.first(where: { $0.id == store.terminals.focusedID }) ?? store.terminals.sessions.first {
+                let terminal = session.view.getTerminal()
+                let lines = (0..<terminal.rows).map { terminal.getLine(row: $0)?.translateToString(trimRight: true) ?? "" }
+                let head = "termscreen alternate=\(terminal.isCurrentBufferAlternate) mouse=\(terminal.mouseMode) appCursor=\(terminal.applicationCursor) scroll=\(String(format: "%.3f", session.view.scrollPosition))"
+                FileHandle.standardError.write(Data(([head] + lines.map { "| " + $0 }).joined(separator: "\n").utf8 + Data("\n".utf8)))
             }
         case "focusviewer": store.focusViewer()
         case "projectstate":

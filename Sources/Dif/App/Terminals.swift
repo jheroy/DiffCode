@@ -185,6 +185,81 @@ final class DifTerminalView: TerminalView, @preconcurrency TerminalViewDelegate 
         }
     }
 
+    // MARK: Wheel
+
+    /// What a trackpad has moved that does not yet add up to a whole line.
+    private var wheelRemainder: CGFloat = 0
+    private var wheelMonitor: Any?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // SwiftTerm's own `scrollWheel` cannot be overridden from outside it, so the wheel is taken before it.
+        if window != nil, wheelMonitor == nil {
+            wheelMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+                guard let self, self.wheel(event) else { return event }
+                return nil
+            }
+        } else if window == nil, let wheelMonitor {
+            NSEvent.removeMonitor(wheelMonitor)
+            self.wheelMonitor = nil
+        }
+    }
+
+    /// Scrolling, as other Mac terminals do it. A program that asked for the mouse gets the wheel as its buttons
+    /// 4 and 5. A program on the alternate screen, where there is no scrollback to move (coding agents such as
+    /// Codex, `less`, `man`), gets it as arrow keys: what such programs ask for with mode 1007, and what Terminal
+    /// and iTerm2 do there anyway. SwiftTerm itself only ever moves the scrollback, so in those the wheel did
+    /// nothing. Anywhere else the event goes on to SwiftTerm, which moves the scrollback; `true` means it was used.
+    func wheel(_ event: NSEvent) -> Bool {
+        let terminal = getTerminal()
+        let reporting = allowMouseReporting && terminal.mouseMode != .off
+        guard reporting || terminal.isCurrentBufferAlternate else {
+            wheelRemainder = 0
+            return false
+        }
+        // Only over this terminal or its margin, and not over something lying on it (a popup, a dialog).
+        // `hitTest` takes a point in the coordinates of the view's superview.
+        guard event.window === window, let content = window?.contentView, let frame = content.superview,
+              let hit = content.hitTest(frame.convert(event.locationInWindow, from: nil)), hit.isDescendant(of: superview ?? self) else { return false }
+        let rows = max(1, terminal.rows), cols = max(1, terminal.cols)
+        let lines = wheelLines(for: event, rows: rows)
+        guard lines != 0 else { return true }
+        if reporting {
+            let point = convert(event.locationInWindow, from: nil)
+            let col = min(cols - 1, max(0, Int(point.x / (bounds.width / CGFloat(cols)))))
+            let row = min(rows - 1, max(0, Int((bounds.height - point.y) / (bounds.height / CGFloat(rows)))))
+            let flags = event.modifierFlags
+            let button = terminal.encodeButton(button: lines > 0 ? 4 : 5, release: false, shift: flags.contains(.shift),
+                                               meta: flags.contains(.option), control: flags.contains(.control))
+            for _ in 0..<abs(lines) { terminal.sendEvent(buttonFlags: button, x: col, y: row) }
+        } else {
+            let application = terminal.applicationCursor
+            let key = lines > 0 ? (application ? "\u{1b}OA" : "\u{1b}[A") : (application ? "\u{1b}OB" : "\u{1b}[B")
+            send(txt: String(repeating: key, count: abs(lines)))
+        }
+        return true
+    }
+
+    /// Whole lines, upwards positive, at most a screenful. A wheel's notches are lines already, one at least each;
+    /// a trackpad's points add up until they make a line, so a slow swipe still moves.
+    private func wheelLines(for event: NSEvent, rows: Int) -> Int {
+        let delta = event.scrollingDeltaY
+        guard event.hasPreciseScrollingDeltas else {
+            wheelRemainder = 0
+            guard delta != 0 else { return 0 }
+            return (delta > 0 ? 1 : -1) * min(rows, max(1, Int(abs(delta).rounded())))
+        }
+        // A new swipe, or a turn the other way, starts from nothing.
+        if event.phase == .began || (delta != 0 && wheelRemainder != 0 && (delta > 0) != (wheelRemainder > 0)) {
+            wheelRemainder = 0
+        }
+        wheelRemainder += delta
+        let lineHeight = max(1, bounds.height / CGFloat(rows))
+        let lines = Int(wheelRemainder / lineHeight)
+        wheelRemainder -= CGFloat(lines) * lineHeight
+        return max(-rows, min(rows, lines))
+    }
+
     func enableFileDrops() {
         registerForDraggedTypes([.fileURL])
     }

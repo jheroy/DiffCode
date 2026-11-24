@@ -126,6 +126,13 @@ struct SidebarView: View {
     /// way and still be found.
     static var treeMinimum: CGFloat { UI.s(56) }
 
+    /// The least the column can be shown in: the title bar's strip, the heading, the row and a half a dragged
+    /// divider keeps, the divider, the tree's bar and the footer. The terminals never take more than leaves this.
+    static func minimumHeight(titlebar: CGFloat) -> CGFloat {
+        let heading = UI.s(24) + 4
+        return titlebar + heading + ((rowHeight + rowSpacing) * 1.5).rounded() + 1 + treeMinimum + 1 + UI.s(34)
+    }
+
     /// What a drag of the divider may ask for: a row and a half at least, and room left for the tree's bar.
     static func clampedChoice(_ height: CGFloat, room: CGFloat, dividerHeight: CGFloat = 1) -> Double {
         let step = rowHeight + rowSpacing

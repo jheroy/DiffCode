@@ -151,6 +151,20 @@ final class SidebarLayoutTests: XCTestCase {
         let least = SidebarView.projectsHeight(count: 40, available: 800, chosen: 0, room: room)
         XCTAssertEqual(least, ((SidebarView.rowHeight + 2) * 1.5).rounded())
     }
+
+    /// A terminal dragged as high as it goes leaves the sidebar its least, and in that the projects, however the
+    /// divider was dragged, and the tree's bar still fit between the heading and the footer.
+    @MainActor
+    func testTheLeastHeightHoldsWhatTheSidebarCannotDoWithout() {
+        let titlebar: CGFloat = 38
+        let least = SidebarView.minimumHeight(titlebar: titlebar)
+        // Less the title bar's strip, the heading, the line over the footer and the footer.
+        let room = least - titlebar - (UI.s(24) + 4) - 1 - UI.s(34)
+        for chosen in [nil, 0, 120, 5000] as [Double?] {
+            let projects = SidebarView.projectsHeight(count: 40, available: least, chosen: chosen, room: room)
+            XCTAssertLessThanOrEqual(projects + 1 + SidebarView.treeMinimum, room, "chosen \(String(describing: chosen))")
+        }
+    }
 }
 
 final class ShellTests: XCTestCase {

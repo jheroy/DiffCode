@@ -10,7 +10,7 @@ struct RootView: View {
         ZStack(alignment: .top) {
             GeometryReader { proxy in
                 VStack(spacing: 0) {
-                    HStack(spacing: 0) {
+                    HStack(alignment: .top, spacing: 0) {
                         if store.sidebarVisible {
                             SidebarView()
                                 .frame(width: settings.sidebarWidth)
@@ -38,10 +38,16 @@ struct RootView: View {
                                 .islandCard(background: .difWindow)
                         }
                     }
+                    // Never taller than the terminals leave room for, nor wider than the window. Whatever cannot
+                    // shrink that far is cut at the bottom or the right, rather than pushing the terminals off the
+                    // window or sideways, and the other columns down from the top.
+                    .frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity, alignment: .topLeading)
+                    .clipped()
                     // The terminals run the full width of the window, under the sidebar too.
                     if let project = store.currentProject, store.terminals.isVisible {
-                        // They may take most of the window, but always leave the diff a strip to live in.
-                        let ceiling = max(120, Double(proxy.size.height) - 200)
+                        // They may take most of the window, but always leave the columns above what they cannot do
+                        // without: the sidebar's least is the most of them, and the diff gets a strip as wide.
+                        let ceiling = max(120, Double(proxy.size.height - SidebarView.minimumHeight(titlebar: store.titlebarHeight) - IslandStyle.gap))
                         HorizontalResizeHandle(height: $settings.terminalHeight, range: 120...ceiling, islandGap: true) { settings.save() }
                         TerminalPanel(project: project)
                             .frame(height: min(settings.terminalHeight, ceiling))

@@ -188,10 +188,32 @@ private struct ViewerHeader: View {
     let project: Project
     @Environment(AppStore.self) private var store
 
+    /// How much a narrow column leaves out, least needed first: the counts, then the view toggles (they have
+    /// shortcuts and menu items), then the rest of the diff's buttons. Finding and the terminal stay.
+    private enum Shed: Int, Comparable {
+        case nothing, counts, toggles, buttons
+        static func < (a: Shed, b: Shed) -> Bool { a.rawValue < b.rawValue }
+    }
+
     var body: some View {
+        // Rather than run past the column's edge, which pushed the terminals sideways with it.
+        ViewThatFits(in: .horizontal) {
+            row(shedding: .nothing)
+            row(shedding: .counts)
+            row(shedding: .toggles)
+            row(shedding: .buttons)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.leading, leadingInset)
+        .padding(.trailing, 10)
+        .frame(height: store.titlebarHeight)
+        .background(WindowDragArea())
+    }
+
+    private func row(shedding shed: Shed) -> some View {
         let viewer = store.viewer
-        HStack(spacing: 8) {
-            if store.canNavigateBack || store.canNavigateForward {
+        return HStack(spacing: 8) {
+            if (store.canNavigateBack || store.canNavigateForward), shed < .buttons {
                 HStack(spacing: 2) {
                     IconButton(symbol: "chevron.left", help: L("Navigate Back (⌘[)", "后退 (⌘[)"), size: 11) {
                         store.navigateBack()
@@ -234,7 +256,7 @@ private struct ViewerHeader: View {
                     // The diff of text being edited changes in place; this follows it.
                     let _ = viewer.diffRevision
                     StatBadge(additions: doc.additions, deletions: doc.deletions)
-                    if viewer.hunkCount > 0 {
+                    if viewer.hunkCount > 0, shed < .counts {
                         Text(differenceLabel(viewer))
                             .font(.ui(size: 11))
                             .foregroundStyle(Color.difText3)
@@ -246,60 +268,64 @@ private struct ViewerHeader: View {
                 Text(project.name).font(.ui(size: 13, weight: .medium)).foregroundStyle(Color.difText2)
             }
             Spacer(minLength: 8)
-            if viewer.request != nil, viewer.loadMilliseconds > 0 {
+            if viewer.request != nil, viewer.loadMilliseconds > 0, shed < .counts {
                 // Load time, shown because being fast is the point.
                 Text(String(format: "%.0f ms", viewer.loadMilliseconds))
                     .font(.ui(size: 10.5, weight: .medium, design: .rounded))
                     .foregroundStyle(Color.difText3)
+                    .lineLimit(1)
+                    .fixedSize()
                     .help(L("Time to load, diff and highlight this file", "加载、比较并高亮这个文件所用的时间"))
             }
             if viewer.request != nil || AppEnvironment.hasTerminal {
                 HStack(spacing: 8) {
                     if viewer.request != nil {
-                        if viewer.isTextDocument || viewer.isSpreadsheet {
+                        if (viewer.isTextDocument || viewer.isSpreadsheet), shed < .buttons {
                             IconButton(symbol: "arrow.left", help: L("Previous file (⇧⌘[)", "上一个文件 (⇧⌘[)")) { store.stepFile(-1) }
                             IconButton(symbol: "arrow.right", help: L("Next file (⇧⌘])", "下一个文件 (⇧⌘])")) { store.stepFile(1) }
                         }
-                        if viewer.isTextDocument, let doc = viewer.document, !doc.isPlainFile {
+                        if viewer.isTextDocument, let doc = viewer.document, !doc.isPlainFile, shed < .buttons {
                             IconButton(symbol: "arrow.up", help: L("Previous Difference (⇧F7)", "上一处差异 (⇧F7)")) { viewer.stepDifference(-1) }
                             IconButton(symbol: "arrow.down", help: L("Next Difference (F7)", "下一处差异 (F7)")) { viewer.stepDifference(1) }
-                            Divider().frame(height: 14)
-                            if !doc.isAddedOnly {
-                                IconButton(symbol: "rectangle.split.2x1", help: L("Side-by-Side (⌥⌘V)", "并排视图 (⌥⌘V)"), isActive: !store.settings.unified) {
-                                    if store.settings.unified { viewer.toggleUnified() }
-                                }
-                                IconButton(symbol: "rectangle.grid.1x2", help: L("Unified (⌥⌘V)", "合并视图 (⌥⌘V)"), isActive: store.settings.unified) {
-                                    if !store.settings.unified { viewer.toggleUnified() }
-                                }
-                                IconButton(symbol: "rectangle.split.1x2",
-                                           help: L("Toggle inline line diff", "显示/隐藏底部行内对比"),
-                                           isActive: store.settings.showLineDiffBar) {
-                                    store.settings.showLineDiffBar.toggle()
-                                    store.settings.save()
-                                    if store.settings.showLineDiffBar {
-                                        viewer.refreshLineDiff()
+                            if shed < .toggles {
+                                Divider().frame(height: 14)
+                                if !doc.isAddedOnly {
+                                    IconButton(symbol: "rectangle.split.2x1", help: L("Side-by-Side (⌥⌘V)", "并排视图 (⌥⌘V)"), isActive: !store.settings.unified) {
+                                        if store.settings.unified { viewer.toggleUnified() }
+                                    }
+                                    IconButton(symbol: "rectangle.grid.1x2", help: L("Unified (⌥⌘V)", "合并视图 (⌥⌘V)"), isActive: store.settings.unified) {
+                                        if !store.settings.unified { viewer.toggleUnified() }
+                                    }
+                                    IconButton(symbol: "rectangle.split.1x2",
+                                               help: L("Toggle inline line diff", "显示/隐藏底部行内对比"),
+                                               isActive: store.settings.showLineDiffBar) {
+                                        store.settings.showLineDiffBar.toggle()
+                                        store.settings.save()
+                                        if store.settings.showLineDiffBar {
+                                            viewer.refreshLineDiff()
+                                        }
                                     }
                                 }
-                            }
-                            IconButton(symbol: "space", help: L("Ignore Whitespace (⌥⌘W)", "忽略空白差异 (⌥⌘W)"), isActive: store.settings.ignoreWhitespace) {
-                                viewer.toggleWhitespace()
-                            }
-                            IconButton(symbol: "text.bubble", help: L("Ignore Comment Changes", "忽略注释变更"), isActive: store.settings.ignoreComments) {
-                                viewer.toggleIgnoreComments()
-                            }
-                            if !doc.isAddedOnly {
-                                IconButton(symbol: "rectangle.compress.vertical",
-                                           help: L("Collapse Unchanged Lines", "折叠未变更行"),
-                                           isActive: store.settings.collapseUnchanged) {
-                                    viewer.toggleCollapseUnchanged()
+                                IconButton(symbol: "space", help: L("Ignore Whitespace (⌥⌘W)", "忽略空白差异 (⌥⌘W)"), isActive: store.settings.ignoreWhitespace) {
+                                    viewer.toggleWhitespace()
                                 }
+                                IconButton(symbol: "text.bubble", help: L("Ignore Comment Changes", "忽略注释变更"), isActive: store.settings.ignoreComments) {
+                                    viewer.toggleIgnoreComments()
+                                }
+                                if !doc.isAddedOnly {
+                                    IconButton(symbol: "rectangle.compress.vertical",
+                                               help: L("Collapse Unchanged Lines", "折叠未变更行"),
+                                               isActive: store.settings.collapseUnchanged) {
+                                        viewer.toggleCollapseUnchanged()
+                                    }
+                                }
+                                SemanticOptionsMenu(viewer: viewer)
                             }
-                            SemanticOptionsMenu(viewer: viewer)
                             Divider().frame(height: 14)
-                        } else if viewer.isTextDocument {
+                        } else if viewer.isTextDocument, shed < .buttons {
                             Divider().frame(height: 14)
                         }
-                        if viewer.isTextDocument {
+                        if viewer.isTextDocument, shed < .buttons {
                             let available = viewer.annotating || viewer.canAnnotate
                             IconButton(symbol: "person.text.rectangle", help: L("Annotate with Git Blame", "逐行追溯 (Blame)：每行最后由谁在何时修改"),
                                        isActive: viewer.annotating, size: 12.5) {
@@ -318,29 +344,31 @@ private struct ViewerHeader: View {
                                 if viewer.findVisible { viewer.hideFind() } else { viewer.showFind() }
                             }
                         }
-                        if let request = viewer.request, request.source != .file, !request.isExternalFile, !viewer.isSpreadsheet {
-                            let canOpen = store.canOpenCurrentFile
-                            IconButton(
-                                symbol: "doc.plaintext",
-                                help: canOpen
-                                    ? L("Open File Content", "直接打开当前文件内容")
-                                    : L("This file is not in the working tree", "这个文件不在当前工作区里"),
-                                size: 12.5
-                            ) {
-                                store.openCurrentFile()
-                            }
-                            .disabled(!canOpen)
-                            .opacity(canOpen ? 1 : 0.35)
-                        } else if store.canShowDiffForCurrentFile {
-                            IconButton(
-                                symbol: "arrow.left.arrow.right",
-                                help: L("Show Diff (⌘D)", "查看差异 (⌘D)"),
-                                size: 12
-                            ) {
-                                store.showDiffForCurrentFile()
+                        if shed < .buttons {
+                            if let request = viewer.request, request.source != .file, !request.isExternalFile, !viewer.isSpreadsheet {
+                                let canOpen = store.canOpenCurrentFile
+                                IconButton(
+                                    symbol: "doc.plaintext",
+                                    help: canOpen
+                                        ? L("Open File Content", "直接打开当前文件内容")
+                                        : L("This file is not in the working tree", "这个文件不在当前工作区里"),
+                                    size: 12.5
+                                ) {
+                                    store.openCurrentFile()
+                                }
+                                .disabled(!canOpen)
+                                .opacity(canOpen ? 1 : 0.35)
+                            } else if store.canShowDiffForCurrentFile {
+                                IconButton(
+                                    symbol: "arrow.left.arrow.right",
+                                    help: L("Show Diff (⌘D)", "查看差异 (⌘D)"),
+                                    size: 12
+                                ) {
+                                    store.showDiffForCurrentFile()
+                                }
                             }
                         }
-                        if AppEnvironment.hasTerminal {
+                        if AppEnvironment.hasTerminal, !viewer.isSpreadsheet || shed < .buttons {
                             Divider().frame(height: 14)
                         }
                     }
@@ -352,10 +380,6 @@ private struct ViewerHeader: View {
                 .titlebarClickGuard(horizontalOutset: 4)
             }
         }
-        .padding(.leading, leadingInset)
-        .padding(.trailing, 10)
-        .frame(height: store.titlebarHeight)
-        .background(WindowDragArea())
     }
 
     /// Leave room for the traffic lights when this header is the leftmost thing in the window.
@@ -404,11 +428,13 @@ private struct PathLabel: View {
                 .foregroundStyle(Color.status(request.kind))
                 .lineLimit(1)
                 .layoutPriority(2)
+            // These two give way: asking for no width of their own, a long path never makes the header shed buttons.
             if let old = request.oldPath, old != request.path {
                 Text("← " + (old as NSString).lastPathComponent)
                     .font(.ui(size: 11.5))
                     .foregroundStyle(Color.difText3)
                     .lineLimit(1)
+                    .frame(minWidth: 0, idealWidth: 0, alignment: .leading)
             }
             if !directory.isEmpty {
                 Text(directory)
@@ -416,6 +442,7 @@ private struct PathLabel: View {
                     .foregroundStyle(Color.difText3)
                     .lineLimit(1)
                     .truncationMode(.head)
+                    .frame(minWidth: 0, idealWidth: 0, alignment: .leading)
             }
         }
         .help(request.isExternalFile ? request.fileURL.path : (request.oldPath.map { "\($0) → \(request.path)" } ?? request.path))
@@ -550,8 +577,19 @@ private struct ViewerEmptyState: View {
             (L("Next / Previous Difference", "下一处 / 上一处差异"), "F7 / ⇧F7"),
             (L("Git Log", "提交历史"), "⌘9"),
         ]
+        let clean = project.hasLoaded && project.changes.isEmpty && project.tab == .changes
+        // A tall terminal can leave little room: the shortcuts go first, then the "clean" badge.
+        ViewThatFits(in: .vertical) {
+            content(clean: clean, hints: hints)
+            content(clean: clean, hints: [])
+            Color.clear
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func content(clean: Bool, hints: [(String, String)]) -> some View {
         VStack(spacing: 22) {
-            if project.hasLoaded, project.changes.isEmpty, project.tab == .changes {
+            if clean {
                 VStack(spacing: 8) {
                     Image(systemName: "checkmark.seal.fill")
                         .font(.ui(size: 34))
@@ -575,16 +613,18 @@ private struct ViewerEmptyState: View {
                 }
                 .padding(.horizontal, 24)
             }
-            Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 9) {
-                ForEach(hints, id: \.0) { hint in
-                    GridRow {
-                        Text(hint.0).font(.ui(size: 13)).foregroundStyle(Color.difText2)
-                        KeyCaps(shortcut: hint.1, size: 12)
+            if !hints.isEmpty {
+                Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 9) {
+                    ForEach(hints, id: \.0) { hint in
+                        GridRow {
+                            Text(hint.0).font(.ui(size: 13)).foregroundStyle(Color.difText2)
+                            KeyCaps(shortcut: hint.1, size: 12)
+                        }
                     }
                 }
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.vertical, 8)
     }
 }
 
