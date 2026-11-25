@@ -1216,6 +1216,149 @@ struct IconButton: View {
     }
 }
 
+/// Compact pill or icon button used to trigger or cancel an AI Code Review run.
+struct AIReviewPillButton: View {
+    var isReviewing: Bool
+    var isDisabled: Bool = false
+    var compactIconOnly: Bool = false
+    var help: String
+    var action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Group {
+                if compactIconOnly {
+                    ZStack {
+                        if isReviewing {
+                            ProgressView()
+                                .controlSize(.small)
+                                .scaleEffect(0.48)
+                                .frame(width: UI.s(11), height: UI.s(11))
+                        } else {
+                            Image(systemName: "doc.text.magnifyingglass")
+                                .font(.ui(size: 10.5, weight: .medium))
+                                .foregroundStyle(isDisabled ? Color.difText3.opacity(0.45) : Color.difAccent)
+                        }
+                    }
+                    .frame(width: UI.s(20), height: UI.s(18))
+                    .background(
+                        RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                            .fill(isReviewing
+                                  ? Color.difSelection
+                                  : (hovering && !isDisabled ? Color.difSelection.opacity(0.9) : Color.difChip.opacity(0.8)))
+                    )
+                } else {
+                    HStack(spacing: 3.5) {
+                        if isReviewing {
+                            ProgressView()
+                                .controlSize(.small)
+                                .scaleEffect(0.48)
+                                .frame(width: UI.s(10), height: UI.s(10))
+                            Text(L("Reviewing…", "审查中…"))
+                                .font(.ui(size: 10.5, weight: .medium))
+                        } else {
+                            Image(systemName: "doc.text.magnifyingglass")
+                                .font(.ui(size: 10, weight: .semibold))
+                            Text(L("Review", "审查"))
+                                .font(.ui(size: 10.5, weight: .medium))
+                        }
+                    }
+                    .lineLimit(1)
+                    .fixedSize()
+                    .foregroundStyle(isDisabled ? Color.difText3.opacity(0.45) : Color.difAccent)
+                    .padding(.horizontal, 6.5)
+                    .frame(height: UI.s(20))
+                    .background(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(isReviewing
+                                  ? Color.difSelection
+                                  : Color.difSelection.opacity(isDisabled ? 0.35 : (hovering ? 1.0 : 0.8)))
+                    )
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .onHover { hovering = $0 }
+        .help(help)
+    }
+}
+
+/// Compact pill or icon button placed next to Review / Grouping buttons to open the live Agent Conversation stream.
+struct AgentStreamPillButton: View {
+    var isRunning: Bool = false
+    var hasError: Bool = false
+    var compactIconOnly: Bool = false
+    var help: String
+    var action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            let tint: Color = hasError ? .difRemoved : .difAccent
+            Group {
+                if compactIconOnly {
+                    ZStack(alignment: .topTrailing) {
+                        Image(systemName: "bubble.left.and.text.bubble.right")
+                            .font(.ui(size: 10, weight: .medium))
+                            .foregroundStyle(tint)
+                        if isRunning || hasError {
+                            Circle()
+                                .fill(hasError ? Color.difRemoved : Color.difAccent)
+                                .frame(width: 5, height: 5)
+                                .offset(x: 2, y: -2)
+                        }
+                    }
+                    .frame(width: UI.s(20), height: UI.s(18))
+                    .background(
+                        RoundedRectangle(cornerRadius: 4.5, style: .continuous)
+                            .fill(hasError
+                                  ? Color.difRemoved.opacity(hovering ? 0.22 : 0.14)
+                                  : (hovering ? Color.difSelection : Color.difChip.opacity(0.85)))
+                    )
+                } else {
+                    HStack(spacing: 3.5) {
+                        if isRunning {
+                            Circle()
+                                .fill(Color.difAccent)
+                                .frame(width: 5.5, height: 5.5)
+                        } else if hasError {
+                            Circle()
+                                .fill(Color.difRemoved)
+                                .frame(width: 5.5, height: 5.5)
+                        }
+                        Image(systemName: "bubble.left.and.text.bubble.right")
+                            .font(.ui(size: 10, weight: .semibold))
+                        Text(L("Stream", "对话"))
+                            .font(.ui(size: 10.5, weight: .medium))
+                    }
+                    .lineLimit(1)
+                    .fixedSize()
+                    .foregroundStyle(tint)
+                    .padding(.horizontal, 6)
+                    .frame(height: UI.s(20))
+                    .background(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(hasError
+                                  ? Color.difRemoved.opacity(hovering ? 0.22 : 0.14)
+                                  : Color.difChip.opacity(hovering ? 1.0 : 0.85))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .strokeBorder(hasError ? Color.difRemoved.opacity(0.4) : Color.difHairline, lineWidth: 0.75)
+                    )
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help(help)
+    }
+}
+
 /// A keyboard shortcut rendered as key caps.
 struct KeyCaps: View {
     var shortcut: String

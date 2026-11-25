@@ -63,6 +63,15 @@ struct PopupSizeSpec: Equatable, Sendable {
         bottomMargin: 32,
         userDefaultsKey: "popupSize.selectionHistory"
     )
+
+    static let agentConversation = PopupSizeSpec(
+        defaultSize: CGSize(width: 860, height: 640),
+        minSize: CGSize(width: 560, height: 400),
+        topPadding: 48,
+        horizontalMargin: 48,
+        bottomMargin: 32,
+        userDefaultsKey: "popupSize.agentConversation"
+    )
 }
 
 /// Pure geometry math for clamping and symmetrically resizing centered popups.

@@ -11,6 +11,35 @@ struct ExternalOpenTarget: Equatable, Sendable {
 
 /// Parses external open requests from `diffcode://` URLs, `file://` URLs, and CLI arguments.
 enum ExternalOpenParser {
+    /// Builds a canonical `diffcode://open?path=...` magic link for a repository file path and optional 1-based position.
+    static func makeOpenURL(path: String, line: Int? = nil, column: Int? = nil) -> URL? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        var components = URLComponents()
+        components.scheme = "diffcode"
+        components.host = "open"
+        var items = [URLQueryItem(name: "path", value: trimmed)]
+        if let line, line >= 1 {
+            items.append(URLQueryItem(name: "line", value: String(line)))
+            if let column, column >= 1 {
+                items.append(URLQueryItem(name: "column", value: String(column)))
+            }
+        }
+        components.queryItems = items
+        // Escape parentheses so Markdown `[label](diffcode://...)` links never terminate early.
+        if let query = components.percentEncodedQuery, query.contains("(") || query.contains(")") {
+            components.percentEncodedQuery = query
+                .replacingOccurrences(of: "(", with: "%28")
+                .replacingOccurrences(of: ")", with: "%29")
+        }
+        return components.url
+    }
+
+    /// Builds a canonical `diffcode://open?path=...` magic link from a local file URL and optional 1-based position.
+    static func makeOpenURL(fileURL: URL, line: Int? = nil, column: Int? = nil) -> URL? {
+        makeOpenURL(path: fileURL.standardizedFileURL.path, line: line, column: column)
+    }
+
     /// Parses a `file://` or `diffcode://open?path=...&line=...&column=...` URL.
     static func parseURL(_ url: URL) -> ExternalOpenTarget? {
         if url.isFileURL {
@@ -21,15 +50,39 @@ enum ExternalOpenParser {
             return nil
         }
         let host = components.host?.lowercased() ?? ""
-        guard host.isEmpty || host == "open" else { return nil }
-        guard let rawPath = components.queryItems?.first(where: { $0.name == "path" })?.value,
+        guard host.isEmpty || host == "open" || host == "file" else { return nil }
+        let queryPath = components.queryItems?.first(where: { $0.name == "path" })?.value
+        let fallbackPath = (host == "file" && !components.path.isEmpty) ? components.path : nil
+        guard let rawPath = (queryPath?.isEmpty == false ? queryPath : fallbackPath),
               !rawPath.isEmpty else {
             return nil
         }
-        let line = parsePositiveInt(components.queryItems?.first(where: { $0.name == "line" })?.value)
-        let column = parsePositiveInt(components.queryItems?.first(where: { $0.name == "column" })?.value).map { $0 - 1 }
+        let lineItem = components.queryItems?.first(where: { $0.name == "line" })
+        let colItem = components.queryItems?.first(where: { $0.name == "column" })
+        var line: Int?
+        if let lineItem {
+            line = parseLineSpec(lineItem.value)
+        } else if let fragment = components.fragment, !fragment.isEmpty {
+            line = parseLineSpec(fragment)
+        }
+        var column = parseLineSpec(colItem?.value).map { $0 - 1 }
+        var resolvedFileURL = URL(fileURLWithPath: rawPath).standardizedFileURL
+        if lineItem == nil && line == nil {
+            let parsedSuffix = parsePathAndPosition(
+                rawPath,
+                currentDirectory: URL(fileURLWithPath: "/"),
+                forcePositionSplit: true
+            )
+            if parsedSuffix.line != nil {
+                resolvedFileURL = parsedSuffix.fileURL
+                line = parsedSuffix.line
+                if column == nil {
+                    column = parsedSuffix.column
+                }
+            }
+        }
         return ExternalOpenTarget(
-            fileURL: URL(fileURLWithPath: rawPath).standardizedFileURL,
+            fileURL: resolvedFileURL,
             line: line,
             column: line != nil ? column : nil
         )
@@ -202,6 +255,19 @@ enum ExternalOpenParser {
             return URL(fileURLWithPath: path).standardizedFileURL
         }
         return URL(fileURLWithPath: path, relativeTo: currentDirectory).standardizedFileURL
+    }
+
+    private static func parseLineSpec(_ raw: String?) -> Int? {
+        guard var text = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+            return nil
+        }
+        if text.hasPrefix("L") || text.hasPrefix("l") {
+            text.removeFirst()
+        }
+        if let dash = text.firstIndex(of: "-") {
+            text = String(text[..<dash])
+        }
+        return parsePositiveInt(text)
     }
 
     private static func parsePositiveInt(_ raw: String?) -> Int? {

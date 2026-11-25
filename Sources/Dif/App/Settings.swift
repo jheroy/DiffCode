@@ -201,6 +201,7 @@ final class Settings {
     enum AITask: String, CaseIterable, Sendable {
         case commit
         case grouping
+        case review
     }
 
     /// Selected local AI agent provider for Commit Message generation (Direct edition only).
@@ -211,6 +212,10 @@ final class Settings {
     var aiGroupingProvider: AgentProvider
     /// Preferred model ID per provider rawValue for AI Hunk Grouping (`nil`/absent means provider default).
     var aiGroupingModels: [String: String]
+    /// Selected local AI agent provider for AI Code Review (Direct edition only).
+    var aiReviewProvider: AgentProvider
+    /// Preferred model ID per provider rawValue for AI Code Review (`nil`/absent means provider default).
+    var aiReviewModels: [String: String]
     /// Space/comma-separated glob patterns restricting which files enter AI grouping (empty means all files).
     var aiGroupingIncludePatterns: String
     /// When enabled, test files (`*_test.go`, `*Tests.swift`, `tests/...`, etc.) are excluded from AI grouping.
@@ -238,6 +243,7 @@ final class Settings {
         switch task {
         case .commit: return aiCommitProvider
         case .grouping: return aiGroupingProvider
+        case .review: return aiReviewProvider
         }
     }
 
@@ -250,6 +256,9 @@ final class Settings {
         case .grouping:
             guard aiGroupingProvider != provider else { return }
             aiGroupingProvider = provider
+        case .review:
+            guard aiReviewProvider != provider else { return }
+            aiReviewProvider = provider
         }
         save()
     }
@@ -260,6 +269,7 @@ final class Settings {
         switch task {
         case .commit: map = aiCommitModels
         case .grouping: map = aiGroupingModels
+        case .review: map = aiReviewModels
         }
         guard let raw = map[provider.rawValue] else { return nil }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -284,6 +294,13 @@ final class Settings {
                 aiGroupingModels[provider.rawValue] = normalized
             } else {
                 aiGroupingModels.removeValue(forKey: provider.rawValue)
+            }
+        case .review:
+            if aiReviewModels[provider.rawValue] == normalized { return }
+            if let normalized {
+                aiReviewModels[provider.rawValue] = normalized
+            } else {
+                aiReviewModels.removeValue(forKey: provider.rawValue)
             }
         }
         save()
@@ -417,6 +434,8 @@ final class Settings {
         aiCommitModels = defaults.dictionary(forKey: "aiCommitModels") as? [String: String] ?? legacyModels
         aiGroupingProvider = AgentProvider(rawValue: defaults.string(forKey: "aiGroupingProvider") ?? "") ?? legacyProvider
         aiGroupingModels = defaults.dictionary(forKey: "aiGroupingModels") as? [String: String] ?? legacyModels
+        aiReviewProvider = AgentProvider(rawValue: defaults.string(forKey: "aiReviewProvider") ?? "") ?? legacyProvider
+        aiReviewModels = defaults.dictionary(forKey: "aiReviewModels") as? [String: String] ?? legacyModels
         aiGroupingIncludePatterns = defaults.string(forKey: "aiGroupingIncludePatterns") ?? ""
         aiGroupingExcludeTestFiles = defaults.bool(forKey: "aiGroupingExcludeTestFiles")
         let rawBlacklists = defaults.dictionary(forKey: "aiGroupingBlacklists") as? [String: [String]] ?? [:]
@@ -478,6 +497,8 @@ final class Settings {
         defaults.set(aiCommitModels, forKey: "aiCommitModels")
         defaults.set(aiGroupingProvider.rawValue, forKey: "aiGroupingProvider")
         defaults.set(aiGroupingModels, forKey: "aiGroupingModels")
+        defaults.set(aiReviewProvider.rawValue, forKey: "aiReviewProvider")
+        defaults.set(aiReviewModels, forKey: "aiReviewModels")
         defaults.set(aiGroupingIncludePatterns, forKey: "aiGroupingIncludePatterns")
         defaults.set(aiGroupingExcludeTestFiles, forKey: "aiGroupingExcludeTestFiles")
         defaults.set(aiGroupingBlacklists, forKey: "aiGroupingBlacklists")

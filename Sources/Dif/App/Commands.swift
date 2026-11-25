@@ -309,6 +309,9 @@ extension AppStore {
             AppCommand(id: "git.endCompare", title: L("Stop Comparing", "退出比较"), symbol: "xmark.circle", group: .git) { [weak self] in
                 self?.endComparison()
             },
+            AppCommand(id: "ai.reviewChanges", title: L("Review Changes with AI…", "使用 AI 审查当前变更…"), symbol: "doc.text.magnifyingglass", group: .git) { [weak self] in
+                self?.reviewActiveContext()
+            },
             AppCommand(id: "git.rollback", title: L("Rollback…", "回滚…"), symbol: "arrow.uturn.backward", group: .git,
                        key: "z", modifiers: [.command, .option], separatorBefore: true) { [weak self] in self?.rollbackInContext() },
             AppCommand(id: "git.rollbackHunk", title: L("Rollback Current Change", "回滚当前这处变更"), symbol: "arrow.uturn.backward.square",
@@ -336,7 +339,7 @@ extension AppStore {
         ]
         .filter { AppEnvironment.hasTerminal || ($0.group != .terminal && $0.id != "view.terminal") }
         .filter { AppEnvironment.hasLSP || ($0.id != "nav.back" && $0.id != "nav.forward" && $0.id != "nav.implementation" && $0.id != "nav.typeDefinition") }
-        .filter { !AppEnvironment.isAppStore || $0.id != "view.groups" }
+        .filter { !AppEnvironment.isAppStore || ($0.id != "view.groups" && $0.id != "ai.reviewChanges") }
         + editionCommands
     }
 

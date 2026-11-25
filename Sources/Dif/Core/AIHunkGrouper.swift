@@ -224,6 +224,11 @@ struct AIHunkGroupingResult: Equatable, Codable, Sendable {
     let provider: AgentProvider
     let model: String?
     let generatedAt: Date
+    var sessionID: String? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case groups, totalHunks, totalFiles, provider, model, generatedAt
+    }
 }
 
 /// Identifies the source of changes grouped into an `AIGroupSession`.
@@ -1388,8 +1393,11 @@ enum AIHunkGrouper {
         filter: AIHunkGroupingFilter = AIHunkGroupingFilter(),
         provider: AgentProvider = .agy,
         model: String? = nil,
+        persistSession: Bool = false,
         timeout: TimeInterval = defaultTimeout,
-        service: LocalAgentService = .shared
+        service: LocalAgentService = .shared,
+        onPromptReady: (@Sendable (String) -> Void)? = nil,
+        onEvent: AgentStreamHandler? = nil
     ) async throws -> AIHunkGroupingResult {
         guard !AppEnvironment.isAppStore else {
             throw AIHunkGroupingError.unavailableInAppStore
@@ -1429,22 +1437,29 @@ enum AIHunkGrouper {
         }
 
         let prompt = buildPrompt(hunks: hunks, source: source)
-        let rawResponse = try await service.generate(
+        onPromptReady?(prompt)
+        let generated = try await service.generateWithSession(
             provider: provider,
             model: model,
             cwd: repoRoot,
             prompt: prompt,
             jsonSchema: responseJSONSchema,
-            timeout: timeout
+            toolAccess: .disabled,
+            resumeSessionID: nil,
+            persistSession: persistSession,
+            timeout: timeout,
+            onEvent: onEvent
         )
 
-        return try parseGroupingResponse(
-            rawResponse,
+        var parsed = try parseGroupingResponse(
+            generated.text,
             validHunks: hunks,
             source: source,
             provider: provider,
             model: model
         )
+        parsed.sessionID = generated.sessionID
+        return parsed
     }
 
     // MARK: - Direct Group Commit Helpers

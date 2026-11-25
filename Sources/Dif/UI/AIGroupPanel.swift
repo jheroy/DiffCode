@@ -144,31 +144,44 @@ struct AIGroupPanel: View {
                 AIGroupFilterCard(project: project, compact: false)
                     .padding(.horizontal, 12)
 
-                // Primary CTA button
+                // Primary CTA button + live stream access
                 VStack(spacing: 6) {
                     if isGeneratingNewSession {
-                        Button {
-                            store.cancelAIGroupGeneration(for: project)
-                        } label: {
-                            HStack(spacing: 7) {
-                                ProgressView()
-                                    .controlSize(.small)
-                                    .scaleEffect(0.6)
-                                    .frame(width: UI.s(13), height: UI.s(13))
-                                Text(L("Grouping… Cancel", "正在分组… 点击取消"))
-                                    .font(.ui(size: 12, weight: .semibold))
+                        HStack(spacing: 6) {
+                            Button {
+                                store.cancelAIGroupGeneration(for: project)
+                            } label: {
+                                HStack(spacing: 7) {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .scaleEffect(0.6)
+                                        .frame(width: UI.s(13), height: UI.s(13))
+                                    Text(L("Grouping… Cancel", "正在分组… 点击取消"))
+                                        .font(.ui(size: 12, weight: .semibold))
+                                }
+                                .foregroundStyle(Color.difText)
+                                .frame(maxWidth: .infinity)
+                                .frame(height: UI.s(30))
+                                .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.difChip))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                        .strokeBorder(Color.difAccent.opacity(0.45), lineWidth: 1)
+                                )
+                                .contentShape(Rectangle())
                             }
-                            .foregroundStyle(Color.difText)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: UI.s(30))
-                            .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(Color.difChip))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                    .strokeBorder(Color.difAccent.opacity(0.45), lineWidth: 1)
-                            )
-                            .contentShape(Rectangle())
+                            .buttonStyle(.plain)
+
+                            if let groupConv = project.activeGroupingConversation {
+                                AgentStreamPillButton(
+                                    isRunning: groupConv.isRunning,
+                                    hasError: groupConv.hasFailed,
+                                    compactIconOnly: false,
+                                    help: L("Open AI grouping conversation stream", "打开 AI 分组对话流")
+                                ) {
+                                    store.openAgentConversation(groupConv)
+                                }
+                            }
                         }
-                        .buttonStyle(.plain)
 
                         if let source = project.generatingGroupSource {
                             Text(source.detailTitle)
@@ -178,30 +191,44 @@ struct AIGroupPanel: View {
                                 .truncationMode(.middle)
                         }
                     } else {
-                        Button {
-                            if useComparisonSource {
-                                store.generateComparisonAIGroups(for: project)
-                            } else {
-                                store.generateWorkingTreeAIGroups(for: project)
+                        HStack(spacing: 6) {
+                            Button {
+                                if useComparisonSource {
+                                    store.generateComparisonAIGroups(for: project)
+                                } else {
+                                    store.generateWorkingTreeAIGroups(for: project)
+                                }
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "sparkles")
+                                        .font(.ui(size: 11.5, weight: .semibold))
+                                    Text(L("Group Changes with AI", "使用 AI 分组"))
+                                        .font(.ui(size: 12, weight: .semibold))
+                                }
+                                .foregroundStyle(.white)
+                                .frame(maxWidth: .infinity)
+                                .frame(height: UI.s(30))
+                                .background(
+                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                        .fill(Color.difAccent.opacity(hasTargetChanges ? 1 : 0.38))
+                                )
+                                .contentShape(Rectangle())
                             }
-                        } label: {
-                            HStack(spacing: 6) {
-                                Image(systemName: "sparkles")
-                                    .font(.ui(size: 11.5, weight: .semibold))
-                                Text(L("Group Changes with AI", "使用 AI 分组"))
-                                    .font(.ui(size: 12, weight: .semibold))
+                            .buttonStyle(.plain)
+                            .disabled(!hasTargetChanges)
+
+                            if let groupConv = project.activeGroupingConversation {
+                                AgentStreamPillButton(
+                                    isRunning: groupConv.isRunning,
+                                    hasError: groupConv.hasFailed,
+                                    compactIconOnly: false,
+                                    help: L("Open AI grouping conversation stream and continue chat",
+                                            "打开 AI 分组对话流并继续对话")
+                                ) {
+                                    store.openAgentConversation(groupConv)
+                                }
                             }
-                            .foregroundStyle(.white)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: UI.s(30))
-                            .background(
-                                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                    .fill(Color.difAccent.opacity(hasTargetChanges ? 1 : 0.38))
-                            )
-                            .contentShape(Rectangle())
                         }
-                        .buttonStyle(.plain)
-                        .disabled(!hasTargetChanges)
 
                         Text(creationStatusCaption(
                             useComparison: useComparisonSource,
@@ -373,12 +400,22 @@ struct AIGroupPanel: View {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 3) {
                             ForEach(result.groups) { group in
+                                let rowConv = project.reviewConversation(forGroupID: group.id)
                                 AIGroupRow(
                                     group: group,
                                     isSelected: group.id == activeGroupID,
                                     canDelete: !project.isCommittingGroup,
+                                    isReviewing: project.isReviewing(groupID: group.id),
+                                    reviewHelp: groupReviewHelp(group: group, isReviewing: project.isReviewing(groupID: group.id)),
+                                    reviewConversation: rowConv,
                                     onSelect: {
                                         store.selectAIGroup(group, in: project, openFirstFile: true)
+                                    },
+                                    onReview: {
+                                        store.reviewGroup(group, in: session, project: project)
+                                    },
+                                    onOpenStream: rowConv.map { conv in
+                                        { store.openAgentConversation(conv) }
                                     },
                                     onDelete: {
                                         store.deleteAIGroup(group, in: project)
@@ -508,6 +545,18 @@ struct AIGroupPanel: View {
                     .opacity(regenerateDisabled ? 0.35 : 1)
                 }
 
+                if let groupConv = project.activeGroupingConversation {
+                    AgentStreamPillButton(
+                        isRunning: groupConv.isRunning,
+                        hasError: groupConv.hasFailed,
+                        compactIconOnly: !isGeneratingThis,
+                        help: L("Open AI grouping conversation stream and continue chat",
+                                "打开 AI 分组对话流并继续对话")
+                    ) {
+                        store.openAgentConversation(groupConv)
+                    }
+                }
+
                 IconButton(symbol: "trash",
                            help: L("Delete this grouping", "删除当前分组集"),
                            size: 11.5) {
@@ -565,6 +614,16 @@ struct AIGroupPanel: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
+    }
+
+    private func groupReviewHelp(group: AIHunkGroup, isReviewing: Bool) -> String {
+        let agentDesc = store.aiReviewAgentDescription()
+        if isReviewing {
+            return L("Generating code review report for “\(group.name)” with \(agentDesc)… Click to cancel",
+                     "正在使用 \(agentDesc) 生成分组「\(group.name)」的代码审查报告… 点击取消")
+        }
+        return L("Review “\(group.name)” with \(agentDesc) and open Markdown report",
+                 "使用 \(agentDesc) 审查分组「\(group.name)」并生成打开 Markdown 报告")
     }
 
     private func errorCard(message: String) -> some View {
@@ -647,6 +706,20 @@ private struct AIGroupSessionBar: View {
                                 )
                                 .id(session.id)
                                 .contextMenu {
+                                    let isReviewingSession = project.isReviewing(sessionID: session.id)
+                                    Button {
+                                        store.reviewAIGroupSession(session, in: project)
+                                    } label: {
+                                        Label(
+                                            isReviewingSession
+                                                ? L("Cancel Code Review", "取消代码审查")
+                                                : L("Review Grouping Session with AI", "AI 审查此分组集"),
+                                            systemImage: "doc.text.magnifyingglass"
+                                        )
+                                    }
+
+                                    Divider()
+
                                     Button(L("Regenerate", "重新分组")) {
                                         store.regenerateAIGroupSession(session.id, in: project)
                                     }
@@ -782,7 +855,12 @@ private struct AIGroupRow: View {
     let group: AIHunkGroup
     let isSelected: Bool
     let canDelete: Bool
+    let isReviewing: Bool
+    let reviewHelp: String
+    let reviewConversation: AgentConversation?
     let onSelect: () -> Void
+    let onReview: () -> Void
+    let onOpenStream: (() -> Void)?
     let onDelete: () -> Void
     let onDeleteSession: () -> Void
     let onClearAll: () -> Void
@@ -802,6 +880,27 @@ private struct AIGroupRow: View {
                     .truncationMode(.tail)
 
                 Spacer(minLength: 4)
+
+                if isReviewing || hovering {
+                    AIReviewPillButton(
+                        isReviewing: isReviewing,
+                        isDisabled: !isReviewing && group.files.isEmpty,
+                        compactIconOnly: true,
+                        help: reviewHelp,
+                        action: onReview
+                    )
+                }
+
+                if let reviewConversation, let onOpenStream,
+                   reviewConversation.isRunning || reviewConversation.hasFailed || isReviewing || hovering {
+                    AgentStreamPillButton(
+                        isRunning: reviewConversation.isRunning,
+                        hasError: reviewConversation.hasFailed,
+                        compactIconOnly: true,
+                        help: L("Open group review conversation stream", "打开该分组的审查对话流"),
+                        action: onOpenStream
+                    )
+                }
 
                 if hovering && canDelete {
                     Button(action: onDelete) {
@@ -861,6 +960,16 @@ private struct AIGroupRow: View {
             if !$0 { hoveringDelete = false }
         }
         .contextMenu {
+            Button(action: onReview) {
+                Label(
+                    isReviewing
+                        ? L("Cancel Code Review", "取消代码审查")
+                        : L("Review Group with AI", "AI 审查此分组"),
+                    systemImage: "doc.text.magnifyingglass"
+                )
+            }
+            .disabled(!isReviewing && group.files.isEmpty)
+            Divider()
             Button(role: .destructive, action: onDelete) {
                 Label(L("Delete Group", "删除此分组"), systemImage: "trash")
             }
@@ -930,6 +1039,35 @@ private struct AIGroupChangesPane: View {
                     .foregroundStyle(Color.difText3)
                     .lineLimit(1)
                 Spacer(minLength: 4)
+                if !AppEnvironment.isAppStore, let session = project.activeAIGroupSession {
+                    let isReviewingGroup = project.isReviewing(groupID: group.id)
+                    let reviewDisabled = !isReviewingGroup && snapshot.changes.isEmpty
+                    let agentDesc = store.aiReviewAgentDescription()
+                    AIReviewPillButton(
+                        isReviewing: isReviewingGroup,
+                        isDisabled: reviewDisabled,
+                        compactIconOnly: false,
+                        help: isReviewingGroup
+                            ? L("Generating code review report for “\(group.name)” with \(agentDesc)… Click to cancel",
+                                "正在使用 \(agentDesc) 生成分组「\(group.name)」的代码审查报告… 点击取消")
+                            : L("Review “\(group.name)” with \(agentDesc) and open Markdown report",
+                                "使用 \(agentDesc) 审查分组「\(group.name)」并生成打开 Markdown 报告")
+                    ) {
+                        store.reviewGroup(group, in: session, project: project)
+                    }
+                    if let reviewConv = project.reviewConversation(forGroupID: group.id)
+                        ?? project.reviewConversation(for: .session(session.id)) {
+                        AgentStreamPillButton(
+                            isRunning: reviewConv.isRunning,
+                            hasError: reviewConv.hasFailed,
+                            compactIconOnly: false,
+                            help: L("Open AI review conversation stream and continue chat",
+                                    "打开 AI 审查对话流并继续对话")
+                        ) {
+                            store.openAgentConversation(reviewConv)
+                        }
+                    }
+                }
                 if !flat, !snapshot.folderIDs.isEmpty {
                     IconButton(
                         symbol: hasExpandedFolder ? "rectangle.compress.vertical" : "rectangle.expand.vertical",

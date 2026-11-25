@@ -71,6 +71,29 @@ struct CommitPanel: View {
                     .foregroundStyle(Color.difText3)
                     .lineLimit(1)
                 Spacer(minLength: 4)
+                if !AppEnvironment.isAppStore {
+                    let isReviewing = project.activeReviewTarget == .workingTree
+                    let reviewDisabled = !isReviewing && project.changes.isEmpty
+                    AIReviewPillButton(
+                        isReviewing: isReviewing,
+                        isDisabled: reviewDisabled,
+                        compactIconOnly: false,
+                        help: aiReviewHelp(isReviewing: isReviewing, hasChanges: !project.changes.isEmpty, hasChecked: !included.isEmpty)
+                    ) {
+                        store.reviewWorkingTreeChanges(in: project)
+                    }
+                    if let reviewConv = project.reviewConversation(for: .workingTree) {
+                        AgentStreamPillButton(
+                            isRunning: reviewConv.isRunning,
+                            hasError: reviewConv.hasFailed,
+                            compactIconOnly: false,
+                            help: L("Open AI review conversation stream and continue chat",
+                                    "打开 AI 审查对话流并继续对话")
+                        ) {
+                            store.openAgentConversation(reviewConv)
+                        }
+                    }
+                }
                 StatBadge(additions: added, deletions: deleted)
             }
             if amend, let remote = project.amendPushedTo.first {
@@ -237,6 +260,23 @@ struct CommitPanel: View {
         }
         return L("Generate commit message with \(agentDesc)",
                  "使用 \(agentDesc) 生成提交信息")
+    }
+
+    private func aiReviewHelp(isReviewing: Bool, hasChanges: Bool, hasChecked: Bool) -> String {
+        let agentDesc = store.aiReviewAgentDescription()
+        if isReviewing {
+            return L("Generating code review report with \(agentDesc)… Click to cancel",
+                     "正在使用 \(agentDesc) 生成代码审查报告… 点击取消")
+        }
+        if !hasChanges {
+            return L("No working tree changes to review", "工作区暂无可审查的变更")
+        }
+        if hasChecked {
+            return L("Review checked changes with \(agentDesc) and open Markdown report",
+                     "使用 \(agentDesc) 审查已勾选变更并生成打开 Markdown 报告")
+        }
+        return L("Review all working tree changes with \(agentDesc) and open Markdown report",
+                 "使用 \(agentDesc) 审查工作区全部变更并生成打开 Markdown 报告")
     }
 }
 

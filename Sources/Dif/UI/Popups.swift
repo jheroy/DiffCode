@@ -37,6 +37,8 @@ struct PopupLayer: View {
                     ResizablePopup(spec: .fileSymbols) { FileSymbolsPopupView() }
                 case .selectionHistory:
                     ResizablePopup(spec: .selectionHistory) { SelectionHistoryPopupView() }
+                case .agentConversation:
+                    ResizablePopup(spec: .agentConversation) { AgentConversationPopupView() }
                 case .goToLine, .keymap, .settings:
                     Group {
                         switch popup {
@@ -2173,11 +2175,12 @@ struct SettingsView: View {
             families = await Task.detached(priority: .userInitiated) { MonospaceFonts.installed() }.value
             if !AppEnvironment.isAppStore {
                 await store.refreshAgentAvailability(forceRefresh: false)
-                let commitProvider = settings.aiProvider(for: .commit)
-                store.loadAgentModels(for: commitProvider, forceRefresh: false)
-                let groupingProvider = settings.aiProvider(for: .grouping)
-                if groupingProvider != commitProvider {
-                    store.loadAgentModels(for: groupingProvider, forceRefresh: false)
+                var loadedProviders: Set<AgentProvider> = []
+                for task in Settings.AITask.allCases {
+                    let provider = settings.aiProvider(for: task)
+                    if loadedProviders.insert(provider).inserted {
+                        store.loadAgentModels(for: provider, forceRefresh: false)
+                    }
                 }
             }
         }
@@ -2233,6 +2236,11 @@ struct SettingsView: View {
             }
         }
         .onChange(of: settings.aiGroupingProvider) { _, provider in
+            if !AppEnvironment.isAppStore {
+                store.loadAgentModels(for: provider, forceRefresh: false)
+            }
+        }
+        .onChange(of: settings.aiReviewProvider) { _, provider in
             if !AppEnvironment.isAppStore {
                 store.loadAgentModels(for: provider, forceRefresh: false)
             }
@@ -2541,7 +2549,7 @@ struct SettingsView: View {
                     let avail = store.availability(for: provider)
                     let installed = avail?.isInstalled ?? false
                     let transportLabel = (avail?.transportKind ?? (provider == .agy ? .acp : .cli)).rawValue.uppercased()
-                    let isUsed = settings.aiProvider(for: .commit) == provider || settings.aiProvider(for: .grouping) == provider
+                    let isUsed = Settings.AITask.allCases.contains { settings.aiProvider(for: $0) == provider }
                     let pathText: String = {
                         if !store.agentAvailabilityChecked { return L("Checking…", "检测中…") }
                         if let path = avail?.executablePath { return path }
@@ -2603,6 +2611,11 @@ struct SettingsView: View {
                 aiTaskConfigRow(
                     title: L("AI Grouping", "变更分组"),
                     task: .grouping,
+                    settings: settings
+                )
+                aiTaskConfigRow(
+                    title: L("Code Review", "代码审查"),
+                    task: .review,
                     settings: settings
                 )
                 row(L("Grouping file filter", "分组文件过滤")) {

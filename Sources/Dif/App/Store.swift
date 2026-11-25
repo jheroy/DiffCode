@@ -16,6 +16,8 @@ enum Popup: Equatable {
     case fileSymbols
     /// Selected lines' commit history with restricted excerpt diff preview (`⌘B`).
     case selectionHistory
+    /// Live AI agent conversation stream and follow-up dialogue popup.
+    case agentConversation
     /// A question or notice (`AppStore.dialog`).
     case dialog
 }
@@ -50,6 +52,21 @@ final class AppStore {
     @ObservationIgnored private var awaitedSelection: String?
     var selectedProjectID: UUID? { didSet { if selectedProjectID != oldValue { terminals.updatePolling() } } }
     var popup: Popup?
+    /// Currently inspected `AgentConversation` in the `.agentConversation` popup.
+    var activeAgentConversationID: UUID? = nil
+
+    var activeAgentConversation: AgentConversation? {
+        guard let activeAgentConversationID else { return nil }
+        if let current = currentProject?.agentConversations.first(where: { $0.id == activeAgentConversationID }) {
+            return current
+        }
+        for project in projects {
+            if let match = project.agentConversations.first(where: { $0.id == activeAgentConversationID }) {
+                return match
+            }
+        }
+        return nil
+    }
     var sidebarVisible = true
     var listVisible = true
     var toast: String?
@@ -101,6 +118,8 @@ final class AppStore {
     @ObservationIgnored var aiGroupPersistTasks: [UUID: Task<Void, Never>] = [:]
     @ObservationIgnored var logStateStorage = LogStateStorage.shared
     @ObservationIgnored var logPersistTasks: [UUID: Task<Void, Never>] = [:]
+    /// Hook used when opening a generated Markdown review report with the system's default viewer (overridden in tests).
+    @ObservationIgnored var openReviewFile: (URL) -> Bool = { NSWorkspace.shared.open($0) }
 
     @ObservationIgnored var recent: [RecentFile] = []
     /// Rollbacks and deletes that can still be undone, oldest first.
@@ -388,7 +407,21 @@ final class AppStore {
         for target in targets {
             var isDirectory: ObjCBool = false
             guard fileManager.fileExists(atPath: target.fileURL.path, isDirectory: &isDirectory) else {
-                missingFileName = missingFileName ?? target.fileURL.lastPathComponent
+                // Support `diffcode://` magic links pointing to files deleted inside an open repository.
+                let matchingProjects = projects
+                    .sorted { LSPURI.canonicalFileURL($0.url).path.count > LSPURI.canonicalFileURL($1.url).path.count }
+                var matchedProject = false
+                for candidate in matchingProjects {
+                    guard let relPath = LSPTargetResolver.relativePath(of: target.fileURL, inside: candidate.url) else {
+                        continue
+                    }
+                    landedFile = (candidate, relPath, target.line, target.column)
+                    matchedProject = true
+                    break
+                }
+                if !matchedProject {
+                    missingFileName = missingFileName ?? target.fileURL.lastPathComponent
+                }
                 continue
             }
 
@@ -469,11 +502,77 @@ final class AppStore {
                 file.project.startWatching()
             }
             await file.project.refreshAndWait()
-            if let change = file.project.change(forPath: file.relativePath) {
+            if file.project.tab == .groups,
+               let session = file.project.activeAIGroupSession,
+               let targetGroup = (session.activeGroup.flatMap { grp in
+                   grp.files.contains(where: { $0.path == file.relativePath }) ? grp : nil
+               }) ?? session.result.groups.first(where: { grp in
+                   grp.files.contains(where: { $0.path == file.relativePath })
+               }),
+               let rawRequest = file.project.diffRequest(
+                   for: file.relativePath,
+                   in: session,
+                   ignoreWhitespace: settings.ignoreWhitespace
+               ) {
+                if selectedProjectID != file.project.id {
+                    currentProject?.cancelAIGroupGeneration()
+                    selectedProjectID = file.project.id
+                    persistProjects()
+                }
+                exitExternalFileMode()
+                pendingGroupHunkFocus = nil
+                file.project.browsedPath = nil
+                let groupFile = targetGroup.files.first(where: { $0.path == file.relativePath })
+                let targetHunk = (session.selectedGroupID == targetGroup.id && session.selectedGroupFilePath == file.relativePath)
+                    ? (session.selectedGroupHunkIndex ?? groupFile?.hunkIndices.first ?? 0)
+                    : (groupFile?.hunkIndices.first ?? 0)
+                if session.selectedGroupID != targetGroup.id
+                    || session.selectedGroupFilePath != file.relativePath
+                    || session.selectedGroupHunkIndex != targetHunk {
+                    file.project.mutateAIGroupSession(id: session.id) { s in
+                        s.selectedGroupID = targetGroup.id
+                        s.selectedGroupFilePath = file.relativePath
+                        s.selectedGroupHunkIndex = targetHunk
+                    }
+                    schedulePersistAIGroups(for: file.project)
+                }
+                for id in ChangeTree.ancestors(of: file.relativePath, in: file.project.groupCollapsed) {
+                    file.project.groupCollapsed.remove(id)
+                }
+                file.project.selectedGroupRowID = ChangeRow.fileID(file.relativePath)
+                let request = resolvedRequest(rawRequest)
+                viewer.setBaseStamp(session.baseStamp(projectHeadOID: file.project.status.headOID))
+                syncGroupHunkFilter(file.project.highlightedGroupHunks(for: file.relativePath), for: request)
+                viewer.open(request, line: file.line, column: file.column, preserveScroll: false)
+                noteRecent(file.project, file.relativePath)
+                follow(file.relativePath, in: file.project)
+                viewer.focusCanvas()
+            } else if file.project.tab == .changes,
+                      let comparison = file.project.comparison,
+                      let compared = file.project.comparedChange(file.relativePath) {
+                if selectedProjectID != file.project.id {
+                    currentProject?.cancelAIGroupGeneration()
+                    selectedProjectID = file.project.id
+                    persistProjects()
+                }
+                exitExternalFileMode()
+                pendingGroupHunkFocus = nil
+                file.project.browsedPath = nil
+                for id in ChangeTree.ancestors(of: file.relativePath, in: file.project.compareCollapsed) {
+                    file.project.compareCollapsed.remove(id)
+                }
+                file.project.compareSelectedID = ChangeRow.fileID(file.relativePath)
+                showCompared(compared, with: comparison, in: file.project, line: file.line, column: file.column)
+                noteRecent(file.project, file.relativePath)
+                follow(file.relativePath, in: file.project)
+                viewer.focusCanvas()
+            } else if let change = file.project.change(forPath: file.relativePath) {
                 showChangeDiff(change, in: file.project, line: file.line, column: file.column)
-            } else {
+            } else if fileManager.fileExists(atPath: file.project.url.appendingPathComponent(file.relativePath).path) {
                 openFile(in: file.project, path: file.relativePath, line: file.line, column: file.column)
                 viewer.focusCanvas()
+            } else {
+                showToast(L("Path not found: \(file.relativePath)", "路径不存在：\(file.relativePath)"))
             }
             updateDormancy()
         } else if let ext = landedExternalFile {
@@ -562,6 +661,11 @@ final class AppStore {
         terminals.removeAll(for: project)
         project.cancelCommitMessageGeneration()
         project.cancelAIGroupGeneration()
+        project.cancelAIReview()
+        project.cancelAllAgentFollowUps()
+        if popup == .agentConversation && activeAgentConversation?.projectID == project.id {
+            dismissPopup(restoreFocus: false)
+        }
         deletePersistedAIGroups(for: project)
         deletePersistedLogState(for: project)
         project.stopWatching()

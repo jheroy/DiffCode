@@ -753,4 +753,690 @@ final class LocalAgentTests: XCTestCase {
         let fallbackModels = try await service.listModels(provider: .codex, cwd: binDir, forceRefresh: true)
         XCTAssertEqual(fallbackModels.map(\.id), ["cached-gpt"])
     }
+
+    // MARK: - Read-Only Tool Access Policy & Adapters
+
+    func testACPInitializeCapabilitiesForToolAccessModes() {
+        let disabledReq = ACPTransport.makeInitializeRequest(id: 1, toolAccess: .disabled)
+        let disabledParams = disabledReq["params"] as? [String: Any]
+        let disabledCaps = disabledParams?["clientCapabilities"] as? [String: Any]
+        XCTAssertTrue(disabledCaps?.isEmpty ?? false)
+
+        let readOnlyReq = ACPTransport.makeInitializeRequest(id: 2, toolAccess: .readOnly)
+        let readOnlyParams = readOnlyReq["params"] as? [String: Any]
+        let readOnlyCaps = readOnlyParams?["clientCapabilities"] as? [String: Any]
+        let fsCaps = readOnlyCaps?["fs"] as? [String: Any]
+        XCTAssertEqual(fsCaps?["readTextFile"] as? Bool, true)
+        XCTAssertEqual(fsCaps?["writeTextFile"] as? Bool, false)
+    }
+
+    func testACPReadOnlyShellValidatorAllowsSafeReadsAndRejectsMutations() throws {
+        let repo = try makeTempDir("shell-policy")
+
+        // Allowed read-only inspection & safe pipes
+        XCTAssertTrue(ACPTransport.isReadOnlyShellCommand("git show 0123456789abcdef:Sources/App.swift", repoRoot: repo))
+        XCTAssertTrue(ACPTransport.isReadOnlyShellCommand("git show 0123456789abcdef:Sources/App.swift | sed -n '1,50p'", repoRoot: repo))
+        XCTAssertTrue(ACPTransport.isReadOnlyShellCommand("git --no-pager log --oneline -n 10", repoRoot: repo))
+        XCTAssertTrue(ACPTransport.isReadOnlyShellCommand("git diff abc..def -- Sources/Dif", repoRoot: repo))
+        XCTAssertTrue(ACPTransport.isReadOnlyShellCommand("git branch --show-current", repoRoot: repo))
+        XCTAssertTrue(ACPTransport.isReadOnlyShellCommand("git branch -a", repoRoot: repo))
+        XCTAssertTrue(ACPTransport.isReadOnlyShellCommand("git tag -l 'v*'", repoRoot: repo))
+        XCTAssertTrue(ACPTransport.isReadOnlyShellCommand("git stash show stash@{0}", repoRoot: repo))
+        XCTAssertTrue(ACPTransport.isReadOnlyShellCommand("rg \"foo\" Sources", repoRoot: repo))
+        XCTAssertTrue(ACPTransport.isReadOnlyShellCommand("git -C . status", repoRoot: repo))
+
+        // Rejected mutations, escapes, and injection attempts
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git checkout main", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git reset --hard", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git commit -m x", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git branch -D foo", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git branch new-branch", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git tag v1.0", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git stash", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git -c core.fsmonitor=id status", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git -C /etc status", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git diff --ext-diff a b", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git diff --output=/tmp/x a b", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git diff --no-index /etc/passwd /etc/hosts", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git show HEAD:a; rm -rf /", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git show HEAD:a && touch x", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git show HEAD:a > /tmp/x", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git show HEAD:`id`", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("rg $(id) Sources", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("sed -i '' 's/a/b/' Sources/App.swift", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("sed -n '1e id' Sources/App.swift", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("rg --pre=sh foo", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("cat /etc/passwd", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("cat ../../secret", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("{ git status; }", repoRoot: repo))
+        XCTAssertFalse(ACPTransport.isReadOnlyShellCommand("git show stash@{0,1}", repoRoot: repo))
+    }
+
+    func testACPPermissionReplyAndReadTextFileHandler() throws {
+        let repo = try makeTempDir("acp-fs-perm")
+        let sub = repo.appendingPathComponent("Sources")
+        try fm.createDirectory(at: sub, withIntermediateDirectories: true)
+        let fileURL = sub.appendingPathComponent("Sample.swift")
+        try Data("line1\nline2\nline3\nline4\n".utf8).write(to: fileURL)
+
+        let options: [[String: Any]] = [
+            ["optionId": "allow_once", "kind": "allow_once", "name": "Allow once"],
+            ["optionId": "reject_once", "kind": "reject_once", "name": "Reject once"],
+        ]
+
+        // 1. In-repo read permission -> selected allow_once (double-nested outcome)
+        let readPerm = ACPTransport.makePermissionReply(
+            id: "perm-1",
+            params: [
+                "toolCall": [
+                    "kind": "read",
+                    "rawInput": ["path": fileURL.path],
+                ],
+                "options": options,
+            ],
+            repoRoot: repo
+        )
+        XCTAssertEqual(readPerm["id"] as? String, "perm-1")
+        let readOutcome = ((readPerm["result"] as? [String: Any])?["outcome"] as? [String: Any])
+        XCTAssertEqual(readOutcome?["outcome"] as? String, "selected")
+        XCTAssertEqual(readOutcome?["optionId"] as? String, "allow_once")
+
+        // 2. Read-only git command -> allow_once
+        let gitPerm = ACPTransport.makePermissionReply(
+            id: "perm-2",
+            params: [
+                "toolCall": [
+                    "kind": "execute",
+                    "rawInput": ["command": "git show HEAD:Sources/Sample.swift"],
+                ],
+                "options": options,
+            ],
+            repoRoot: repo
+        )
+        let gitOutcome = ((gitPerm["result"] as? [String: Any])?["outcome"] as? [String: Any])
+        XCTAssertEqual(gitOutcome?["optionId"] as? String, "allow_once")
+
+        // 3. Edit / outside-repo read / mutating execute -> reject_once
+        for badToolCall: [String: Any] in [
+            ["kind": "edit", "rawInput": ["path": fileURL.path]],
+            ["kind": "read", "rawInput": ["path": "/etc/passwd"]],
+            ["kind": "execute", "rawInput": ["command": "git reset --hard"]],
+        ] {
+            let reply = ACPTransport.makePermissionReply(
+                id: 77,
+                params: ["toolCall": badToolCall, "options": options],
+                repoRoot: repo
+            )
+            let outcome = ((reply["result"] as? [String: Any])?["outcome"] as? [String: Any])
+            XCTAssertEqual(outcome?["outcome"] as? String, "selected")
+            XCTAssertEqual(outcome?["optionId"] as? String, "reject_once")
+        }
+
+        // 4. fs/read_text_file line/limit slicing & outside path error
+        let sliceReply = ACPTransport.makeReadTextFileReply(
+            id: 10,
+            params: ["path": "Sources/Sample.swift", "line": 2, "limit": 2],
+            repoRoot: repo
+        )
+        let slicedContent = (sliceReply["result"] as? [String: Any])?["content"] as? String
+        XCTAssertEqual(slicedContent, "line2\nline3")
+
+        let escapeReply = ACPTransport.makeReadTextFileReply(
+            id: 11,
+            params: ["path": "../../etc/passwd"],
+            repoRoot: repo
+        )
+        XCTAssertNotNil(escapeReply["error"])
+        let escapeOutsideReply = ACPTransport.makeReadTextFileReply(
+            id: 12,
+            params: ["path": "/etc/passwd"],
+            repoRoot: repo
+        )
+        XCTAssertNotNil(escapeOutsideReply["error"])
+    }
+
+    func testACPReadOnlyEndToEndHandlesFSToolsPermissionsAndStripsNarration() async throws {
+        let binDir = try makeTempDir("acp-ro-bin")
+        let repo = try makeTempDir("acp-ro-repo")
+        let targetFile = repo.appendingPathComponent("Context.swift")
+        try Data("alpha\nbeta\ngamma\ndelta\n".utf8).write(to: targetFile)
+        let logFile = binDir.appendingPathComponent("tool_log.json")
+
+        _ = try makeExecutable(
+            """
+            #!/usr/bin/env python3
+            import json, sys
+
+            log_path = \(String(reflecting: logFile.path))
+            def emit(obj):
+                sys.stdout.write(json.dumps(obj) + "\\n")
+                sys.stdout.flush()
+
+            logs = {}
+            for raw in sys.stdin:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                msg = json.loads(raw)
+                method = msg.get("method")
+                req_id = msg.get("id")
+                if method == "initialize":
+                    logs["caps"] = msg.get("params", {}).get("clientCapabilities", {})
+                    emit({"jsonrpc": "2.0", "id": req_id, "result": {"protocolVersion": 1}})
+                elif method == "session/new":
+                    emit({"jsonrpc": "2.0", "id": req_id, "result": {"sessionId": "sid-ro"}})
+                elif method == "session/prompt":
+                    # Pre-tool narration
+                    emit({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Let me read Context.swift first..."}}}})
+                    # Tool call #1: fs/read_text_file
+                    emit({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {"sessionUpdate": "tool_call", "toolCallId": "tc-1"}}})
+                    emit({"jsonrpc": "2.0", "id": "fs-1", "method": "fs/read_text_file", "params": {"sessionId": "sid-ro", "path": "Context.swift", "line": 2, "limit": 2}})
+                    logs["fs_reply"] = json.loads(sys.stdin.readline())
+                    # Tool call #2: allowed read-only git permission
+                    emit({"jsonrpc": "2.0", "id": "perm-allow", "method": "session/request_permission", "params": {"toolCall": {"kind": "execute", "rawInput": {"command": "git show HEAD:Context.swift"}}, "options": [{"optionId": "allow_once", "kind": "allow_once"}, {"optionId": "reject_once", "kind": "reject_once"}]}})
+                    logs["perm_allow_reply"] = json.loads(sys.stdin.readline())
+                    # Tool call #3: disallowed edit permission
+                    emit({"jsonrpc": "2.0", "id": "perm-deny", "method": "session/request_permission", "params": {"toolCall": {"kind": "edit", "rawInput": {"path": "Context.swift"}}, "options": [{"optionId": "allow_once", "kind": "allow_once"}, {"optionId": "reject_once", "kind": "reject_once"}]}})
+                    logs["perm_deny_reply"] = json.loads(sys.stdin.readline())
+                    # Final report
+                    emit({"jsonrpc": "2.0", "method": "session/update", "params": {"update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "# 代码审查报告：最终正文"}}}})
+                    emit({"jsonrpc": "2.0", "id": req_id, "result": {"stopReason": "end_turn"}})
+                elif method == "session/close":
+                    with open(log_path, "w", encoding="utf-8") as f:
+                        json.dump(logs, f)
+                    emit({"jsonrpc": "2.0", "id": req_id, "result": {}})
+                    break
+            """,
+            name: "agy",
+            in: binDir
+        )
+
+        let service = LocalAgentService(searchPaths: [binDir.path], environment: ProcessInfo.processInfo.environment)
+        let output = try await service.generate(
+            provider: .agy,
+            cwd: repo,
+            prompt: "review",
+            toolAccess: .readOnly,
+            timeout: 5.0
+        )
+        XCTAssertEqual(output, "# 代码审查报告：最终正文")
+        XCTAssertFalse(output.contains("Let me read"))
+
+        let logData = try Data(contentsOf: logFile)
+        let logs = try XCTUnwrap(JSONSerialization.jsonObject(with: logData) as? [String: Any])
+        let capsFS = (logs["caps"] as? [String: Any])?["fs"] as? [String: Any]
+        XCTAssertEqual(capsFS?["readTextFile"] as? Bool, true)
+        let fsContent = ((logs["fs_reply"] as? [String: Any])?["result"] as? [String: Any])?["content"] as? String
+        XCTAssertEqual(fsContent, "beta\ngamma")
+        let allowOutcome = (((logs["perm_allow_reply"] as? [String: Any])?["result"] as? [String: Any])?["outcome"] as? [String: Any])
+        XCTAssertEqual(allowOutcome?["optionId"] as? String, "allow_once")
+        let denyOutcome = (((logs["perm_deny_reply"] as? [String: Any])?["result"] as? [String: Any])?["outcome"] as? [String: Any])
+        XCTAssertEqual(denyOutcome?["optionId"] as? String, "reject_once")
+    }
+
+    func testClaudeAndCodexArgumentsForReadOnlyToolAccess() {
+        let claudeDisabled = ClaudeCLIAdapter.generateArguments(model: "sonnet", jsonSchema: nil, toolAccess: .disabled)
+        XCTAssertTrue(claudeDisabled.contains("--tools"))
+        if let idx = claudeDisabled.firstIndex(of: "--tools") {
+            XCTAssertEqual(claudeDisabled[idx + 1], "")
+        }
+
+        let claudeReadOnly = ClaudeCLIAdapter.generateArguments(model: "sonnet", jsonSchema: nil, toolAccess: .readOnly)
+        XCTAssertFalse(claudeReadOnly.contains("--safe-mode"))
+        XCTAssertFalse(claudeReadOnly.contains("--bare"))
+        XCTAssertTrue(claudeReadOnly.contains("--permission-mode"))
+        XCTAssertTrue(claudeReadOnly.contains("dontAsk"))
+        XCTAssertTrue(claudeReadOnly.contains("Read,Grep,Glob,Bash"))
+        XCTAssertTrue(claudeReadOnly.contains("--disallowedTools"))
+        XCTAssertTrue(claudeReadOnly.contains("--allowedTools"))
+        let modelIdx = claudeReadOnly.firstIndex(of: "--model")
+        let allowedIdx = claudeReadOnly.firstIndex(of: "--allowedTools")
+        XCTAssertNotNil(modelIdx)
+        XCTAssertNotNil(allowedIdx)
+        XCTAssertLessThan(modelIdx!, allowedIdx!)
+
+        let codexDisabled = CodexCLIAdapter.generateArguments(model: "gpt-5.3-codex", outputSchemaPath: nil, toolAccess: .disabled)
+        XCTAssertFalse(codexDisabled.contains("-c"))
+        XCTAssertTrue(codexDisabled.contains("read-only"))
+
+        let codexReadOnly = CodexCLIAdapter.generateArguments(model: "gpt-5.3-codex", outputSchemaPath: nil, toolAccess: .readOnly)
+        XCTAssertTrue(codexReadOnly.contains("read-only"))
+        XCTAssertTrue(codexReadOnly.contains("-c"))
+        XCTAssertTrue(codexReadOnly.contains("approval_policy=\"never\""))
+        XCTAssertEqual(codexReadOnly.last, "-")
+    }
+
+    func testACPReadOnlyShellValidatorSupportsCompoundsRedirectsAndLocalVars() throws {
+        let repo = FileManager.default.temporaryDirectory.appendingPathComponent("dif-ro-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: repo) }
+
+        let allowed = [
+            "rg -n \"origin_server_id|OriginServerId\" datastruct/ gamecore/ app/ sql/ migrations/ 2>/dev/null || rg -n \"origin_server_id\" .",
+            "SHA=0123456789abcdef0123456789abcdef01234567\necho \"=== diff ===\"\ngit show $SHA:Sources/App.swift | nl -ba",
+            "find . -maxdepth 2 -name \"*.swift\"",
+            "sort Sources/App.swift",
+            "git status && git log -n 5",
+            "git show HEAD:Sources/App.swift 2>&1"
+        ]
+        for cmd in allowed {
+            XCTAssertTrue(ACPTransport.isReadOnlyShellCommand(cmd, repoRoot: repo), "Expected allow: \(cmd)")
+        }
+
+        let denied = [
+            "git show HEAD:Sources/App.swift > /tmp/out.txt",
+            "git show HEAD:Sources/App.swift 2> err.log",
+            "git show HEAD:Sources/App.swift; rm -rf /",
+            "git show HEAD:Sources/App.swift && touch hacked.txt",
+            "PATH=/tmp/evil git status",
+            "GIT_SSH_COMMAND=id git status",
+            "find . -delete",
+            "find . -exec id {} +",
+            "sort -o out.txt Sources/App.swift"
+        ]
+        for cmd in denied {
+            XCTAssertFalse(ACPTransport.isReadOnlyShellCommand(cmd, repoRoot: repo), "Expected deny: \(cmd)")
+        }
+    }
+
+    func testACPStreamingEventsPermissionErrorAndSessionResumeFallback() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("dif-acp-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let mockScript = tempDir.appendingPathComponent("mock-acp.py")
+        let python = """
+        #!/usr/bin/env python3
+        import json, sys, os
+
+        def send(obj):
+            sys.stdout.write(json.dumps(obj) + "\\n")
+            sys.stdout.flush()
+
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            msg = json.loads(line)
+            mid = msg.get("id")
+            method = msg.get("method")
+            params = msg.get("params") or {}
+
+            if method == "initialize":
+                send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": True}}})
+            elif method == "session/new":
+                send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "sess-acp-1"}})
+            elif method in ("session/set_model", "session/set_config_option"):
+                send({"jsonrpc": "2.0", "id": mid, "result": {}})
+            elif method == "session/resume":
+                send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": "Method not found"}})
+            elif method == "session/load":
+                sid = params.get("sessionId", "sess-acp-1")
+                send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "REPLAYED-HISTORY"}}}})
+                send({"jsonrpc": "2.0", "id": mid, "result": {}})
+            elif method == "session/prompt":
+                sid = params.get("sessionId", "sess-acp-1")
+                prompt_text = ""
+                for item in params.get("prompt", []):
+                    if isinstance(item, dict):
+                        prompt_text += item.get("text", "")
+                if os.environ.get("MOCK_DENY_EDIT") == "1":
+                    send({"jsonrpc": "2.0", "id": 9001, "method": "session/request_permission", "params": {
+                        "sessionId": sid,
+                        "toolCall": {"toolCallId": "tc-edit", "kind": "edit", "title": "edit file"},
+                        "options": [{"optionId": "allow_once", "kind": "allow_once"}, {"optionId": "reject_once", "kind": "reject_once"}]
+                    }})
+                    _ = sys.stdin.readline()
+                    send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "cancelled"}})
+                    continue
+                if "FOLLOWUP" in prompt_text:
+                    send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "FOLLOWUP-ACP-OK"}}}})
+                    send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+                    continue
+                send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "Checking refs..."}}}})
+                send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "tool_call", "toolCallId": "tc-1", "kind": "execute", "title": "rg foo", "status": "in_progress", "rawInput": {"command": "rg -n foo . 2>/dev/null || rg -n foo src/"}}}})
+                send({"jsonrpc": "2.0", "id": 9002, "method": "session/request_permission", "params": {
+                    "sessionId": sid,
+                    "toolCall": {"toolCallId": "tc-1", "kind": "execute", "title": "rg foo", "rawInput": {"command": "rg -n foo . 2>/dev/null || rg -n foo src/"}},
+                    "options": [{"optionId": "allow_once", "kind": "allow_once"}, {"optionId": "reject_once", "kind": "reject_once"}]
+                }})
+                perm_reply = json.loads(sys.stdin.readline())
+                outcome = (((perm_reply.get("result") or {}).get("outcome") or {}).get("optionId"))
+                if outcome != "allow_once":
+                    send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "cancelled"}})
+                    continue
+                send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1", "status": "completed", "rawOutput": "match:1"}}})
+                send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "ACP-STREAM-OK"}}}})
+                send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+        """
+        try python.write(to: mockScript, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: mockScript.path)
+
+        final class EventRecorder: @unchecked Sendable {
+            private let lock = NSLock()
+            private var storage: [AgentStreamEvent] = []
+            func append(_ event: AgentStreamEvent) {
+                lock.lock()
+                storage.append(event)
+                lock.unlock()
+            }
+            var events: [AgentStreamEvent] {
+                lock.lock()
+                defer { lock.unlock() }
+                return storage
+            }
+        }
+
+        let recorder = EventRecorder()
+        let first = try await ACPTransport.generateWithSession(
+            provider: .agy,
+            executable: mockScript.path,
+            arguments: [],
+            cwd: tempDir,
+            model: "default",
+            prompt: "Review",
+            environment: ProcessInfo.processInfo.environment,
+            toolAccess: .readOnly,
+            resumeSessionID: nil,
+            timeout: 5,
+            maxTotalTimeout: 10,
+            killGracePeriod: 0.2
+        ) { event in
+            recorder.append(event)
+        }
+        let events = recorder.events
+        XCTAssertEqual(first.text, "ACP-STREAM-OK")
+        XCTAssertEqual(first.sessionID, "sess-acp-1")
+        XCTAssertTrue(events.contains(.sessionStarted("sess-acp-1")))
+        XCTAssertTrue(events.contains(.thinkingDelta("Checking refs...")))
+        XCTAssertTrue(events.contains(.messageDelta("ACP-STREAM-OK")))
+        XCTAssertTrue(events.contains {
+            if case .toolActivity(id: "tc-1", title: _, kind: _, input: _, status: "completed", output: _) = $0 {
+                return true
+            }
+            return false
+        })
+
+        let resumed = try await ACPTransport.generateWithSession(
+            provider: .agy,
+            executable: mockScript.path,
+            arguments: [],
+            cwd: tempDir,
+            model: "default",
+            prompt: "FOLLOWUP",
+            environment: ProcessInfo.processInfo.environment,
+            toolAccess: .readOnly,
+            resumeSessionID: "sess-acp-1",
+            timeout: 5,
+            maxTotalTimeout: 10,
+            killGracePeriod: 0.2,
+            onEvent: nil
+        )
+        XCTAssertEqual(resumed.text, "FOLLOWUP-ACP-OK")
+
+        do {
+            _ = try await ACPTransport.generateWithSession(
+                provider: .agy,
+                executable: mockScript.path,
+                arguments: [],
+                cwd: tempDir,
+                model: "default",
+                prompt: "Edit test",
+                environment: ProcessInfo.processInfo.environment.merging(["MOCK_DENY_EDIT": "1"]) { _, new in new },
+                toolAccess: .readOnly,
+                resumeSessionID: nil,
+                timeout: 5,
+                maxTotalTimeout: 10,
+                killGracePeriod: 0.2,
+                onEvent: nil
+            )
+            XCTFail("Expected denied permission error")
+        } catch {
+            let desc = error.localizedDescription.lowercased()
+            XCTAssertTrue(desc.contains("edit") || desc.contains("只读") || desc.contains("permission"))
+        }
+    }
+
+    func testClaudeAndCodexStreamingAndResumeAdapters() async throws {
+        let claudeArgs = ClaudeCLIAdapter.generateArguments(
+            model: "claude-sonnet-4-6",
+            jsonSchema: nil,
+            toolAccess: .readOnly,
+            streaming: true,
+            resumeSessionID: "c-sess-1",
+            persistSession: true
+        )
+        XCTAssertTrue(claudeArgs.contains("stream-json"))
+        XCTAssertTrue(claudeArgs.contains("--verbose"))
+        XCTAssertTrue(claudeArgs.contains("--include-partial-messages"))
+        XCTAssertTrue(claudeArgs.contains("--resume"))
+        XCTAssertTrue(claudeArgs.contains("c-sess-1"))
+        XCTAssertFalse(claudeArgs.contains("--no-session-persistence"))
+
+        let codexArgs = CodexCLIAdapter.generateArguments(
+            model: "gpt-5.3-codex",
+            outputSchemaPath: nil,
+            toolAccess: .readOnly,
+            resumeSessionID: "x-sess-1",
+            persistSession: true
+        )
+        XCTAssertEqual(Array(codexArgs.prefix(2)), ["exec", "resume"])
+        XCTAssertTrue(codexArgs.contains("x-sess-1"))
+        XCTAssertEqual(codexArgs.last, "-")
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("dif-cli-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let mockClaude = tempDir.appendingPathComponent("mock-claude.sh")
+        let claudeScript = """
+        #!/bin/sh
+        cat >/dev/null
+        echo '{"type":"system","subtype":"init","session_id":"c-sess-1"}'
+        echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"Thinking..."}}}'
+        echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"CLAUDE-"}}}'
+        echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"OK"}}}'
+        echo '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"cu1","name":"Bash","input":{"command":"git status"}},{"type":"text","text":"CLAUDE-OK"}]}}'
+        echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"cu1","content":"clean"}]}}'
+        echo '{"type":"result","session_id":"c-sess-1","result":"CLAUDE-OK"}'
+        """
+        try claudeScript.write(to: mockClaude, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: mockClaude.path)
+
+        final class EventRecorder: @unchecked Sendable {
+            private let lock = NSLock()
+            private var storage: [AgentStreamEvent] = []
+            func append(_ event: AgentStreamEvent) {
+                lock.lock()
+                storage.append(event)
+                lock.unlock()
+            }
+            var events: [AgentStreamEvent] {
+                lock.lock()
+                defer { lock.unlock() }
+                return storage
+            }
+        }
+
+        let claudeRecorder = EventRecorder()
+        let claudeRes = try await ClaudeCLIAdapter.generateWithSession(
+            executable: mockClaude.path,
+            cwd: tempDir,
+            model: "claude-sonnet-4-6",
+            prompt: "Review",
+            jsonSchema: nil,
+            environment: ProcessInfo.processInfo.environment,
+            toolAccess: .readOnly,
+            resumeSessionID: nil,
+            persistSession: true,
+            timeout: 5,
+            killGracePeriod: 0.2
+        ) { claudeRecorder.append($0) }
+        let claudeEvents = claudeRecorder.events
+        XCTAssertEqual(claudeRes.sessionID, "c-sess-1")
+        XCTAssertEqual(claudeRes.text, "CLAUDE-OK")
+        XCTAssertTrue(claudeEvents.contains(.sessionStarted("c-sess-1")))
+        XCTAssertTrue(claudeEvents.contains(.thinkingDelta("Thinking...")))
+        XCTAssertTrue(claudeEvents.contains(.messageDelta("CLAUDE-")))
+        XCTAssertTrue(claudeEvents.contains(.messageDelta("OK")))
+
+        let mockCodex = tempDir.appendingPathComponent("mock-codex.sh")
+        let codexScript = """
+        #!/bin/sh
+        cat >/dev/null
+        echo '{"type":"thread.started","thread_id":"x-thread-1"}'
+        echo '{"type":"item.completed","item":{"id":"r1","type":"reasoning","text":"Checking diff"}}'
+        echo '{"type":"item.started","item":{"id":"cmd1","type":"command_execution","command":"git diff --stat","status":"in_progress"}}'
+        echo '{"type":"item.completed","item":{"id":"cmd1","type":"command_execution","command":"git diff --stat","status":"completed","aggregated_output":"1 file"}}'
+        echo '{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":"CODEX-OK"}}'
+        """
+        try codexScript.write(to: mockCodex, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: mockCodex.path)
+
+        let codexRecorder = EventRecorder()
+        let codexRes = try await CodexCLIAdapter.generateWithSession(
+            executable: mockCodex.path,
+            cwd: tempDir,
+            model: "gpt-5.3-codex",
+            prompt: "Review",
+            jsonSchema: nil,
+            environment: ProcessInfo.processInfo.environment,
+            toolAccess: .readOnly,
+            resumeSessionID: nil,
+            persistSession: true,
+            timeout: 5,
+            killGracePeriod: 0.2
+        ) { codexRecorder.append($0) }
+        let codexEvents = codexRecorder.events
+        XCTAssertEqual(codexRes.sessionID, "x-thread-1")
+        XCTAssertEqual(codexRes.text, "CODEX-OK")
+        XCTAssertTrue(codexEvents.contains(.sessionStarted("x-thread-1")))
+        XCTAssertTrue(codexEvents.contains(.thinkingDelta("Checking diff")))
+        XCTAssertTrue(codexEvents.contains(.messageDelta("CODEX-OK")))
+    }
+
+    func testACPReadOnlyShellValidatorSupportsForIfAndCurlyVariables() throws {
+        let repo = FileManager.default.temporaryDirectory.appendingPathComponent("dif-loop-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: repo) }
+
+        let allowed = [
+            "SHA=b384d72f30c2c9768a7da35331382d3ac8253fe8 ; echo \"=== Check git show for key commits on the 8 files ===\" ; for c in 66e239fc19ef61fbac6777eb5d968a4dd7a50d72 dc2a806f7b095a68b7c711e2209ccd1c5414908d; do git log -1 --format=\"%h %s\" \"$c\"; done",
+            "SHA=b384d72f30c2c9768a7da35331382d3ac8253fe8\ngit show \"${SHA}:Sources/App.swift\" | nl -ba",
+            "for f in Sources/App.swift Sources/Other.swift; do cat \"$f\"; done",
+            "if [ -f Sources/App.swift ]; then echo ok; else echo missing; fi",
+            "diff -u Sources/A.swift Sources/B.swift"
+        ]
+        for cmd in allowed {
+            XCTAssertTrue(ACPTransport.isReadOnlyShellCommand(cmd, repoRoot: repo), "Expected allow: \(cmd)")
+        }
+
+        let denied = [
+            "for f in /etc/passwd; do cat \"$f\"; done",
+            "for PATH in /tmp; do git status; done",
+            "for c in a b; do rm -rf \"$c\"; done",
+            "echo ${PATH:=evil}",
+            "for f in a b; do echo \"$f\"",
+            "while true; do git status; done",
+            "cat \"$UNBOUND_SECRET\""
+        ]
+        for cmd in denied {
+            XCTAssertFalse(ACPTransport.isReadOnlyShellCommand(cmd, repoRoot: repo), "Expected deny: \(cmd)")
+            if case .failure = ACPTransport.evaluateReadOnlyShellCommand(cmd, repoRoot: repo) {
+                // Expected structured reason
+            } else {
+                XCTFail("Expected structured failure reason for: \(cmd)")
+            }
+        }
+    }
+
+    func testACPSoftDenialRecoveryContinuesSameSession() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("dif-softdeny-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let mockScript = tempDir.appendingPathComponent("mock-softdeny.py")
+        let python = """
+        #!/usr/bin/env python3
+        import json, sys, os
+
+        def send(obj):
+            sys.stdout.write(json.dumps(obj) + "\\n")
+            sys.stdout.flush()
+
+        prompt_count = 0
+        for line in sys.stdin:
+            line = line.strip()
+            if not line:
+                continue
+            msg = json.loads(line)
+            mid = msg.get("id")
+            method = msg.get("method")
+            params = msg.get("params") or {}
+
+            if method == "initialize":
+                send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1}})
+            elif method == "session/new":
+                send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "sess-soft-1"}})
+            elif method in ("session/set_model", "session/set_config_option"):
+                send({"jsonrpc": "2.0", "id": mid, "result": {}})
+            elif method == "session/prompt":
+                sid = params.get("sessionId", "sess-soft-1")
+                prompt_text = "".join(item.get("text", "") for item in params.get("prompt", []) if isinstance(item, dict))
+                prompt_count += 1
+                always_fail = os.environ.get("MOCK_ALWAYS_BLOCKED") == "1"
+                if prompt_count == 1 or always_fail:
+                    send({"jsonrpc": "2.0", "id": 7000 + prompt_count, "method": "session/request_permission", "params": {
+                        "sessionId": sid,
+                        "toolCall": {"toolCallId": f"tc-{prompt_count}", "kind": "edit", "title": "write report.md"},
+                        "options": [{"optionId": "allow", "kind": "allow_once"}, {"optionId": "deny", "kind": "reject_once"}]
+                    }})
+                    _ = sys.stdin.readline()
+                    send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+                    continue
+                if "DiffCode Read-Only Policy Notice" in prompt_text:
+                    send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "RECOVERED-AFTER-BLOCK"}}}})
+                send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+        """
+        try Data(python.utf8).write(to: mockScript)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: mockScript.path)
+
+        let res = try await ACPTransport.generateWithSession(
+            provider: .agy,
+            executable: mockScript.path,
+            arguments: [],
+            cwd: tempDir,
+            model: "default",
+            prompt: "Review",
+            environment: ProcessInfo.processInfo.environment,
+            toolAccess: .readOnly,
+            resumeSessionID: nil,
+            timeout: 5,
+            maxTotalTimeout: 10,
+            killGracePeriod: 0.2
+        )
+        XCTAssertEqual(res.text, "RECOVERED-AFTER-BLOCK")
+        XCTAssertEqual(res.sessionID, "sess-soft-1")
+
+        do {
+            _ = try await ACPTransport.generateWithSession(
+                provider: .agy,
+                executable: mockScript.path,
+                arguments: [],
+                cwd: tempDir,
+                model: "default",
+                prompt: "Review",
+                environment: ProcessInfo.processInfo.environment.merging(["MOCK_ALWAYS_BLOCKED": "1"]) { _, new in new },
+                toolAccess: .readOnly,
+                resumeSessionID: nil,
+                timeout: 5,
+                maxTotalTimeout: 10,
+                killGracePeriod: 0.2,
+                maxPermissionDeniedRecoveries: 1
+            )
+            XCTFail("Expected repeated denials to fail once maxPermissionDeniedRecoveries is exhausted")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Read-only policy rejected tool call"))
+        }
+    }
 }

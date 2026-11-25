@@ -285,23 +285,40 @@ extension AppStore {
 
         project.lastFailedGroupTarget = .workingTree
         let token = project.beginAIGroupGeneration(sessionID: targetSessionID, source: .workingTree)
+        let conversation = makeGroupingConversation(
+            project: project,
+            source: .workingTree,
+            provider: provider,
+            model: model
+        )
+        let turnID = conversation.turns[0].id
 
-        project.aiGroupGenerationTask = Task { @MainActor [weak self, weak project] in
-            guard let self, let project else { return }
+        project.aiGroupGenerationTask = Task { @MainActor [weak self, weak project, weak conversation] in
+            guard let self, let project, let conversation else { return }
             defer {
                 project.finishAIGroupGeneration(token: token)
             }
             do {
-                let result = try await AIHunkGrouper.generateGroups(
-                    repoRoot: repoRoot,
-                    source: .workingTree,
-                    files: filteredFiles,
-                    filter: filter,
-                    provider: provider,
-                    model: model
-                )
+                let result = try await self.withAgentStream(for: conversation, turnID: turnID) { onEvent in
+                    try await AIHunkGrouper.generateGroups(
+                        repoRoot: repoRoot,
+                        source: .workingTree,
+                        files: filteredFiles,
+                        filter: filter,
+                        provider: provider,
+                        model: model,
+                        persistSession: true,
+                        onPromptReady: { [weak conversation] fullPrompt in
+                            Task { @MainActor [weak conversation] in
+                                conversation?.setFullPrompt(fullPrompt, forTurnID: turnID)
+                            }
+                        },
+                        onEvent: onEvent
+                    )
+                }
                 try Task.checkCancellation()
                 guard project.aiGroupGenerationToken == token else { return }
+                self.finalizeGroupingConversation(conversation, turnID: turnID, result: result)
                 project.cancelGroupCommitMessageGeneration()
                 self.applyGeneratedGroupingResult(
                     result,
@@ -313,12 +330,19 @@ extension AppStore {
                     in: project
                 )
             } catch is CancellationError {
-                // Cancelled by user or project switch.
+                guard project.aiGroupGenerationToken == token else { return }
+                conversation.finishTurn(turnID, status: .cancelled)
             } catch {
                 guard project.aiGroupGenerationToken == token else { return }
+                conversation.finishTurn(turnID, status: .failed(error.localizedDescription))
                 project.lastFailedGroupTarget = .workingTree
                 project.aiGroupError = error.localizedDescription
-                self.showToast(error.localizedDescription)
+                self.showToast(
+                    error.localizedDescription,
+                    action: ToastAction(title: L("View Stream", "查看对话")) {
+                        self.openAgentConversation(conversation)
+                    }
+                )
             }
         }
     }
@@ -393,9 +417,16 @@ extension AppStore {
 
         project.lastFailedGroupTarget = .commits(hashes)
         let token = project.beginAIGroupGeneration(sessionID: replacingSessionID, source: placeholderSource)
+        let conversation = makeGroupingConversation(
+            project: project,
+            source: placeholderSource,
+            provider: provider,
+            model: model
+        )
+        let turnID = conversation.turns[0].id
 
-        project.aiGroupGenerationTask = Task { @MainActor [weak self, weak project] in
-            guard let self, let project else { return }
+        project.aiGroupGenerationTask = Task { @MainActor [weak self, weak project, weak conversation] in
+            guard let self, let project, let conversation else { return }
             defer {
                 project.finishAIGroupGeneration(token: token)
             }
@@ -423,17 +454,28 @@ extension AppStore {
                 )
                 let source = AIHunkGroupingSource.commits(commitsSource)
                 project.generatingGroupSource = source
+                conversation.title = source.detailTitle
 
-                let result = try await AIHunkGrouper.generateGroups(
-                    repoRoot: repoRoot,
-                    source: source,
-                    files: filteredFiles,
-                    filter: filter,
-                    provider: provider,
-                    model: model
-                )
+                let result = try await self.withAgentStream(for: conversation, turnID: turnID) { onEvent in
+                    try await AIHunkGrouper.generateGroups(
+                        repoRoot: repoRoot,
+                        source: source,
+                        files: filteredFiles,
+                        filter: filter,
+                        provider: provider,
+                        model: model,
+                        persistSession: true,
+                        onPromptReady: { [weak conversation] fullPrompt in
+                            Task { @MainActor [weak conversation] in
+                                conversation?.setFullPrompt(fullPrompt, forTurnID: turnID)
+                            }
+                        },
+                        onEvent: onEvent
+                    )
+                }
                 try Task.checkCancellation()
                 guard project.aiGroupGenerationToken == token else { return }
+                self.finalizeGroupingConversation(conversation, turnID: turnID, result: result)
                 self.applyGeneratedGroupingResult(
                     result,
                     source: source,
@@ -444,12 +486,19 @@ extension AppStore {
                     in: project
                 )
             } catch is CancellationError {
-                // Cancelled by user or project switch.
+                guard project.aiGroupGenerationToken == token else { return }
+                conversation.finishTurn(turnID, status: .cancelled)
             } catch {
                 guard project.aiGroupGenerationToken == token else { return }
+                conversation.finishTurn(turnID, status: .failed(error.localizedDescription))
                 project.lastFailedGroupTarget = .commits(hashes)
                 project.aiGroupError = error.localizedDescription
-                self.showToast(error.localizedDescription)
+                self.showToast(
+                    error.localizedDescription,
+                    action: ToastAction(title: L("View Stream", "查看对话")) {
+                        self.openAgentConversation(conversation)
+                    }
+                )
             }
         }
     }
@@ -556,9 +605,16 @@ extension AppStore {
 
         project.lastFailedGroupTarget = .comparison(comparisonSource)
         let token = project.beginAIGroupGeneration(sessionID: replacingSessionID, source: initialSource)
+        let conversation = makeGroupingConversation(
+            project: project,
+            source: initialSource,
+            provider: provider,
+            model: model
+        )
+        let turnID = conversation.turns[0].id
 
-        project.aiGroupGenerationTask = Task { @MainActor [weak self, weak project] in
-            guard let self, let project else { return }
+        project.aiGroupGenerationTask = Task { @MainActor [weak self, weak project, weak conversation] in
+            guard let self, let project, let conversation else { return }
             defer {
                 project.finishAIGroupGeneration(token: token)
             }
@@ -606,17 +662,28 @@ extension AppStore {
                 let finalSource = AIHunkGroupingSource.comparison(resolvedComp)
                 project.generatingGroupSource = finalSource
                 project.lastFailedGroupTarget = .comparison(resolvedComp)
+                conversation.title = finalSource.detailTitle
 
-                let result = try await AIHunkGrouper.generateGroups(
-                    repoRoot: repoRoot,
-                    source: finalSource,
-                    files: filteredFiles,
-                    filter: filter,
-                    provider: provider,
-                    model: model
-                )
+                let result = try await self.withAgentStream(for: conversation, turnID: turnID) { onEvent in
+                    try await AIHunkGrouper.generateGroups(
+                        repoRoot: repoRoot,
+                        source: finalSource,
+                        files: filteredFiles,
+                        filter: filter,
+                        provider: provider,
+                        model: model,
+                        persistSession: true,
+                        onPromptReady: { [weak conversation] fullPrompt in
+                            Task { @MainActor [weak conversation] in
+                                conversation?.setFullPrompt(fullPrompt, forTurnID: turnID)
+                            }
+                        },
+                        onEvent: onEvent
+                    )
+                }
                 try Task.checkCancellation()
                 guard project.aiGroupGenerationToken == token else { return }
+                self.finalizeGroupingConversation(conversation, turnID: turnID, result: result)
                 self.applyGeneratedGroupingResult(
                     result,
                     source: finalSource,
@@ -627,14 +694,65 @@ extension AppStore {
                     in: project
                 )
             } catch is CancellationError {
-                // Cancelled by user or project switch.
+                guard project.aiGroupGenerationToken == token else { return }
+                conversation.finishTurn(turnID, status: .cancelled)
             } catch {
                 guard project.aiGroupGenerationToken == token else { return }
+                conversation.finishTurn(turnID, status: .failed(error.localizedDescription))
                 project.lastFailedGroupTarget = .comparison(comparisonSource)
                 project.aiGroupError = error.localizedDescription
-                self.showToast(error.localizedDescription)
+                self.showToast(
+                    error.localizedDescription,
+                    action: ToastAction(title: L("View Stream", "查看对话")) {
+                        self.openAgentConversation(conversation)
+                    }
+                )
             }
         }
+    }
+
+    private func makeGroupingConversation(
+        project: Project,
+        source: AIHunkGroupingSource,
+        provider: AgentProvider,
+        model: String?
+    ) -> AgentConversation {
+        let conv = AgentConversation(
+            projectID: project.id,
+            repoRoot: project.url,
+            kind: .grouping,
+            reviewTarget: nil,
+            title: source.detailTitle,
+            provider: provider,
+            model: model,
+            toolAccess: .disabled,
+            initialUserPromptDisplay: "\(source.detailTitle)"
+        )
+        project.registerAgentConversation(conv)
+        return conv
+    }
+
+    private func finalizeGroupingConversation(
+        _ conversation: AgentConversation,
+        turnID: UUID,
+        result: AIHunkGroupingResult
+    ) {
+        if let sid = result.sessionID, !sid.isEmpty {
+            conversation.remoteSessionID = sid
+        }
+        let summaryLines = result.groups.enumerated().map { idx, grp in
+            let brief = grp.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+            return "\(idx + 1). **\(grp.name)** (\(grp.fileCount) files, \(grp.hunkCount) hunks)" + (brief.isEmpty ? "" : " — \(brief)")
+        }.joined(separator: "\n")
+        let fallbackSummary = summaryLines.isEmpty
+            ? L("Generated \(result.groups.count) group(s).", "已生成 \(result.groups.count) 个分组。")
+            : summaryLines
+        conversation.appendStatusNote(
+            L("Generated \(result.groups.count) group(s) across \(result.totalHunks) hunk(s).",
+              "已生成 \(result.groups.count) 个逻辑分组（共 \(result.totalHunks) 处变更）。"),
+            toTurnID: turnID
+        )
+        conversation.finishTurn(turnID, status: .completed, finalText: fallbackSummary)
     }
 
     private func prepareGroupsTabForGeneration(replacingSessionID: UUID?, in project: Project) {
@@ -773,6 +891,13 @@ extension AppStore {
         } else if removedSession.isCommittable {
             project.cancelGroupCommitMessageGeneration()
         }
+        if project.isReviewing(sessionID: sessionID)
+            || (project.activeGroupSessionID == sessionID && {
+                if case .group = project.activeReviewTarget { return true }
+                return false
+            }()) {
+            project.cancelAIReview()
+        }
 
         if pendingGroupHunkFocus?.root == project.url, project.activeGroupSessionID == sessionID {
             pendingGroupHunkFocus = nil
@@ -831,6 +956,11 @@ extension AppStore {
         if pendingGroupHunkFocus?.root == project.url {
             pendingGroupHunkFocus = nil
         }
+        if case .group = project.activeReviewTarget {
+            project.cancelAIReview()
+        } else if case .session = project.activeReviewTarget {
+            project.cancelAIReview()
+        }
         project.clearAIGroups()
         deletePersistedAIGroups(for: project)
         if project.id == selectedProjectID {
@@ -865,6 +995,9 @@ extension AppStore {
 
         if project.generatingGroupCommitID == groupID {
             project.cancelGroupCommitMessageGeneration()
+        }
+        if project.isReviewing(groupID: groupID) {
+            project.cancelAIReview()
         }
         project.mutateAIGroupSession(id: sessionID) { s in
             s.groupCommitMessages.removeValue(forKey: groupID.uuidString)

@@ -536,9 +536,15 @@ extension AppStore {
         noteRecent(project, change.path)
     }
 
-    func showCompared(_ change: FileChange, with comparison: Comparison, in project: Project) {
+    func showCompared(_ change: FileChange, with comparison: Comparison, in project: Project, line: Int? = nil, column: Int? = nil) {
         let request = resolvedRequest(project.request(compared: change, with: comparison, ignoreWhitespace: settings.ignoreWhitespace))
-        if request == viewer.request {
+        syncGroupHunkFilter(nil, for: request)
+        if let line {
+            if request == viewer.request {
+                viewer.reloadIfStale(base: comparison.base)
+            }
+            viewer.open(request, line: line, column: column, preserveScroll: false)
+        } else if request == viewer.request {
             viewer.reloadIfStale(base: comparison.base)
         } else {
             let sameDiff = viewer.request?.path == request.path && viewer.request?.root == request.root && viewer.request?.source != .file

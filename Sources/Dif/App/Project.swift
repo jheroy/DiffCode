@@ -238,6 +238,60 @@ final class Project: Identifiable {
     @ObservationIgnored var groupCommitMessageToken: UInt64 = 0
     @ObservationIgnored var groupCommitMessageTask: Task<Void, Never>?
 
+    // AI Code Review
+    enum AIReviewTarget: Equatable, Hashable, Sendable {
+        case workingTree
+        case comparison
+        case group(UUID)
+        case session(UUID)
+    }
+
+    /// Which target (working tree, comparison, AI group, or grouping session) is currently being reviewed by AI.
+    var activeReviewTarget: AIReviewTarget? = nil
+    var aiReviewError: String? = nil
+    @ObservationIgnored var aiReviewToken: UInt64 = 0
+    @ObservationIgnored var aiReviewTask: Task<Void, Never>?
+
+    /// Recent and live AI agent conversations for Code Review and AI Grouping (most recent first).
+    var agentConversations: [AgentConversation] = []
+    var lastReviewConversationID: UUID? = nil
+    var lastGroupingConversationID: UUID? = nil
+
+    var activeReviewConversation: AgentConversation? {
+        if let activeReviewTarget,
+           let matching = agentConversations.first(where: { $0.kind == .review && $0.reviewTarget == activeReviewTarget }) {
+            return matching
+        }
+        if let lastReviewConversationID,
+           let matching = agentConversations.first(where: { $0.id == lastReviewConversationID }) {
+            return matching
+        }
+        return agentConversations.first { $0.kind == .review }
+    }
+
+    var activeGroupingConversation: AgentConversation? {
+        if let lastGroupingConversationID,
+           let matching = agentConversations.first(where: { $0.id == lastGroupingConversationID }) {
+            return matching
+        }
+        return agentConversations.first { $0.kind == .grouping }
+    }
+
+    func reviewConversation(for target: AIReviewTarget) -> AgentConversation? {
+        agentConversations.first { $0.kind == .review && $0.reviewTarget == target }
+    }
+
+    func reviewConversation(forGroupID groupID: UUID) -> AgentConversation? {
+        reviewConversation(for: .group(groupID))
+    }
+
+    var isReviewing: Bool { activeReviewTarget != nil }
+    var isReviewingChanges: Bool {
+        activeReviewTarget == .workingTree || activeReviewTarget == .comparison
+    }
+    func isReviewing(groupID: UUID) -> Bool { activeReviewTarget == .group(groupID) }
+    func isReviewing(sessionID: UUID) -> Bool { activeReviewTarget == .session(sessionID) }
+
     private struct SessionGroupKey: Hashable {
         let sessionID: UUID
         let groupID: UUID
@@ -479,6 +533,9 @@ final class Project: Identifiable {
         isGeneratingGroups = false
         generatingGroupSessionID = nil
         generatingGroupSource = nil
+        if let conv = activeGroupingConversation, let last = conv.latestTurn, last.status.isRunning {
+            conv.finishTurn(last.id, status: .cancelled)
+        }
         if includeGroupCommitMessage {
             cancelGroupCommitMessageGeneration()
         }
@@ -546,6 +603,68 @@ final class Project: Identifiable {
         groupCommitMessageTask?.cancel()
         groupCommitMessageTask = nil
         generatingGroupCommitID = nil
+    }
+
+    /// Registers a new live AI conversation at the head of `agentConversations` (retaining up to 20 per project).
+    func registerAgentConversation(_ conversation: AgentConversation) {
+        agentConversations.removeAll { $0.id == conversation.id }
+        agentConversations.insert(conversation, at: 0)
+        if agentConversations.count > 20 {
+            let dropped = agentConversations.dropFirst(20)
+            for item in dropped {
+                item.followUpToken &+= 1
+                item.followUpTask?.cancel()
+                item.followUpTask = nil
+            }
+            agentConversations = Array(agentConversations.prefix(20))
+        }
+        switch conversation.kind {
+        case .review:
+            lastReviewConversationID = conversation.id
+        case .grouping:
+            lastGroupingConversationID = conversation.id
+        }
+    }
+
+    /// Cancels all running follow-up tasks across this project's agent conversations.
+    func cancelAllAgentFollowUps() {
+        for conversation in agentConversations {
+            conversation.followUpToken &+= 1
+            conversation.followUpTask?.cancel()
+            conversation.followUpTask = nil
+            if let lastTurn = conversation.latestTurn, lastTurn.status.isRunning {
+                conversation.finishTurn(lastTurn.id, status: .cancelled)
+            }
+        }
+    }
+
+    /// Starts a new AI code review run for `target`, cancelling any prior run and returning its token.
+    func beginAIReview(target: AIReviewTarget) -> UInt64 {
+        aiReviewTask?.cancel()
+        aiReviewToken &+= 1
+        aiReviewError = nil
+        activeReviewTarget = target
+        return aiReviewToken
+    }
+
+    /// Clears review state only if `token` still matches the active review run.
+    @discardableResult
+    func finishAIReview(token: UInt64) -> Bool {
+        guard aiReviewToken == token else { return false }
+        activeReviewTarget = nil
+        aiReviewTask = nil
+        return true
+    }
+
+    /// Cancels any active AI code review run and invalidates its token immediately.
+    func cancelAIReview() {
+        aiReviewToken &+= 1
+        aiReviewTask?.cancel()
+        aiReviewTask = nil
+        activeReviewTarget = nil
+        if let conv = activeReviewConversation, let last = conv.latestTurn, last.status.isRunning {
+            conv.finishTurn(last.id, status: .cancelled)
+        }
     }
 
     /// Clears all AI grouping sessions, selections, drafts, and error state.

@@ -473,10 +473,21 @@ struct ComparisonList: View {
                 } else {
                     ComparisonBanner(
                         comparison: comparison,
+                        onReviewWithAI: AppEnvironment.isAppStore ? nil : {
+                            store.reviewComparisonChanges(in: project, comparison: comparison)
+                        },
+                        isReviewing: project.activeReviewTarget == .comparison,
+                        isReviewDisabled: project.activeReviewTarget != .comparison && (project.isLoadingCompare || project.compareChanges.isEmpty),
+                        reviewHelp: comparisonReviewHelp,
+                        reviewConversation: AppEnvironment.isAppStore ? nil : project.reviewConversation(for: .comparison),
                         onGroupWithAI: AppEnvironment.isAppStore ? nil : {
                             store.generateComparisonAIGroups(for: project, comparison: comparison)
                         },
-                        isGroupDisabled: project.isLoadingCompare || project.compareChanges.isEmpty
+                        isGroupDisabled: project.isLoadingCompare || project.compareChanges.isEmpty,
+                        groupingConversation: AppEnvironment.isAppStore ? nil : project.activeGroupingConversation,
+                        onOpenConversation: { conv in
+                            store.openAgentConversation(conv)
+                        }
                     ) {
                         store.endComparison()
                     }
@@ -529,6 +540,16 @@ struct ComparisonList: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .islandCard(background: .difPanel)
+    }
+
+    private var comparisonReviewHelp: String {
+        let agentDesc = store.aiReviewAgentDescription()
+        if project.activeReviewTarget == .comparison {
+            return L("Generating code review report with \(agentDesc)… Click to cancel",
+                     "正在使用 \(agentDesc) 生成代码审查报告… 点击取消")
+        }
+        return L("Review compared changes with \(agentDesc) and open Markdown report",
+                 "使用 \(agentDesc) 审查当前对比变更并生成打开 Markdown 报告")
     }
 
     private func toggle(_ row: ChangeRow) {
@@ -594,8 +615,15 @@ struct ComparisonList: View {
 /// What the Changes tab compares with, over its list.
 private struct ComparisonBanner: View {
     var comparison: Comparison
+    var onReviewWithAI: (() -> Void)? = nil
+    var isReviewing: Bool = false
+    var isReviewDisabled: Bool = false
+    var reviewHelp: String = ""
+    var reviewConversation: AgentConversation? = nil
     var onGroupWithAI: (() -> Void)? = nil
     var isGroupDisabled: Bool = false
+    var groupingConversation: AgentConversation? = nil
+    var onOpenConversation: ((AgentConversation) -> Void)? = nil
     var onClose: () -> Void
 
     var body: some View {
@@ -620,6 +648,26 @@ private struct ComparisonBanner: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 4)
+            if let onReviewWithAI {
+                AIReviewPillButton(
+                    isReviewing: isReviewing,
+                    isDisabled: isReviewDisabled,
+                    compactIconOnly: false,
+                    help: reviewHelp,
+                    action: onReviewWithAI
+                )
+                if let reviewConversation {
+                    AgentStreamPillButton(
+                        isRunning: reviewConversation.isRunning,
+                        hasError: reviewConversation.hasFailed,
+                        compactIconOnly: false,
+                        help: L("Open AI review conversation stream and continue chat",
+                                "打开 AI 审查对话流并继续对话")
+                    ) {
+                        onOpenConversation?(reviewConversation)
+                    }
+                }
+            }
             if let onGroupWithAI {
                 Button(action: onGroupWithAI) {
                     Image(systemName: "sparkles")
@@ -631,6 +679,17 @@ private struct ComparisonBanner: View {
                 .buttonStyle(.plain)
                 .disabled(isGroupDisabled)
                 .help(L("Group compared changes with AI", "使用 AI 对当前比较结果分组"))
+                if let groupingConversation {
+                    AgentStreamPillButton(
+                        isRunning: groupingConversation.isRunning,
+                        hasError: groupingConversation.hasFailed,
+                        compactIconOnly: true,
+                        help: L("Open AI grouping conversation stream and continue chat",
+                                "打开 AI 分组对话流并继续对话")
+                    ) {
+                        onOpenConversation?(groupingConversation)
+                    }
+                }
             }
             Button(action: onClose) {
                 Image(systemName: "xmark").font(.ui(size: 9, weight: .bold)).foregroundStyle(Color.difText2)
@@ -683,6 +742,34 @@ private struct StashBanner: View {
                 }
                 Spacer(minLength: 4)
                 if !AppEnvironment.isAppStore {
+                    let isReviewing = project.activeReviewTarget == .comparison
+                    let reviewDisabled = !isReviewing && (project.isLoadingCompare || project.compareChanges.isEmpty)
+                    let agentDesc = store.aiReviewAgentDescription()
+                    AIReviewPillButton(
+                        isReviewing: isReviewing,
+                        isDisabled: reviewDisabled,
+                        compactIconOnly: false,
+                        help: isReviewing
+                            ? L("Generating code review report with \(agentDesc)… Click to cancel",
+                                "正在使用 \(agentDesc) 生成代码审查报告… 点击取消")
+                            : L("Review stash changes with \(agentDesc) and open Markdown report",
+                                "使用 \(agentDesc) 审查此 Stash 变更并生成打开 Markdown 报告")
+                    ) {
+                        store.reviewChanges(in: project)
+                    }
+                    if let reviewConv = project.reviewConversation(for: .comparison) {
+                        AgentStreamPillButton(
+                            isRunning: reviewConv.isRunning,
+                            hasError: reviewConv.hasFailed,
+                            compactIconOnly: false,
+                            help: L("Open AI review conversation stream and continue chat",
+                                    "打开 AI 审查对话流并继续对话")
+                        ) {
+                            store.openAgentConversation(reviewConv)
+                        }
+                    }
+                }
+                if !AppEnvironment.isAppStore {
                     let groupDisabled = project.isLoadingCompare || project.compareChanges.isEmpty
                     Button {
                         store.generateComparisonAIGroups(for: project)
@@ -696,6 +783,17 @@ private struct StashBanner: View {
                     .buttonStyle(.plain)
                     .disabled(groupDisabled)
                     .help(L("Group stash changes with AI", "使用 AI 对此 Stash 变更分组"))
+                    if let groupConv = project.activeGroupingConversation {
+                        AgentStreamPillButton(
+                            isRunning: groupConv.isRunning,
+                            hasError: groupConv.hasFailed,
+                            compactIconOnly: true,
+                            help: L("Open AI grouping conversation stream and continue chat",
+                                    "打开 AI 分组对话流并继续对话")
+                        ) {
+                            store.openAgentConversation(groupConv)
+                        }
+                    }
                 }
                 Button { store.endComparison(in: project) } label: {
                     Image(systemName: "xmark").font(.ui(size: 9, weight: .bold)).foregroundStyle(Color.difText2)
@@ -1579,6 +1677,17 @@ private struct CommitDetail: View {
                 .fixedSize()
                 .disabled(groupDisabled)
                 .help(L("Group selected commits with AI", "使用 AI 对所选提交进行分组"))
+                if let groupConv = project.activeGroupingConversation {
+                    AgentStreamPillButton(
+                        isRunning: groupConv.isRunning,
+                        hasError: groupConv.hasFailed,
+                        compactIconOnly: false,
+                        help: L("Open AI grouping conversation stream and continue chat",
+                                "打开 AI 分组对话流并继续对话")
+                    ) {
+                        store.openAgentConversation(groupConv)
+                    }
+                }
             }
             if !store.settings.flatList, !folderIDs.isEmpty {
                 IconButton(symbol: hasExpandedFolder ? "rectangle.compress.vertical" : "rectangle.expand.vertical",
